@@ -8,6 +8,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
+use crate::tag::DeclaredTags;
+
 /// Settings from `config.toml`. Unknown keys are errors, so typos surface; add new settings as
 /// `#[serde(default)]` fields.
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -16,12 +18,30 @@ pub struct Config {
     /// `add`, `edit`, and import reject tags that aren't canonical or an alias of one.
     #[serde(default)]
     pub strict_tags: bool,
+    #[serde(default, skip_serializing_if = "Tags::is_empty")]
+    pub tags: Tags,
     /// Sections for features this build doesn't have yet. They're accepted, unchecked, so one
     /// config works across builds.
     #[serde(default, skip_serializing)]
     ai: Option<IgnoredAny>,
     #[serde(default, skip_serializing)]
     provider: Option<IgnoredAny>,
+}
+
+/// The `[tags]` section.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tags {
+    /// The declared canonical list, `tag = [aliases]`. When present (even empty), config is the
+    /// source of truth and the database mirrors it; see [`crate::Store::sync_declared`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical: Option<DeclaredTags>,
+}
+
+impl Tags {
+    fn is_empty(&self) -> bool {
+        self.canonical.is_none()
+    }
 }
 
 impl Config {
@@ -168,6 +188,57 @@ mod tests {
         assert!(e.starts_with("/c.toml:1:15: "), "{e}");
         let e = parse("strict_tags = \n").unwrap_err().to_string();
         assert!(e.starts_with("/c.toml:1:"), "{e}");
+    }
+
+    #[test]
+    fn parses_declared_canonical_tags() {
+        assert!(parse("").unwrap().tags.canonical.is_none());
+        // Present but empty is still declarative.
+        let c = parse("[tags.canonical]\n").unwrap();
+        assert!(c.tags.canonical.unwrap().is_empty());
+
+        let text = "[tags.canonical]\njavascript = [\"js\", \"ecmascript\"]\nrust = []\n";
+        let c = parse(text).unwrap();
+        let d = c.tags.canonical.as_ref().unwrap();
+        let list: Vec<_> = d.iter().collect();
+        assert_eq!(
+            list,
+            [
+                ("javascript", &["ecmascript".to_string(), "js".into()][..]),
+                ("rust", &[][..])
+            ]
+        );
+        // `config show` prints it back; aliases come out sorted.
+        assert_eq!(
+            c.to_toml(),
+            "strict_tags = false\n\n[tags.canonical]\njavascript = [\"ecmascript\", \"js\"]\nrust = []\n"
+        );
+        assert!(parse(&c.to_toml()).is_ok());
+    }
+
+    #[test]
+    fn declared_tag_errors_have_positions() {
+        let e = parse("strict_tags = true\n[tags.canonical]\n\"Web Dev\" = []\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("/c.toml:2:1: "), "{e}");
+        assert!(
+            e.contains("\"Web Dev\" is not a normalized tag name; write \"web-dev\""),
+            "{e}"
+        );
+        let e = parse("[tags.canonical]\njavascript = [\"js\"]\njson = [\"js\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("alias \"js\" is declared for both \"javascript\" and \"json\""),
+            "{e}"
+        );
+        let e = parse("[tags]\ncanon = {}\n").unwrap_err().to_string();
+        assert!(e.starts_with("/c.toml:2:1: unknown field `canon`"), "{e}");
+        let e = parse("[tags.canonical]\nrust = \"rs\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("/c.toml:2:8: "), "{e}");
     }
 
     #[test]

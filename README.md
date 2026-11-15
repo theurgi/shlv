@@ -64,7 +64,19 @@ errors.
 ```toml
 # Reject tags in add and edit that aren't canonical or an alias of a canonical tag.
 strict_tags = true
+
+# Declare the canonical list: each tag with its aliases. When this table is present, even empty,
+# the config is the source of truth: the database mirrors it on startup, and `tag canonical
+# add|rm|import`, `tag alias`, and renaming or merging declared tags are refused.
+[tags.canonical]
+javascript = ["js", "ecmascript"]
+rust = []
 ```
+
+Declared names must already be normalized (`web-dev`, not `Web Dev`). Mirroring marks declared tags
+canonical, points their aliases at them, and unmarks canonical tags that aren't listed; bookmarks
+keep their tags. A declared alias that is a tag in the database is merged into its declared tag.
+Mirroring is skipped while the list is unchanged.
 
 ## Performance
 

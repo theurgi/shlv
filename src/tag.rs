@@ -4,9 +4,13 @@
 //! tags. Every change to a bookmark's tags bumps that bookmark's `updated_at` and reindexes it in
 //! the same transaction; every change to a tag or its aliases bumps the tag's `updated_at`.
 
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+
+use crate::db::{meta_delete, meta_get, meta_set};
 use crate::store::{Store, ensure_tag, normalize_tag, now_ms, resolve_tag, touch_many};
 
 /// A live tag, as listed by [`Store::tags`].
@@ -90,6 +94,149 @@ pub fn format_canonical(tags: &[TagInfo]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The `meta` key holding [`DeclaredTags::hash`] of the list last mirrored into the database.
+const DECLARED_HASH: &str = "canonical_hash";
+
+/// A canonical list declared in config: tag names mapped to their aliases. Built only through
+/// validation, so names are normalized, no alias belongs to two tags, and no alias is also a
+/// declared tag.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "BTreeMap<String, Vec<String>>")]
+pub struct DeclaredTags {
+    /// Aliases are sorted, so the hash doesn't depend on their order in the file.
+    tags: BTreeMap<String, Vec<String>>,
+    /// Alias to tag.
+    aliases: HashMap<String, String>,
+}
+
+impl DeclaredTags {
+    /// Validates a declared list. Names must already be normalized: config is a source of truth,
+    /// so `"Web Dev"` is an error rather than quietly becoming `web-dev`.
+    pub fn new(tags: BTreeMap<String, Vec<String>>) -> Result<Self, String> {
+        let check = |name: &str| {
+            let n = normalize_tag(name);
+            if n.is_empty() {
+                Err(format!("{name:?} is not a valid tag name"))
+            } else if n != name {
+                Err(format!(
+                    "{name:?} is not a normalized tag name; write {n:?}"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let mut aliases: HashMap<String, String> = HashMap::new();
+        let mut sorted = BTreeMap::new();
+        for (tag, list) in tags {
+            check(&tag)?;
+            for a in &list {
+                check(a)?;
+                if a == &tag {
+                    return Err(format!("{tag:?} lists itself as an alias"));
+                }
+                if let Some(other) = aliases.insert(a.clone(), tag.clone()) {
+                    return Err(if other == tag {
+                        format!("alias {a:?} is listed twice for {tag:?}")
+                    } else {
+                        format!("alias {a:?} is declared for both {other:?} and {tag:?}")
+                    });
+                }
+            }
+            let mut list = list;
+            list.sort_unstable();
+            sorted.insert(tag, list);
+        }
+        if let Some((a, tag)) = aliases.iter().find(|(a, _)| sorted.contains_key(*a)) {
+            return Err(format!(
+                "{a:?} is declared both as a tag and as an alias of {tag:?}"
+            ));
+        }
+        Ok(DeclaredTags {
+            tags: sorted,
+            aliases,
+        })
+    }
+
+    /// Declared tags by name, each with its sorted aliases.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.tags.iter().map(|(t, a)| (t.as_str(), a.as_slice()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.tags.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tags.is_empty()
+    }
+
+    /// Whether `name` (normalized) is a declared tag.
+    pub fn is_tag(&self, name: &str) -> bool {
+        self.tags.contains_key(name)
+    }
+
+    /// The declared tag that `name` (normalized) names or is an alias of.
+    pub fn resolve(&self, name: &str) -> Option<&str> {
+        match self.tags.get_key_value(name) {
+            Some((t, _)) => Some(t),
+            None => self.aliases.get(name).map(String::as_str),
+        }
+    }
+
+    /// A 64-bit FNV-1a hash of the list in canonical-list format, as 16 hex digits. It only
+    /// detects changes, so it needs no collision resistance; the leading version tag lets the
+    /// format change later at the cost of one resync.
+    pub fn hash(&self) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut feed = |s: &str| {
+            for b in s.bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        feed("v1\n");
+        for (tag, aliases) in &self.tags {
+            feed(tag);
+            for a in aliases {
+                feed(" ");
+                feed(a);
+            }
+            feed("\n");
+        }
+        format!("{h:016x}")
+    }
+}
+
+impl TryFrom<BTreeMap<String, Vec<String>>> for DeclaredTags {
+    type Error = String;
+    fn try_from(tags: BTreeMap<String, Vec<String>>) -> Result<Self, String> {
+        DeclaredTags::new(tags)
+    }
+}
+
+impl Serialize for DeclaredTags {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.tags.serialize(s)
+    }
+}
+
+/// What [`Store::sync_declared`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    /// Tags newly marked canonical (created if needed).
+    pub marked: usize,
+    /// Canonical tags not in the list, now unmarked.
+    pub unmarked: usize,
+    /// Aliases added or repointed.
+    pub aliases_added: usize,
+    /// Aliases removed: undeclared aliases of declared tags, and aliases whose name is now a
+    /// declared tag.
+    pub aliases_removed: usize,
+    /// Live tags that the list declares as aliases, folded into their tag: (from, into, bookmarks
+    /// retagged).
+    pub merged: Vec<(String, String, usize)>,
 }
 
 /// Strict mode rejected these tags (normalized, deduplicated, in input order): they aren't
@@ -198,6 +345,7 @@ impl Store {
         )?;
         let bookmarks = tagged(&tx, id)?;
         touch_many(&tx, &bookmarks, now)?;
+        forget_declared(&tx)?;
         tx.commit()?;
         Ok(Retagged {
             tag: new,
@@ -219,39 +367,13 @@ impl Store {
         if from_id == into_id {
             bail!("{from:?} and {into:?} are the same tag");
         }
-        let bookmarks = tagged(&tx, from_id)?;
-        // Bookmarks that already have `into` keep that row (and its source); the rest move.
-        tx.execute(
-            "UPDATE OR IGNORE bookmark_tag SET tag_id = ?2 WHERE tag_id = ?1",
-            params![from_id, into_id],
-        )?;
-        tx.execute("DELETE FROM bookmark_tag WHERE tag_id = ?1", [from_id])?;
-        tx.execute(
-            "UPDATE tag_alias SET tag_id = ?2 WHERE tag_id = ?1",
-            params![from_id, into_id],
-        )?;
-        tx.execute(
-            "INSERT INTO tag_alias (alias, tag_id) VALUES (?1, ?2)",
-            params![from, into_id],
-        )?;
-        tx.execute(
-            "UPDATE tag SET updated_at = ?3, \
-             canonical = canonical OR (SELECT canonical FROM tag WHERE id = ?2) WHERE id = ?1",
-            params![into_id, from_id, now],
-        )?;
-        tx.execute(
-            "UPDATE tag SET deleted_at = ?2, updated_at = ?2, canonical = 0 WHERE id = ?1",
-            params![from_id, now],
-        )?;
-        touch_many(&tx, &bookmarks, now)?;
+        let bookmarks = merge_into(&tx, from_id, &from, into_id, now)?;
         let tag = tx.query_row("SELECT name FROM tag WHERE id = ?1", [into_id], |r| {
             r.get(0)
         })?;
+        forget_declared(&tx)?;
         tx.commit()?;
-        Ok(Retagged {
-            tag,
-            bookmarks: bookmarks.len(),
-        })
+        Ok(Retagged { tag, bookmarks })
     }
 
     /// Makes `alias` resolve to the live tag `tag`. Returns false if it already did. Fails if
@@ -261,6 +383,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let tag_id = require_tag(&tx, &tag)?;
         let added = add_alias(&tx, &alias, tag_id, &tag, now_ms())?;
+        forget_declared(&tx)?;
         tx.commit()?;
         Ok(added)
     }
@@ -275,6 +398,7 @@ impl Store {
         };
         tx.execute("DELETE FROM tag_alias WHERE alias = ?1", [&alias])?;
         touch_tag(&tx, tag_id, now_ms())?;
+        forget_declared(&tx)?;
         tx.commit()?;
         Ok(Some(tag))
     }
@@ -287,6 +411,7 @@ impl Store {
         for t in tags {
             changed += usize::from(mark_canonical(&tx, &tag_name(t)?, now)?);
         }
+        forget_declared(&tx)?;
         tx.commit()?;
         Ok(changed)
     }
@@ -303,6 +428,7 @@ impl Store {
                 params![id, now],
             )?;
         }
+        forget_declared(&tx)?;
         tx.commit()?;
         Ok(changed)
     }
@@ -324,9 +450,159 @@ impl Store {
                     usize::from(add_alias(&tx, a, tag_id, &e.tag, now).with_context(at)?);
             }
         }
+        forget_declared(&tx)?;
         tx.commit()?;
         Ok(stats)
     }
+
+    /// Makes the database mirror a declared canonical list, unless the list's hash matches the
+    /// one stored by the last sync; then it costs one indexed read and returns `None`. Otherwise,
+    /// in one transaction:
+    ///
+    /// - declared tags exist and are canonical (a declared name that was an alias stops being
+    ///   one; its old tag keeps its bookmarks);
+    /// - declared aliases point at their tags (a declared alias that is a live tag is merged into
+    ///   its declared tag, as `tag merge` would);
+    /// - canonical tags not in the list are unmarked (their bookmarks keep them);
+    /// - aliases of declared tags that aren't in the list are removed; aliases of undeclared tags
+    ///   (left by `tag merge`, say) stay.
+    pub fn sync_declared(&mut self, declared: &DeclaredTags) -> Result<Option<SyncStats>> {
+        let hash = declared.hash();
+        if meta_get(&self.conn, DECLARED_HASH)?.as_deref() == Some(hash.as_str()) {
+            return Ok(None);
+        }
+        // Take the write lock up front: a deferred transaction upgrading to a write fails at once
+        // with SQLITE_BUSY in WAL mode if another process syncs at the same time.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if meta_get(&tx, DECLARED_HASH)?.as_deref() == Some(hash.as_str()) {
+            return Ok(None); // another process just did it
+        }
+        let now = now_ms();
+        let mut stats = SyncStats::default();
+
+        let mut ids = HashMap::with_capacity(declared.len());
+        for (tag, _) in declared.iter() {
+            if let Some((owner, _)) = alias_target(&tx, tag)? {
+                tx.execute("DELETE FROM tag_alias WHERE alias = ?1", [tag])?;
+                touch_tag(&tx, owner, now)?;
+                stats.aliases_removed += 1;
+            }
+            stats.marked += usize::from(mark_canonical(&tx, tag, now)?);
+            ids.insert(tag, require_tag(&tx, tag)?);
+        }
+
+        for (tag, aliases) in declared.iter() {
+            let id = ids[tag];
+            for a in aliases {
+                // Validation keeps declared tags out of `aliases`, so this is never one of them.
+                if let Some(from) = live_tag(&tx, a)? {
+                    let n = merge_into(&tx, from, a, id, now)?;
+                    stats.merged.push((a.clone(), tag.to_string(), n));
+                    continue;
+                }
+                match alias_target(&tx, a)? {
+                    Some((owner, _)) if owner == id => continue,
+                    Some((owner, _)) => {
+                        tx.execute(
+                            "UPDATE tag_alias SET tag_id = ?2 WHERE alias = ?1",
+                            params![a, id],
+                        )?;
+                        touch_tag(&tx, owner, now)?;
+                    }
+                    None => {
+                        tx.execute(
+                            "INSERT INTO tag_alias (alias, tag_id) VALUES (?1, ?2)",
+                            params![a, id],
+                        )?;
+                    }
+                }
+                touch_tag(&tx, id, now)?;
+                stats.aliases_added += 1;
+            }
+        }
+
+        // Only after every declared alias is in place, so one moving between declared tags is
+        // repointed rather than deleted and re-added.
+        for (tag, aliases) in declared.iter() {
+            let id = ids[tag];
+            let keep: HashSet<&str> = aliases.iter().map(String::as_str).collect();
+            let stale: Vec<String> = tx
+                .prepare_cached("SELECT alias FROM tag_alias WHERE tag_id = ?1")?
+                .query_map([id], |r| r.get(0))?
+                .filter(|a| {
+                    a.as_ref()
+                        .map_or(true, |a: &String| !keep.contains(a.as_str()))
+                })
+                .collect::<rusqlite::Result<_>>()?;
+            for a in &stale {
+                tx.execute("DELETE FROM tag_alias WHERE alias = ?1", [a])?;
+            }
+            if !stale.is_empty() {
+                touch_tag(&tx, id, now)?;
+                stats.aliases_removed += stale.len();
+            }
+        }
+
+        let canonical: Vec<(i64, String)> = tx
+            .prepare("SELECT id, name FROM tag WHERE canonical AND deleted_at IS NULL")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, name) in canonical {
+            if !declared.is_tag(&name) {
+                tx.execute(
+                    "UPDATE tag SET canonical = 0, updated_at = ?2 WHERE id = ?1",
+                    params![id, now],
+                )?;
+                stats.unmarked += 1;
+            }
+        }
+
+        meta_set(&tx, DECLARED_HASH, &hash)?;
+        tx.commit()?;
+        Ok(Some(stats))
+    }
+}
+
+/// Moves every bookmark from live tag `from_id` (named `from`) to live tag `into_id`, tombstones
+/// `from`, leaves `from` as an alias of `into`, and moves `from`'s aliases over. `into` becomes
+/// canonical if `from` was. Returns how many bookmarks were retagged.
+fn merge_into(tx: &Transaction, from_id: i64, from: &str, into_id: i64, now: i64) -> Result<usize> {
+    let bookmarks = tagged(tx, from_id)?;
+    // Bookmarks that already have `into` keep that row (and its source); the rest move.
+    tx.execute(
+        "UPDATE OR IGNORE bookmark_tag SET tag_id = ?2 WHERE tag_id = ?1",
+        params![from_id, into_id],
+    )?;
+    tx.execute("DELETE FROM bookmark_tag WHERE tag_id = ?1", [from_id])?;
+    tx.execute(
+        "UPDATE tag_alias SET tag_id = ?2 WHERE tag_id = ?1",
+        params![from_id, into_id],
+    )?;
+    tx.execute(
+        "INSERT INTO tag_alias (alias, tag_id) VALUES (?1, ?2)",
+        params![from, into_id],
+    )?;
+    tx.execute(
+        "UPDATE tag SET updated_at = ?3, \
+         canonical = canonical OR (SELECT canonical FROM tag WHERE id = ?2) WHERE id = ?1",
+        params![into_id, from_id, now],
+    )?;
+    tx.execute(
+        "UPDATE tag SET deleted_at = ?2, updated_at = ?2, canonical = 0 WHERE id = ?1",
+        params![from_id, now],
+    )?;
+    touch_many(tx, &bookmarks, now)?;
+    Ok(bookmarks.len())
+}
+
+/// Drops the stored hash of the declared list. Every manual change to tags, aliases, or the
+/// canonical marks calls this, so the next run with a declared list re-mirrors it even if the
+/// list itself is unchanged (say, after declarative mode was turned off, the database edited, and
+/// the same list declared again).
+fn forget_declared(tx: &Transaction) -> Result<()> {
+    meta_delete(tx, DECLARED_HASH)
 }
 
 /// Normalizes a single tag name, rejecting empty ones.

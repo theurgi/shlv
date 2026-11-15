@@ -467,7 +467,7 @@ fn config_path_and_show() {
 }
 
 #[test]
-fn config_errors_name_file_and_line_and_only_hit_commands_that_need_it() {
+fn config_errors_name_file_and_line() {
     let db = Db::new();
     db.ok(&["add", "a.com"]);
     std::fs::write(db.config(), "# settings\nstrict_tag = true\n").unwrap();
@@ -481,8 +481,10 @@ fn config_errors_name_file_and_line_and_only_hit_commands_that_need_it() {
         db.fail(&["config", "show"])
             .contains(&format!("{path}:2:1"))
     );
-    // Commands that don't use settings never read the file.
-    assert_eq!(db.ok(&["ls"]).lines().count(), 1);
+    // Every command that opens the database reads the config (a declared tag list may need
+    // mirroring); `config path` reads neither.
+    assert!(db.fail(&["ls"]).contains(&format!("{path}:2:1")));
+    assert!(db.ok(&["config", "path"]).contains(&path));
 
     std::fs::write(db.config(), "strict_tags = yes\n").unwrap();
     assert!(
@@ -531,4 +533,106 @@ fn strict_tags_from_a_read_only_symlinked_config() {
         std::fs::read_to_string(&real).unwrap(),
         "strict_tags = true\n"
     );
+}
+
+#[test]
+fn declared_canonical_tags() {
+    let db = Db::new();
+    db.ok(&["add", "a.com", "-t", "js", "-t", "misc", "-t", "old"]);
+    db.ok(&["tag", "canonical", "add", "misc"]);
+    std::fs::write(
+        db.config(),
+        "strict_tags = true\n\n[tags.canonical]\njavascript = [\"js\", \"ecmascript\"]\nrust = []\n",
+    )
+    .unwrap();
+    let path = db.config().display().to_string();
+
+    // First run mirrors the list; the live tag `js` is folded into `javascript`, and says so.
+    let (ok, out, err) = db.run(&["ls"]);
+    assert!(ok, "{err}");
+    assert!(out.contains("#javascript  #misc  #old"), "{out}");
+    assert_eq!(
+        err,
+        format!("shlv: merged tag js into javascript (1 bookmark): {path} declares it an alias\n")
+    );
+    assert_eq!(
+        db.ok(&["tag", "canonical", "export"]),
+        "javascript ecmascript js\nrust\n"
+    );
+    // Unchanged list: nothing to report.
+    assert_eq!(db.run(&["tag", "canonical", "ls"]).2, "");
+
+    // Edits to the declared list are refused, naming the config file.
+    let refused = |args: &[&str], what: &str| {
+        let err = db.fail(args);
+        assert!(
+            err.contains(what) && err.contains(&format!("declared in {path} ([tags.canonical])")),
+            "{args:?}: {err}"
+        );
+    };
+    refused(
+        &["tag", "canonical", "add", "go"],
+        "cannot change canonical tags",
+    );
+    refused(
+        &["tag", "canonical", "rm", "rust"],
+        "cannot change canonical tags",
+    );
+    refused(
+        &["tag", "canonical", "import", "-"],
+        "cannot change canonical tags",
+    );
+    refused(&["tag", "alias", "rs", "rust"], "cannot change aliases");
+    refused(&["tag", "alias", "--rm", "js"], "cannot change aliases");
+    refused(
+        &["tag", "rename", "Rust", "rust-lang"],
+        "cannot rename declared tag rust",
+    );
+    refused(
+        &["tag", "merge", "rust", "misc"],
+        "cannot merge declared tag rust",
+    );
+    refused(
+        &["tag", "merge", "old", "js"],
+        "cannot merge into js, an alias of declared tag javascript",
+    );
+
+    // Undeclared tags can still be renamed and merged; merge leaves an alias that sync keeps.
+    db.ok(&["tag", "rename", "old", "older"]);
+    db.ok(&["tag", "merge", "older", "misc"]);
+    assert!(db.ok(&["tag", "ls"]).contains("misc  = older"));
+
+    // Strict mode points at the config file, not at `tag canonical add`.
+    let err = db.fail(&["add", "b.com", "-t", "go"]);
+    assert!(
+        err.contains("not canonical (strict_tags is on): go"),
+        "{err}"
+    );
+    assert!(err.contains(&format!("declare these in {path}")), "{err}");
+    assert!(!err.contains("tag canonical add"), "{err}");
+    assert!(
+        db.ok(&["add", "b.com", "-t", "ecmascript"])
+            .contains("#javascript")
+    );
+
+    // Dropping a tag from the list unmarks it; a conflict is an error at load time.
+    std::fs::write(db.config(), "[tags.canonical]\njavascript = [\"js\"]\n").unwrap();
+    assert_eq!(db.ok(&["tag", "canonical", "export"]), "javascript js\n");
+    assert!(db.ok(&["tag", "ls"]).contains("misc  = older"));
+    std::fs::write(
+        db.config(),
+        "[tags.canonical]\njs = []\njavascript = [\"js\"]\n",
+    )
+    .unwrap();
+    let err = db.fail(&["ls"]);
+    assert!(
+        err.contains(&format!("{path}:1:1: "))
+            && err.contains("\"js\" is declared both as a tag and as an alias of \"javascript\""),
+        "{err}"
+    );
+
+    // Without the section, the database is editable again.
+    std::fs::write(db.config(), "").unwrap();
+    db.ok(&["tag", "canonical", "add", "go"]);
+    db.ok(&["tag", "alias", "golang", "go"]);
 }

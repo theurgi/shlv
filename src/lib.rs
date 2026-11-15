@@ -9,4 +9,7 @@ pub mod url;
 
 pub use config::Config;
 pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
-pub use tag::{CanonicalEntry, ImportStats, NonCanonicalTags, Retagged, TagInfo, TagSort};
+pub use tag::{
+    CanonicalEntry, DeclaredTags, ImportStats, NonCanonicalTags, Retagged, SyncStats, TagInfo,
+    TagSort,
+};

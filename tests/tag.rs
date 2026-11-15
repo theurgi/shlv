@@ -1,7 +1,9 @@
 //! Tag management through the library: list, rename, merge, aliases, canonical list.
 
 use shlv::tag::{format_canonical, parse_canonical};
-use shlv::{CanonicalEntry, NewBookmark, Store, TagInfo, TagSort};
+use std::collections::BTreeMap;
+
+use shlv::{CanonicalEntry, DeclaredTags, NewBookmark, Store, SyncStats, TagInfo, TagSort};
 
 fn store() -> Store {
     Store::open_in_memory().unwrap()
@@ -438,4 +440,175 @@ fn strict_mode_rejects_non_canonical_tags_before_writing() {
 
     s.set_strict_tags(false);
     add(&mut s, "https://c.com", &["anything"]);
+}
+
+fn declared(list: &[(&str, &[&str])]) -> DeclaredTags {
+    let map: BTreeMap<String, Vec<String>> = list
+        .iter()
+        .map(|(t, a)| (t.to_string(), strings(a)))
+        .collect();
+    DeclaredTags::new(map).unwrap()
+}
+
+/// Canonical tags and their aliases, as `tag canonical export` prints them.
+fn canonical(s: &Store) -> String {
+    format_canonical(&s.canonical_tags().unwrap())
+}
+
+#[test]
+fn sync_mirrors_declared_list() {
+    let mut s = store();
+    let a = add(&mut s, "a.com", &["rust", "js", "misc"]);
+    s.add_canonical(&strings(&["misc"])).unwrap();
+    // An alias of an undeclared tag, as `tag merge` leaves; it must survive.
+    s.add_alias("miscellaneous", "misc").unwrap();
+
+    let d = declared(&[
+        ("javascript", &["js", "ecmascript"]),
+        ("rust", &[]),
+        ("zig", &["ziglang"]),
+    ]);
+    age(&s);
+    let stats = s.sync_declared(&d).unwrap().unwrap();
+    assert_eq!(
+        stats,
+        SyncStats {
+            marked: 3,
+            unmarked: 1,
+            aliases_added: 2,
+            aliases_removed: 0,
+            merged: vec![("js".into(), "javascript".into(), 1)],
+        }
+    );
+    assert_eq!(
+        canonical(&s),
+        "javascript ecmascript js\nrust\nzig ziglang\n"
+    );
+    // `misc` is unmarked but keeps its bookmark and its alias.
+    let misc = tag(&s, "misc");
+    assert!(!misc.canonical && misc.count == 1);
+    assert_eq!(misc.aliases, ["miscellaneous"]);
+    // The live tag `js` was declared an alias, so it was merged.
+    assert_eq!(tags_of(&s, a), ["javascript", "misc", "rust"]);
+    assert!(updated(&s, a) > 0);
+    assert_eq!(found(&s, "#javascript"), [a]);
+
+    // Strict mode accepts what the list declares.
+    s.set_strict_tags(true);
+    let b = add(&mut s, "b.com", &["ecmascript", "zig"]);
+    assert_eq!(tags_of(&s, b), ["javascript", "zig"]);
+}
+
+#[test]
+fn sync_skips_unchanged_list_without_writing() {
+    let mut s = store();
+    let d = declared(&[("rust", &["rs"]), ("go", &["golang"])]);
+    assert!(s.sync_declared(&d).unwrap().is_some());
+    let before = s.conn().total_changes();
+    assert_eq!(s.sync_declared(&d).unwrap(), None);
+    // The same list in another order hashes the same.
+    assert_eq!(
+        s.sync_declared(&declared(&[("go", &["golang"]), ("rust", &["rs"])]))
+            .unwrap(),
+        None
+    );
+    assert_eq!(s.conn().total_changes(), before);
+
+    // An empty list is still a declared list: it unmarks everything.
+    let stats = s.sync_declared(&declared(&[])).unwrap().unwrap();
+    assert_eq!(stats.unmarked, 2);
+    assert_eq!(canonical(&s), "");
+}
+
+#[test]
+fn sync_removing_a_tag_unmarks_it_and_drops_undeclared_aliases() {
+    let mut s = store();
+    let a = add(&mut s, "a.com", &["rust", "go"]);
+    s.sync_declared(&declared(&[
+        ("rust", &["rs", "rust-lang"]),
+        ("go", &["golang"]),
+    ]))
+    .unwrap();
+
+    let stats = s
+        .sync_declared(&declared(&[("rust", &["rs"])]))
+        .unwrap()
+        .unwrap();
+    assert_eq!((stats.unmarked, stats.aliases_removed), (1, 1));
+    assert_eq!(canonical(&s), "rust rs\n");
+    let go = tag(&s, "go");
+    assert!(!go.canonical);
+    // Aliases of a tag that's no longer declared are its own business now.
+    assert_eq!(go.aliases, ["golang"]);
+    assert_eq!(tags_of(&s, a), ["go", "rust"]);
+}
+
+#[test]
+fn sync_moves_aliases_and_frees_names_declared_as_tags() {
+    let mut s = store();
+    let a = add(&mut s, "a.com", &["javascript"]);
+    s.sync_declared(&declared(&[("javascript", &["js", "ecma"])]))
+        .unwrap();
+
+    // `js` becomes a tag of its own; `ecma` moves to `typescript`.
+    let d = declared(&[("javascript", &[]), ("js", &[]), ("typescript", &["ecma"])]);
+    let stats = s.sync_declared(&d).unwrap().unwrap();
+    assert_eq!(
+        (stats.marked, stats.aliases_added, stats.aliases_removed),
+        (2, 1, 1)
+    );
+    assert_eq!(canonical(&s), "javascript\njs\ntypescript ecma\n");
+    assert_eq!(tags_of(&s, a), ["javascript"]);
+}
+
+#[test]
+fn manual_tag_edits_force_the_next_sync() {
+    let mut s = store();
+    let d = declared(&[("rust", &["rs"])]);
+    s.sync_declared(&d).unwrap();
+    // As if declarative mode were turned off, the list edited by hand, and turned back on.
+    s.remove_canonical(&strings(&["rust"])).unwrap();
+    s.remove_alias("rs").unwrap();
+    assert!(s.sync_declared(&d).unwrap().is_some());
+    assert_eq!(canonical(&s), "rust rs\n");
+}
+
+#[test]
+fn declared_list_validation() {
+    let new = |list: &[(&str, &[&str])]| {
+        let map: BTreeMap<String, Vec<String>> = list
+            .iter()
+            .map(|(t, a)| (t.to_string(), strings(a)))
+            .collect();
+        DeclaredTags::new(map).unwrap_err()
+    };
+    assert_eq!(
+        new(&[("Web Dev", &[])]),
+        "\"Web Dev\" is not a normalized tag name; write \"web-dev\""
+    );
+    assert_eq!(
+        new(&[("web", &["#www"])]),
+        "\"#www\" is not a normalized tag name; write \"www\""
+    );
+    assert_eq!(new(&[("web", &[" "])]), "\" \" is not a valid tag name");
+    assert_eq!(
+        new(&[("javascript", &["js"]), ("json", &["js"])]),
+        "alias \"js\" is declared for both \"javascript\" and \"json\""
+    );
+    assert_eq!(
+        new(&[("javascript", &["js", "js"])]),
+        "alias \"js\" is listed twice for \"javascript\""
+    );
+    assert_eq!(
+        new(&[("javascript", &["js"]), ("js", &[])]),
+        "\"js\" is declared both as a tag and as an alias of \"javascript\""
+    );
+    assert_eq!(new(&[("js", &["js"])]), "\"js\" lists itself as an alias");
+
+    let d = declared(&[("javascript", &["js"])]);
+    assert_eq!(d.resolve("js"), Some("javascript"));
+    assert_eq!(d.resolve("javascript"), Some("javascript"));
+    assert_eq!(d.resolve("rust"), None);
+    assert_ne!(d.hash(), declared(&[("javascript", &[])]).hash());
+    assert_ne!(d.hash(), declared(&[("javascript", &["j"])]).hash());
 }

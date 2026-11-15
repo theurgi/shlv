@@ -62,7 +62,7 @@ fn opens_with_pragmas_and_schema() {
     let v: i64 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 1);
+    assert_eq!(v, 2);
 }
 
 #[test]
@@ -372,4 +372,26 @@ fn each_variants_stream_and_stop_on_error() {
     .unwrap();
     assert_eq!(seen, 3);
     assert_eq!(s.max_id().unwrap(), 5);
+}
+
+#[test]
+fn upgrades_a_version_1_database() {
+    let dir = TempDir::new();
+    let path = dir.0.join("shlv.db");
+    let s = Store::open(&path).unwrap();
+    s.conn()
+        .execute_batch("DROP TABLE meta; PRAGMA user_version = 1;")
+        .unwrap();
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    let v: i64 = s
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
+    let n: i64 = s
+        .conn()
+        .query_row("SELECT count(*) FROM meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 0);
 }

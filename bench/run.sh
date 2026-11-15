@@ -21,6 +21,8 @@ if [[ ! -f $db ]]; then
 fi
 
 export SHLV_DB=$PWD/$db
+# Every command reads the config now; keep the host's out of the read numbers.
+export SHLV_CONFIG=/nonexistent
 opts=(--warmup 5 --min-runs 30 -N --export-markdown "$data/read-$count.md")
 hyperfine "${opts[@]}" \
   -n 'baseline: --version' "$bin --version" \
@@ -60,7 +62,27 @@ hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/add-$co
   -n 'add new url, strict config' "SHLV_CONFIG=$PWD/$config $add" \
   -n 'add duplicate, strict config' \
   "SHLV_CONFIG=$PWD/$config $bin add https://bench.example/same -t bench"
-rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$config"
+
+# A declared canonical list: the database's tags plus synthetic ones, two aliases each (200 tags,
+# 400 aliases). The first run mirrors it into the database; later runs only compare its hash. A
+# manual tag edit clears the stored hash, which forces a resync that has little to do.
+declared=$data/declared.toml
+{
+  echo "[tags.canonical]"
+  { "$bin" tag ls --json | sed 's/.*"name":"\([^"]*\)".*/\1/'; seq -f "topic%g" 1 170; } |
+    sort -u | while read -r t; do echo "\"$t\" = [\"$t-alias\", \"x-$t\"]"; done
+} >"$declared"
+echo "declared: $(($(wc -l <"$declared") - 1)) tags"
+TIMEFORMAT="first sync: %3R s"
+time SHLV_CONFIG=$PWD/$declared "$bin" tag canonical ls >/dev/null
+hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/declared-$count.md" \
+  -n 'ls, no config' "$bin ls" \
+  -n 'ls, declared list (unchanged)' "SHLV_CONFIG=$PWD/$declared $bin ls"
+# A lone --prepare applies to every command, so the resync gets its own run.
+hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/resync-$count.md" \
+  --prepare "$bin tag canonical add scratch >/dev/null" \
+  -n 'ls, declared list (resync)' "SHLV_CONFIG=$PWD/$declared $bin ls"
+rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$config" "$declared"
 
 echo
 echo "binary: $(stat -c %s "$bin") bytes"

@@ -3,11 +3,14 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::Connection;
 use rusqlite::functions::FunctionFlags;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Embedded migrations; `PRAGMA user_version` is the number applied so far.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/001-init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/001-init.sql"),
+    include_str!("../migrations/002-meta.sql"),
+];
 
 /// Resolves the database path: `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 /// `~/.local/share/shlv/shlv.db`.
@@ -81,6 +84,26 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// A value from the `meta` table.
+pub(crate) fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .prepare_cached("SELECT value FROM meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
+        .optional()?)
+}
+
+pub(crate) fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")?
+        .execute([key, value])?;
+    Ok(())
+}
+
+pub(crate) fn meta_delete(conn: &Connection, key: &str) -> Result<()> {
+    conn.prepare_cached("DELETE FROM meta WHERE key = ?1")?
+        .execute([key])?;
     Ok(())
 }
 

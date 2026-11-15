@@ -1,5 +1,5 @@
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use shlv::config::{self, Config};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, parse_canonical};
-use shlv::{Bookmark, Edit, ListQuery, NewBookmark, Store, TagInfo, TagSort};
+use shlv::{
+    Bookmark, DeclaredTags, Edit, ListQuery, NewBookmark, NonCanonicalTags, Store, TagInfo, TagSort,
+};
 
 /// A fast bookmark manager.
 #[derive(Parser)]
@@ -187,10 +189,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let mut store = Store::open_default()?;
-    // Only commands that write tags need settings; the rest don't touch the config file.
-    if matches!(cli.cmd, Cmd::Add { .. } | Cmd::Edit { .. }) {
-        let config = Config::load(&config::default_path()?)?;
-        store.set_strict_tags(config.strict_tags);
+    // Every command that opens the database reads the config: a declared canonical list has to
+    // be mirrored before anything reads or writes tags.
+    let config_path = config::default_path()?;
+    let config = Config::load(&config_path)?;
+    store.set_strict_tags(config.strict_tags);
+    let declared = config.tags.canonical.as_ref().map(|tags| Declared {
+        tags,
+        path: &config_path,
+    });
+    if let Some(d) = &declared {
+        let stats = store
+            .sync_declared(d.tags)
+            .with_context(|| format!("cannot apply [tags.canonical] from {}", d.path.display()))?;
+        for (from, into, n) in stats.iter().flat_map(|s| &s.merged) {
+            let n = plural(*n, "bookmark");
+            eprintln!(
+                "shlv: merged tag {from} into {into} ({n}): {} declares it an alias",
+                d.path.display()
+            );
+        }
     }
     let limit = |n: usize| if n == 0 { usize::MAX } else { n };
 
@@ -205,12 +223,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             if fetch {
                 bail!("--fetch isn't available yet; this build has no fetch support");
             }
-            let added = store.add(&NewBookmark {
-                url,
-                title,
-                note,
-                tags,
-            })?;
+            let added = store
+                .add(&NewBookmark {
+                    url,
+                    title,
+                    note,
+                    tags,
+                })
+                .map_err(|e| declared_hint(e, declared.as_ref()))?;
             let b = store.get(added.id)?.context("bookmark vanished")?;
             let verb = if added.created { "added" } else { "updated" };
             write!(out, "{verb} ")?;
@@ -273,7 +293,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             {
                 bail!("nothing to change; pass --title, --note, or -t");
             }
-            if !store.edit(id, &edit)? {
+            let edited = store
+                .edit(id, &edit)
+                .map_err(|e| declared_hint(e, declared.as_ref()))?;
+            if !edited {
                 bail!("no bookmark with id {id}");
             }
             let b = get(&store, id)?;
@@ -302,7 +325,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Cmd::Open { id } => open(&get(&store, id)?.url)?,
-        Cmd::Tag { cmd } => run_tag(&mut store, cmd, &mut out, &style)?,
+        Cmd::Tag { cmd } => run_tag(&mut store, cmd, declared.as_ref(), &mut out, &style)?,
         Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }
     out.flush()?;
@@ -330,7 +353,71 @@ fn run_config(cmd: ConfigCmd, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) -> Result<()> {
+/// A canonical list declared in config, and the file that declares it.
+struct Declared<'a> {
+    tags: &'a DeclaredTags,
+    path: &'a Path,
+}
+
+impl Declared<'_> {
+    /// The error for a command that would edit the declared list.
+    fn refuse(&self, what: &str) -> anyhow::Error {
+        anyhow!(
+            "{what}: the canonical tag list is declared in {} ([tags.canonical]); edit it there",
+            self.path.display()
+        )
+    }
+
+    /// Refuses `rename`/`merge` when `name` is a declared tag or alias.
+    fn check(&self, cmd: &str, name: &str) -> Result<()> {
+        let name = normalize_tag(name);
+        match self.tags.resolve(&name) {
+            Some(t) if t == name => Err(self.refuse(&format!("cannot {cmd} declared tag {name}"))),
+            Some(t) => Err(self.refuse(&format!(
+                "cannot {cmd} {name}, an alias of declared tag {t}"
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Replaces strict mode's hint (which suggests `tag canonical add`) when the list is declared.
+fn declared_hint(e: anyhow::Error, declared: Option<&Declared>) -> anyhow::Error {
+    match (e.downcast_ref::<NonCanonicalTags>(), declared) {
+        (Some(bad), Some(d)) => anyhow!(
+            "not canonical (strict_tags is on): {}\n\
+             hint: use a canonical tag (`shlv tag canonical ls`), or declare these in {} \
+             ([tags.canonical])",
+            bad.0.join(" "),
+            d.path.display()
+        ),
+        _ => e,
+    }
+}
+
+fn run_tag(
+    store: &mut Store,
+    cmd: TagCmd,
+    declared: Option<&Declared>,
+    out: &mut impl Write,
+    style: &Style,
+) -> Result<()> {
+    if let Some(d) = declared {
+        match &cmd {
+            TagCmd::Alias { .. } => return Err(d.refuse("cannot change aliases")),
+            TagCmd::Canonical {
+                cmd:
+                    CanonicalCmd::Add { .. } | CanonicalCmd::Rm { .. } | CanonicalCmd::Import { .. },
+            } => return Err(d.refuse("cannot change canonical tags")),
+            TagCmd::Rename { old, .. } => d.check("rename", old)?,
+            // Merging into a declared tag would give it an alias the config doesn't list.
+            TagCmd::Merge { from, into } => {
+                d.check("merge", from)?;
+                d.check("merge into", into)?;
+            }
+            _ => {}
+        }
+    }
     match cmd {
         TagCmd::Ls { sort, json } => {
             let sort = match sort {
