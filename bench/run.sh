@@ -3,26 +3,37 @@
 #
 #   bench/run.sh [count]      # default 100000
 #
-# The database is generated once per count and reused (bench/data/, git-ignored). `add` runs
-# against a copy so the base database stays fixed.
+# The database is generated once per count and kept in bench/data/ (git-ignored), along with the
+# result tables. Each run copies the binary and the database to a temporary directory under
+# $TMPDIR (default /tmp) and works there: in the igloo VM, /workspace is virtiofs, which made `ls`
+# 50% slower (13.3 vs 8.9 ms) and `ls -n 0` 2.4x slower than the same files on tmpfs, even with a
+# warm cache. Writes run against scratch copies, so the base database stays fixed.
 set -euo pipefail
 
 count=${1:-100000}
 cd "$(dirname "$0")/.."
-data=bench/data
-db=$data/$count.db
+data=$PWD/bench/data
 mkdir -p "$data"
 
 cargo build --release --quiet --bin shlv --example gen
-bin=$PWD/target/release/shlv
 
-if [[ ! -f $db ]]; then
-  target/release/examples/gen "$count" "$db"
+if [[ ! -f $data/$count.db ]]; then
+  target/release/examples/gen "$count" "$data/$count.db"
 fi
 
-export SHLV_DB=$PWD/$db
+work=$(mktemp -d "${TMPDIR:-/tmp}/shlv-bench.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+bin=$work/shlv
+db=$work/$count.db
+scratch=$work/scratch.db
+cp target/release/shlv "$bin"
+cp "$data/$count.db" "$db"
+echo "working in $work"
+
+export SHLV_DB=$db
 # Every command reads the config now; keep the host's out of the read numbers.
 export SHLV_CONFIG=/nonexistent
+"$bin" ls -n 1 >/dev/null # apply migrations to an older generated database outside the timings
 opts=(--warmup 5 --min-runs 30 -N --export-markdown "$data/read-$count.md")
 hyperfine "${opts[@]}" \
   -n 'baseline: --version' "$bin --version" \
@@ -39,12 +50,23 @@ hyperfine "${opts[@]}" \
   -n 'search site: (500 hits)' "$bin search site:blog.omulri7.com" \
   -n 'search site: (5.8k hits)' "$bin search site:esmarulka0.co.uk"
 
-# add writes, so give it a scratch copy and a fresh URL each run. It's the only benchmarked
-# command that reads the config, so it runs without one and with a typical one.
-scratch=$data/scratch.db
+# Every timing runs without a shell (-N). `--shell bash` subtracts an estimate of the shell's
+# startup, which came out 1.4 ms low for `ls` (3.9 against 5.3 ms), and wrapping a command in `env`
+# adds about 4 ms, so settings go in the environment of hyperfine itself.
+#
+# bench_add URL LABEL FILE: `add` of a new URL and of a duplicate, under $SHLV_CONFIG. The prepare
+# step deletes the bookmark, and its tombstone frees the URL, so each run inserts a new row.
+bench_add() {
+  "$bin" add "$1" -t bench >/dev/null
+  hyperfine -N --warmup 5 --min-runs 30 --export-markdown "$3" \
+    --prepare "$bin rm $1" -n "add new url$2" "$bin add $1 -t bench" \
+    --prepare "$bin --version" -n "add duplicate$2" "$bin add $1 -t bench"
+}
+
+# add writes, so give it a scratch copy. It runs without a config and with a typical one.
 cp "$db" "$scratch"
-export SHLV_DB=$PWD/$scratch
-config=$data/config.toml
+export SHLV_DB=$scratch
+config=$work/config.toml
 cat > "$config" <<'TOML'
 strict_tags = true
 
@@ -54,19 +76,15 @@ model = "example"
 [provider.example]
 url = "http://localhost:11434"
 TOML
-SHLV_CONFIG=/nonexistent "$bin" tag canonical add bench > /dev/null
-add="$bin add \"https://bench.example/\$RANDOM\$RANDOM\$RANDOM\" -t bench"
-hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/add-$count.md" \
-  -n 'add new url' "SHLV_CONFIG=/nonexistent $add" \
-  -n 'add duplicate' "SHLV_CONFIG=/nonexistent $bin add https://bench.example/same -t bench" \
-  -n 'add new url, strict config' "SHLV_CONFIG=$PWD/$config $add" \
-  -n 'add duplicate, strict config' \
-  "SHLV_CONFIG=$PWD/$config $bin add https://bench.example/same -t bench"
+"$bin" tag canonical add bench >/dev/null
+bench_add https://bench.example/a "" "$data/add-$count.md"
+SHLV_CONFIG=$config bench_add https://bench.example/b ", strict config" "$data/add-strict-$count.md"
 
 # A declared canonical list: the database's tags plus synthetic ones, two aliases each (200 tags,
 # 400 aliases). The first run mirrors it into the database; later runs only compare its hash. A
-# manual tag edit clears the stored hash, which forces a resync that has little to do.
-declared=$data/declared.toml
+# manual tag edit clears the stored hash, which forces a resync that has little to do. Compare with
+# `ls` in the read benchmarks.
+declared=$work/declared.toml
 {
   echo "[tags.canonical]"
   { "$bin" tag ls --json | sed 's/.*"name":"\([^"]*\)".*/\1/'; seq -f "topic%g" 1 170; } |
@@ -74,36 +92,34 @@ declared=$data/declared.toml
 } >"$declared"
 echo "declared: $(($(wc -l <"$declared") - 1)) tags"
 TIMEFORMAT="first sync: %3R s"
-time SHLV_CONFIG=$PWD/$declared "$bin" tag canonical ls >/dev/null
-hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/declared-$count.md" \
-  -n 'ls, no config' "$bin ls" \
-  -n 'ls, declared list (unchanged)' "SHLV_CONFIG=$PWD/$declared $bin ls"
-# A lone --prepare applies to every command, so the resync gets its own run.
-hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/resync-$count.md" \
-  --prepare "$bin tag canonical add scratch >/dev/null" \
-  -n 'ls, declared list (resync)' "SHLV_CONFIG=$PWD/$declared $bin ls"
+time SHLV_CONFIG=$declared "$bin" tag canonical ls >/dev/null
+SHLV_CONFIG=$declared hyperfine -N --warmup 5 --min-runs 30 \
+  --export-markdown "$data/declared-$count.md" \
+  --prepare "$bin --version" -n 'ls, declared list (unchanged)' "$bin ls" \
+  --prepare "env SHLV_CONFIG=/nonexistent $bin tag canonical add scratch" \
+  -n 'ls, declared list (resync)' "$bin ls"
 rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$config" "$declared"
 
 # Export everything, import it into an empty database, then import it again (all updates). One run
 # each: these take seconds, not milliseconds.
-export SHLV_DB=$PWD/$db
+export SHLV_DB=$db
 for format in json html; do
   TIMEFORMAT="export $format: %3R s"
-  time "$bin" export --format "$format" >"$data/export.$format"
-  export SHLV_DB=$PWD/$scratch
+  time "$bin" export --format "$format" >"$work/export.$format"
+  export SHLV_DB=$scratch
   rm -f "$scratch" "$scratch"-wal "$scratch"-shm
   TIMEFORMAT="import $format (new): %3R s"
-  time "$bin" import "$data/export.$format" >/dev/null
+  time "$bin" import "$work/export.$format" >/dev/null
   TIMEFORMAT="import $format (again): %3R s"
-  time "$bin" import "$data/export.$format" >/dev/null
-  export SHLV_DB=$PWD/$db
+  time "$bin" import "$work/export.$format" >/dev/null
+  export SHLV_DB=$db
 done
-rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$data/export.json" "$data/export.html"
+rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$work/export.json" "$work/export.html"
 
 # Domain rules: the 40 most common hosts (a fifth of the bookmarks) with two tags each, plus 20
 # rules that match nothing. `add` with rules, then the rules on every bookmark, in confirm mode
 # (record suggestions, run again with nothing new, accept them all) and in auto mode.
-rules=$data/rules.toml
+rules=$work/rules.toml
 {
   echo "[tags.rules]"
   sqlite3 "$db" "SELECT substr(url_norm, 9, instr(substr(url_norm, 9), '/') - 1) h FROM bookmark \
@@ -111,23 +127,24 @@ rules=$data/rules.toml
     awk '{ printf "\"%s\" = [\"site%d\", \"topic%d\"]\n", $0, NR, NR % 7 }'
   for i in $(seq 20); do echo "\"nomatch$i.example\" = [\"nm$i\"]"; done
 } >"$rules"
-auto=$data/rules-auto.toml
+auto=$work/rules-auto.toml
 printf '[tags]\nsuggestions = "auto"\n\n' | cat - "$rules" >"$auto"
 fresh() {
   rm -f "$scratch" "$scratch"-wal "$scratch"-shm
   cp "$db" "$scratch"
   SHLV_CONFIG=/nonexistent "$bin" ls -n 1 >/dev/null # migrate outside the timings
 }
-export SHLV_DB=$PWD/$scratch
+export SHLV_DB=$scratch
 fresh
-match="$bin add \"https://$(sed -n 2p "$rules" | cut -d'"' -f2)/\$RANDOM\$RANDOM\$RANDOM\""
-hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/rules-$count.md" \
-  -n 'add new url, no config' "SHLV_CONFIG=/nonexistent $add" \
-  -n 'add new url, 60 rules, no match' "SHLV_CONFIG=$PWD/$rules $add" \
-  -n 'add new url, 60 rules, match' "SHLV_CONFIG=$PWD/$rules $match" \
-  -n 'ls, 60 rules' "SHLV_CONFIG=$PWD/$rules $bin ls"
+host=$(sed -n 2p "$rules" | cut -d'"' -f2)
+SHLV_CONFIG=$rules bench_add https://bench.example/c ", 60 rules, no match" \
+  "$data/add-rules-$count.md"
+SHLV_CONFIG=$rules bench_add "https://$host/new" ", 60 rules, match" \
+  "$data/add-rules-match-$count.md"
+SHLV_CONFIG=$rules hyperfine -N --warmup 5 --min-runs 30 --export-markdown "$data/rules-$count.md" \
+  -n 'ls, 60 rules' "$bin ls"
 fresh
-export SHLV_CONFIG=$PWD/$rules
+export SHLV_CONFIG=$rules
 TIMEFORMAT="suggest --all (confirm): %3R s"
 time "$bin" suggest --all
 TIMEFORMAT="suggest --all (again, nothing new): %3R s"
@@ -135,7 +152,7 @@ time "$bin" suggest --all >/dev/null
 TIMEFORMAT="suggest accept --all: %3R s"
 time "$bin" suggest accept --all
 fresh
-export SHLV_CONFIG=$PWD/$auto
+export SHLV_CONFIG=$auto
 TIMEFORMAT="suggest --all (auto): %3R s"
 time "$bin" suggest --all
 export SHLV_CONFIG=/nonexistent
@@ -143,4 +160,4 @@ rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$rules" "$auto"
 
 echo
 echo "binary: $(stat -c %s "$bin") bytes"
-echo "database: $(stat -c %s "$db") bytes, $(( $(stat -c %s "$db") / count )) bytes/bookmark"
+echo "database: $(stat -c %s "$data/$count.db") bytes, $(( $(stat -c %s "$data/$count.db") / count )) bytes/bookmark"

@@ -135,18 +135,18 @@ local model and an LLM, both opt-in) will add their suggestions to the same list
 ## Performance
 
 Measured with [`bench/run.sh`](bench/run.sh) on 100k synthetic bookmarks (release build, warm cache,
-in a VM where starting a process takes about 5 ms):
+binary and database on tmpfs, in a VM where starting a process takes about 4.4 ms):
 
-| Command                    | Mean    |
-| -------------------------- | ------- |
-| `ls` (first page)          | 11.6 ms |
-| `search kalomi` (28 hits)  | 19 ms   |
-| `search rust` (51k hits)   | 47 ms   |
-| `add` (new URL)            | 16 ms   |
-| `export` (100k, JSON)      | 0.7 s   |
-| `import` (100k, JSON)      | 5.0 s   |
-| Release binary             | 3.4 MB  |
-| Database size per bookmark | 723 B   |
+| Command                    | Mean   |
+| -------------------------- | ------ |
+| `ls` (first page)          | 5.2 ms |
+| `search kalomi` (28 hits)  | 5.9 ms |
+| `search rust` (51k hits)   | 31 ms  |
+| `add` (new URL)            | 5.4 ms |
+| `export` (100k, JSON)      | 0.2 s  |
+| `import` (100k, JSON)      | 1.9 s  |
+| Release binary             | 3.9 MB |
+| Database size per bookmark | 723 B  |
 
 ## Development
 
