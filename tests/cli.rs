@@ -246,3 +246,179 @@ fn ids_align_to_widest_id_in_database() {
         Some(" 9  https://9.com  #nine")
     );
 }
+
+#[test]
+fn tag_ls() {
+    let db = Db::new();
+    for i in 0..10 {
+        db.ok(&["add", &format!("https://{i}.com"), "-t", "rust"]);
+    }
+    db.ok(&["add", "https://x.com", "-t", "web"]);
+    db.ok(&["tag", "canonical", "add", "web"]);
+    db.ok(&["tag", "alias", "rs", "rust"]);
+    db.ok(&["tag", "alias", "rust-lang", "rust"]);
+    assert_eq!(
+        db.ok(&["tag", "ls"]),
+        "10   rust  = rs rust-lang\n 1 * web\n"
+    );
+    db.ok(&["tag", "canonical", "add", "zig"]);
+    let by_count = db.ok(&["tag", "ls", "--sort", "count"]);
+    let names: Vec<_> = by_count
+        .lines()
+        .map(|l| l.split_whitespace().last().unwrap())
+        .collect();
+    assert_eq!(names, ["rust-lang", "web", "zig"], "{by_count}");
+    let v = json_lines(&db.ok(&["tag", "ls", "--json"]));
+    assert_eq!(v.len(), 3);
+    assert_eq!(v[0]["name"], "rust");
+    assert_eq!(v[0]["count"], 10);
+    assert_eq!(v[0]["canonical"], false);
+    assert_eq!(v[0]["aliases"], serde_json::json!(["rs", "rust-lang"]));
+    assert_eq!(v[2]["name"], "zig");
+    assert_eq!(v[2]["canonical"], true);
+    assert_eq!(v[2]["count"], 0);
+    assert!(
+        db.fail(&["tag", "ls", "--sort", "bogus"])
+            .contains("invalid value")
+    );
+}
+
+#[test]
+fn tag_rename() {
+    let db = Db::new();
+    db.ok(&["add", "https://a.com", "-t", "rust", "-t", "web"]);
+    let uid = json_lines(&db.ok(&["tag", "ls", "--json"]))[0]["uid"].clone();
+    assert_eq!(
+        db.ok(&["tag", "rename", "Rust", "rust-lang"]),
+        "renamed rust to rust-lang (1 bookmark)\n"
+    );
+    assert_eq!(json_lines(&db.ok(&["tag", "ls", "--json"]))[0]["uid"], uid);
+    assert_eq!(db.ok(&["ls"]), "1  https://a.com  #rust-lang  #web\n");
+    assert_eq!(db.ok(&["search", "#rust-lang"]).lines().count(), 1);
+    let err = db.fail(&["tag", "rename", "rust-lang", "web"]);
+    assert!(
+        err.contains("already exists") && err.contains("shlv tag merge"),
+        "{err}"
+    );
+    assert!(db.fail(&["tag", "rename", "nope", "x"]).contains("no tag"));
+}
+
+#[test]
+fn tag_merge() {
+    let db = Db::new();
+    db.ok(&["add", "https://a.com", "-t", "js"]);
+    db.ok(&["add", "https://b.com", "-t", "js", "-t", "javascript"]);
+    db.ok(&["tag", "alias", "ecmascript", "js"]);
+    assert_eq!(
+        db.ok(&["tag", "merge", "js", "javascript"]),
+        "merged js into javascript (2 bookmarks); js is now an alias\n"
+    );
+    assert_eq!(db.ok(&["tag", "ls"]), "2   javascript  = ecmascript js\n");
+    assert_eq!(
+        db.ok(&["ls"]),
+        "2  https://b.com  #javascript\n1  https://a.com  #javascript\n"
+    );
+    // Re-adding the old name lands on the target.
+    assert_eq!(
+        db.ok(&["add", "https://c.com", "-t", "js"]),
+        "added 3  https://c.com  #javascript\n"
+    );
+    assert_eq!(db.ok(&["ls", "-t", "ecmascript"]).lines().count(), 3);
+    let err = db.fail(&["tag", "merge", "javascript", "nope"]);
+    assert!(err.contains("no tag \"nope\""), "{err}");
+}
+
+#[test]
+fn tag_alias() {
+    let db = Db::new();
+    db.ok(&["add", "https://a.com", "-t", "rust", "-t", "go"]);
+    assert_eq!(
+        db.ok(&["tag", "alias", "rs", "rust"]),
+        "added alias rs for rust\n"
+    );
+    assert_eq!(
+        db.ok(&["tag", "alias", "rs", "rust"]),
+        "rs is already an alias of rust\n"
+    );
+    assert_eq!(db.ok(&["ls", "-t", "rs"]).lines().count(), 1);
+    let err = db.fail(&["tag", "alias", "go", "rust"]);
+    assert!(
+        err.contains("is a tag") && err.contains("shlv tag merge go rust"),
+        "{err}"
+    );
+    assert_eq!(
+        db.ok(&["tag", "alias", "--rm", "rs"]),
+        "removed alias rs (of rust)\n"
+    );
+    assert!(
+        db.fail(&["tag", "alias", "--rm", "rs"])
+            .contains("no alias")
+    );
+    // TAG is required without --rm and refused with it.
+    db.fail(&["tag", "alias", "rs"]);
+    db.fail(&["tag", "alias", "--rm", "rs", "rust"]);
+}
+
+#[test]
+fn tag_canonical() {
+    let db = Db::new();
+    db.ok(&["add", "https://a.com", "-t", "rust", "-t", "js"]);
+    assert_eq!(
+        db.ok(&["tag", "canonical", "add", "rust", "zig"]),
+        "marked 2 tags canonical\n"
+    );
+    assert_eq!(db.ok(&["tag", "canonical", "ls"]), "rust\nzig\n");
+    assert_eq!(
+        db.ok(&["tag", "canonical", "rm", "zig"]),
+        "unmarked 1 tag\n"
+    );
+    assert_eq!(db.ok(&["tag", "canonical", "ls"]), "rust\n");
+    db.fail(&["tag", "canonical", "add"]);
+
+    let file = db.0.join("tags.txt");
+    std::fs::write(
+        &file,
+        "# my list\nJavaScript ecmascript  # comment\n\nrust rs\n",
+    )
+    .unwrap();
+    assert_eq!(
+        db.ok(&["tag", "canonical", "import", file.to_str().unwrap()]),
+        "imported 2 tags: 1 newly canonical, 2 aliases added\n"
+    );
+    assert_eq!(
+        db.ok(&["tag", "canonical", "export"]),
+        "javascript ecmascript\nrust rs\n"
+    );
+
+    // From stdin; import only adds.
+    let mut c = db.cmd(&["tag", "canonical", "import", "-"]);
+    c.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"go golang\n")
+        .unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    assert_eq!(
+        db.ok(&["tag", "canonical", "export"]),
+        "go golang\njavascript ecmascript\nrust rs\n"
+    );
+
+    // A conflicting line fails the whole import.
+    std::fs::write(&file, "python py\nweb js\n").unwrap();
+    let err = db.fail(&["tag", "canonical", "import", file.to_str().unwrap()]);
+    assert!(
+        err.contains("line 2") && err.contains("\"js\" is a tag"),
+        "{err}"
+    );
+    assert!(!db.ok(&["tag", "canonical", "ls"]).contains("python"));
+    assert!(
+        db.fail(&["tag", "canonical", "import", "/nonexistent"])
+            .contains("cannot read")
+    );
+}

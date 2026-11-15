@@ -1,9 +1,12 @@
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
-use shlv::{Bookmark, Edit, ListQuery, NewBookmark, Store};
+use clap::{Parser, Subcommand, ValueEnum};
+use shlv::store::normalize_tag;
+use shlv::tag::{format_canonical, parse_canonical};
+use shlv::{Bookmark, Edit, ListQuery, NewBookmark, Store, TagInfo, TagSort};
 
 /// A fast bookmark manager.
 #[derive(Parser)]
@@ -79,6 +82,68 @@ enum Cmd {
     },
     /// Open a bookmark in the browser ($BROWSER, else the system opener)
     Open { id: i64 },
+    /// Manage tags: list, rename, merge, aliases, canonical list
+    Tag {
+        #[command(subcommand)]
+        cmd: TagCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagCmd {
+    /// List tags with their bookmark counts; * marks canonical tags, = lists aliases
+    Ls {
+        /// Sort order
+        #[arg(long, value_enum, default_value_t = SortArg::Name)]
+        sort: SortArg,
+        /// One JSON object per line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename a tag (use merge if NEW already exists)
+    Rename { old: String, new: String },
+    /// Move every bookmark from FROM to INTO and leave FROM as an alias of INTO
+    Merge { from: String, into: String },
+    /// Make ALIAS resolve to TAG on input, or remove an alias with --rm
+    Alias {
+        alias: String,
+        #[arg(required_unless_present = "rm", conflicts_with = "rm")]
+        tag: Option<String>,
+        /// Remove ALIAS
+        #[arg(long)]
+        rm: bool,
+    },
+    /// Mark, unmark, list, import, or export canonical tags
+    Canonical {
+        #[command(subcommand)]
+        cmd: CanonicalCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CanonicalCmd {
+    /// Mark tags canonical (creating them if needed)
+    Add {
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Unmark canonical tags (the tags stay)
+    Rm {
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// List canonical tags
+    Ls,
+    /// Add tags and aliases from a file ("-" for stdin): one tag per line, aliases after it
+    Import { file: PathBuf },
+    /// Print the canonical list in the format import reads
+    Export,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SortArg {
+    Name,
+    Count,
 }
 
 fn main() -> ExitCode {
@@ -213,9 +278,131 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Cmd::Open { id } => open(&get(&store, id)?.url)?,
+        Cmd::Tag { cmd } => run_tag(&mut store, cmd, &mut out, &style)?,
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) -> Result<()> {
+    match cmd {
+        TagCmd::Ls { sort, json } => {
+            let sort = match sort {
+                SortArg::Name => TagSort::Name,
+                SortArg::Count => TagSort::Count,
+            };
+            let tags = store.tags(sort)?;
+            let width = tags.iter().map(|t| t.count).max().unwrap_or(0);
+            let width = width.to_string().len();
+            for t in &tags {
+                if json {
+                    serde_json::to_writer(&mut *out, t)?;
+                    writeln!(out)?;
+                } else {
+                    print_tag(out, t, width, style)?;
+                }
+            }
+        }
+        TagCmd::Rename { old, new } => {
+            let r = store.rename_tag(&old, &new)?;
+            let n = plural(r.bookmarks, "bookmark");
+            writeln!(out, "renamed {} to {} ({n})", normalize_tag(&old), r.tag)?;
+        }
+        TagCmd::Merge { from, into } => {
+            let r = store.merge_tags(&from, &into)?;
+            let (from, n) = (normalize_tag(&from), plural(r.bookmarks, "bookmark"));
+            writeln!(
+                out,
+                "merged {from} into {} ({n}); {from} is now an alias",
+                r.tag
+            )?;
+        }
+        TagCmd::Alias {
+            alias,
+            tag: None,
+            rm: true,
+        } => {
+            let alias = normalize_tag(&alias);
+            match store.remove_alias(&alias)? {
+                Some(tag) => writeln!(out, "removed alias {alias} (of {tag})")?,
+                None => bail!("no alias {alias:?}"),
+            }
+        }
+        TagCmd::Alias {
+            alias,
+            tag: Some(tag),
+            rm: false,
+        } => {
+            let added = store.add_alias(&alias, &tag)?;
+            let (alias, tag) = (normalize_tag(&alias), normalize_tag(&tag));
+            if added {
+                writeln!(out, "added alias {alias} for {tag}")?;
+            } else {
+                writeln!(out, "{alias} is already an alias of {tag}")?;
+            }
+        }
+        TagCmd::Alias { .. } => unreachable!("clap requires TAG unless --rm, and not both"),
+        TagCmd::Canonical { cmd } => match cmd {
+            CanonicalCmd::Add { tags } => {
+                let n = store.add_canonical(&tags)?;
+                writeln!(out, "marked {} canonical", plural(n, "tag"))?;
+            }
+            CanonicalCmd::Rm { tags } => {
+                let n = store.remove_canonical(&tags)?;
+                writeln!(out, "unmarked {}", plural(n, "tag"))?;
+            }
+            CanonicalCmd::Ls => {
+                for t in store.canonical_tags()? {
+                    writeln!(out, "{}", t.name)?;
+                }
+            }
+            CanonicalCmd::Import { file } => {
+                let mut text = String::new();
+                if file.as_os_str() == "-" {
+                    io::stdin().read_to_string(&mut text)?;
+                } else {
+                    text = std::fs::read_to_string(&file)
+                        .with_context(|| format!("cannot read {}", file.display()))?;
+                }
+                let s = store
+                    .import_canonical(&parse_canonical(&text))
+                    .with_context(|| format!("cannot import {}", file.display()))?;
+                writeln!(
+                    out,
+                    "imported {}: {} newly canonical, {} added",
+                    plural(s.tags, "tag"),
+                    s.marked,
+                    plural(s.aliases, "alias"),
+                )?;
+            }
+            CanonicalCmd::Export => {
+                out.write_all(format_canonical(&store.canonical_tags()?).as_bytes())?
+            }
+        },
+    }
+    Ok(())
+}
+
+/// One tag: count, canonical marker, name, aliases.
+fn print_tag(out: &mut impl Write, t: &TagInfo, width: usize, s: &Style) -> io::Result<()> {
+    let mark = if t.canonical { '*' } else { ' ' };
+    write!(
+        out,
+        "{}{:>width$}{} {mark} {}{}{}",
+        s.dim, t.count, s.reset, s.tag, t.name, s.reset
+    )?;
+    if !t.aliases.is_empty() {
+        write!(out, "  {}= {}{}", s.dim, t.aliases.join(" "), s.reset)?;
+    }
+    writeln!(out)
+}
+
+fn plural(n: usize, word: &str) -> String {
+    match (n, word.ends_with('s')) {
+        (1, _) => format!("1 {word}"),
+        (_, true) => format!("{n} {word}es"),
+        _ => format!("{n} {word}s"),
+    }
 }
 
 /// Width of the id column: the widest id the database has handed out, so rows align without
