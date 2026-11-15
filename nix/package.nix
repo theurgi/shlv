@@ -1,8 +1,6 @@
 {
   lib,
   rustPlatform,
-  pkg-config,
-  sqlite,
 }:
 let
   fs = lib.fileset;
@@ -25,10 +23,10 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
-  # nixpkgs' cargo setup hook sets LIBSQLITE3_SYS_USE_PKG_CONFIG=1, which overrides rusqlite's
-  # `bundled` feature and links the system SQLite instead (nixpkgs' sqlite has FTS5).
-  nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ sqlite ];
+  # nixpkgs' cargo setup hook exports LIBSQLITE3_SYS_USE_PKG_CONFIG=1, which overrides rusqlite's
+  # `bundled` feature. Keep the bundled SQLite so the package matches what `cargo test` and
+  # `bench/run.sh` measure (see tasks/completed/009-nix-package.md).
+  preBuild = "export LIBSQLITE3_SYS_USE_PKG_CONFIG=0";
 
   meta = {
     description = "A fast, resource-efficient bookmarking app";
