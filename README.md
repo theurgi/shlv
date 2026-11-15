@@ -34,25 +34,33 @@ $ shlv search fts5
 1  SQLite FTS5  https://www.sqlite.org/fts5.html  #search  #sqlite
 ```
 
-| Command                     | What it does                                                      |
-| --------------------------- | ----------------------------------------------------------------- |
-| `add URL [-t TAG]...`       | Add a bookmark, or update it if the URL is already saved          |
-| `ls [-t TAG]... [-n N]`     | List bookmarks, newest first                                      |
-| `search QUERY...`           | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`    |
-| `show ID`                   | Show one bookmark in full                                         |
-| `edit ID [-t +TAG/-TAG]...` | Change a bookmark's title, note, or tags                          |
-| `rm ID\|URL...`             | Delete bookmarks                                                  |
-| `open ID`                   | Open a bookmark with `$BROWSER` or the system opener              |
-| `tag ls [--sort count]`     | Tags with bookmark counts; `*` marks canonical, `=` lists aliases |
-| `tag rename OLD NEW`        | Rename a tag                                                      |
-| `tag merge FROM INTO`       | Retag FROM's bookmarks as INTO; FROM becomes an alias             |
-| `tag alias ALIAS TAG`       | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)      |
-| `tag canonical add\|rm\|ls` | Mark, unmark, or list canonical tags                              |
-| `tag canonical import FILE` | Add a canonical list: one tag per line, aliases after it          |
-| `tag canonical export`      | Print the canonical list in that format                           |
-| `config path\|show`         | Print the config file path, or the effective config               |
+| Command                     | What it does                                                        |
+| --------------------------- | ------------------------------------------------------------------- |
+| `add URL [-t TAG]...`       | Add a bookmark, or update it if the URL is already saved            |
+| `ls [-t TAG]... [-n N]`     | List bookmarks, newest first                                        |
+| `search QUERY...`           | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`      |
+| `show ID`                   | Show one bookmark in full                                           |
+| `edit ID [-t +TAG/-TAG]...` | Change a bookmark's title, note, or tags                            |
+| `rm ID\|URL...`             | Delete bookmarks                                                    |
+| `open ID`                   | Open a bookmark with `$BROWSER` or the system opener                |
+| `tag ls [--sort count]`     | Tags with bookmark counts; `*` marks canonical, `=` lists aliases   |
+| `tag rename OLD NEW`        | Rename a tag                                                        |
+| `tag merge FROM INTO`       | Retag FROM's bookmarks as INTO; FROM becomes an alias               |
+| `tag alias ALIAS TAG`       | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)        |
+| `tag canonical add\|rm\|ls` | Mark, unmark, or list canonical tags                                |
+| `tag canonical import FILE` | Add a canonical list: one tag per line, aliases after it            |
+| `tag canonical export`      | Print the canonical list in that format                             |
+| `import FILE`               | Import a browser export (Netscape HTML) or JSON lines; `-` is stdin |
+| `export [--format html]`    | Print every bookmark as JSON lines, or HTML that browsers import    |
+| `config path\|show`         | Print the config file path, or the effective config                 |
 
 `ls`, `search`, and `tag ls` take `--json` for one JSON object per line. `-n 0` shows every result.
+
+`import` detects the format and treats URLs already saved the way `add` does: it updates the
+bookmark and merges tags. It keeps creation times, titles, tags, and notes, and skips `javascript:`
+and `place:` URLs. Browser folders become tags only with `--folders-as-tags`. With `strict_tags`, an
+import with non-canonical tags writes nothing unless you pass `--drop-unknown-tags`. `export` then
+`import` (JSON) reproduces a database, uids included.
 
 The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 `~/.local/share/shlv/shlv.db`.
@@ -89,6 +97,8 @@ in a VM where starting a process takes about 5 ms):
 | `search kalomi` (28 hits)  | 19 ms   |
 | `search rust` (51k hits)   | 47 ms   |
 | `add` (new URL)            | 16 ms   |
+| `export` (100k, JSON)      | 0.7 s   |
+| `import` (100k, JSON)      | 5.0 s   |
 | Release binary             | 3.4 MB  |
 | Database size per bookmark | 723 B   |
 

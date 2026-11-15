@@ -113,7 +113,7 @@ fn new_uid() -> String {
 }
 
 /// Empty strings mean "no value".
-fn non_empty(s: &Option<String>) -> Option<&str> {
+pub(crate) fn non_empty(s: &Option<String>) -> Option<&str> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty())
 }
 
@@ -149,6 +149,11 @@ impl Store {
         self.strict_tags = on;
     }
 
+    /// Whether strict mode is on; see [`Store::set_strict_tags`].
+    pub fn strict_tags(&self) -> bool {
+        self.strict_tags
+    }
+
     /// Fails with [`NonCanonicalTags`] if strict mode is on and any of `tags` (normalized) isn't
     /// canonical or an alias of a canonical tag.
     pub(crate) fn check_strict(&self, tags: &[String]) -> Result<()> {
@@ -170,57 +175,26 @@ impl Store {
     /// Adds a bookmark. If its normalized URL is already bookmarked, updates that bookmark
     /// instead: given title and note replace the old ones, tags are added.
     pub fn add(&mut self, new: &NewBookmark) -> Result<Added> {
-        let full = url::complete(&new.url);
-        if full.trim() == "https://" || full.chars().any(char::is_whitespace) {
-            bail!("invalid URL: {:?}", new.url);
-        }
-        let norm = url::normalize(&full);
+        let (full, norm) = check_url(&new.url)?;
         let tags = normalize_tags(&new.tags)?;
         self.check_strict(&tags)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT id FROM bookmark WHERE url_norm = ?1 AND deleted_at IS NULL",
-                [&norm],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let added = match existing {
-            Some(id) => {
-                tx.execute(
-                    "UPDATE bookmark SET title = coalesce(?2, title), note = coalesce(?3, note), \
-                     updated_at = ?4 WHERE id = ?1",
-                    params![id, non_empty(&new.title), non_empty(&new.note), now],
-                )?;
-                Added { id, created: false }
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO bookmark (uid, url, url_norm, title, note, created_at, \
-                     updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![
-                        new_uid(),
-                        full,
-                        norm,
-                        non_empty(&new.title),
-                        non_empty(&new.note),
-                        now
-                    ],
-                )?;
-                Added {
-                    id: tx.last_insert_rowid(),
-                    created: true,
-                }
-            }
-        };
-        for tag in &tags {
-            let tag_id = ensure_tag(&tx, tag, now)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO bookmark_tag (bookmark_id, tag_id) VALUES (?1, ?2)",
-                params![added.id, tag_id],
-            )?;
-        }
+        let added = put(
+            &tx,
+            &Put {
+                url: &full,
+                norm: &norm,
+                title: non_empty(&new.title),
+                note: non_empty(&new.note),
+                summary: None,
+                tags: &tags,
+                uid: None,
+                created_at: now,
+                updated_at: now,
+            },
+            now,
+        )?;
         reindex(&tx, added.id)?;
         tx.commit()?;
         Ok(added)
@@ -434,6 +408,94 @@ impl Store {
     }
 }
 
+/// Completes and checks a URL; returns it and its normalized form.
+pub(crate) fn check_url(input: &str) -> Result<(String, String)> {
+    let full = url::complete(input);
+    if full.trim() == "https://" || full.chars().any(char::is_whitespace) {
+        bail!("invalid URL: {input:?}");
+    }
+    let norm = url::normalize(&full);
+    Ok((full, norm))
+}
+
+/// A bookmark to insert, or to merge into the live one with the same normalized URL; see
+/// [`put`].
+pub(crate) struct Put<'a> {
+    /// Completed and checked (see [`check_url`]).
+    pub url: &'a str,
+    pub norm: &'a str,
+    pub title: Option<&'a str>,
+    pub note: Option<&'a str>,
+    pub summary: Option<&'a str>,
+    /// Normalized.
+    pub tags: &'a [String],
+    /// Kept for a new bookmark if it's a valid UUID no other bookmark (live or deleted) has;
+    /// otherwise a new one is generated.
+    pub uid: Option<&'a str>,
+    pub created_at: i64,
+    /// For a new bookmark; an updated one gets `now`.
+    pub updated_at: i64,
+}
+
+/// Inserts a bookmark, or, if its normalized URL is already bookmarked, updates that one: given
+/// title, note, and summary replace the old ones, tags are added, and the earlier `created_at`
+/// wins. Callers check strict mode first and reindex the bookmark after.
+pub(crate) fn put(tx: &Transaction, p: &Put, now: i64) -> Result<Added> {
+    let existing: Option<i64> = tx
+        .prepare_cached("SELECT id FROM bookmark WHERE url_norm = ?1 AND deleted_at IS NULL")?
+        .query_row([p.norm], |r| r.get(0))
+        .optional()?;
+    let added = match existing {
+        Some(id) => {
+            tx.prepare_cached(
+                "UPDATE bookmark SET title = coalesce(?2, title), note = coalesce(?3, note), \
+                 summary = coalesce(?4, summary), created_at = min(created_at, ?5), \
+                 updated_at = ?6 WHERE id = ?1",
+            )?
+            .execute(params![id, p.title, p.note, p.summary, p.created_at, now])?;
+            Added { id, created: false }
+        }
+        None => {
+            let uid = match p.uid.and_then(|u| uuid::Uuid::parse_str(u).ok()) {
+                Some(u) if !uid_taken(tx, &u.to_string())? => u.to_string(),
+                _ => new_uid(),
+            };
+            tx.prepare_cached(
+                "INSERT INTO bookmark (uid, url, url_norm, title, note, summary, created_at, \
+                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?
+            .execute(params![
+                uid,
+                p.url,
+                p.norm,
+                p.title,
+                p.note,
+                p.summary,
+                p.created_at,
+                p.updated_at
+            ])?;
+            Added {
+                id: tx.last_insert_rowid(),
+                created: true,
+            }
+        }
+    };
+    let mut link = tx.prepare_cached(
+        "INSERT OR IGNORE INTO bookmark_tag (bookmark_id, tag_id) VALUES (?1, ?2)",
+    )?;
+    for tag in p.tags {
+        link.execute(params![added.id, ensure_tag(tx, tag, now)?])?;
+    }
+    Ok(added)
+}
+
+/// Whether any bookmark, deleted ones included, has this uid.
+fn uid_taken(tx: &Transaction, uid: &str) -> Result<bool> {
+    Ok(tx
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM bookmark WHERE uid = ?1)")?
+        .query_row([uid], |r| r.get(0))?)
+}
+
 pub(crate) fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
     tags.iter()
         .map(|t| {
@@ -488,6 +550,22 @@ pub(crate) fn reindex(tx: &Transaction, id: i64) -> Result<()> {
 /// tags changed. Set-based statements are about 3× faster than [`reindex`] in a loop (1.1 s
 /// against 3.2 s for 47k bookmarks).
 pub(crate) fn touch_many(tx: &Transaction, ids: &[i64], now: i64) -> Result<()> {
+    fill_touched(tx, ids)?;
+    tx.execute(
+        "UPDATE bookmark SET updated_at = ?1 WHERE id IN (SELECT id FROM touched)",
+        [now],
+    )?;
+    reindex_touched(tx)
+}
+
+/// Rewrites the full-text rows of many bookmarks at once; see [`touch_many`].
+pub(crate) fn reindex_many(tx: &Transaction, ids: &[i64]) -> Result<()> {
+    fill_touched(tx, ids)?;
+    reindex_touched(tx)
+}
+
+/// Fills the temporary `touched` table with `ids`.
+fn fill_touched(tx: &Transaction, ids: &[i64]) -> Result<()> {
     tx.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS touched (id INTEGER PRIMARY KEY); DELETE FROM touched;",
     )?;
@@ -495,10 +573,11 @@ pub(crate) fn touch_many(tx: &Transaction, ids: &[i64], now: i64) -> Result<()> 
     for &id in ids {
         insert.execute([id])?;
     }
-    tx.execute(
-        "UPDATE bookmark SET updated_at = ?1 WHERE id IN (SELECT id FROM touched)",
-        [now],
-    )?;
+    Ok(())
+}
+
+/// Rewrites the full-text rows of the bookmarks in `touched`, then empties it.
+fn reindex_touched(tx: &Transaction) -> Result<()> {
     tx.execute(
         "DELETE FROM bookmark_fts WHERE rowid IN (SELECT id FROM touched)",
         [],

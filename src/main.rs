@@ -8,8 +8,10 @@ use shlv::config::{self, Config};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, parse_canonical};
 use shlv::{
-    Bookmark, DeclaredTags, Edit, ListQuery, NewBookmark, NonCanonicalTags, Store, TagInfo, TagSort,
+    Bookmark, DeclaredTags, Edit, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalTags,
+    Store, TagInfo, TagSort,
 };
+use shlv::{netscape, transfer};
 
 /// A fast bookmark manager.
 #[derive(Parser)]
@@ -90,6 +92,24 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
+    /// Import bookmarks from a browser export (Netscape HTML) or JSON lines ("-" for stdin)
+    Import {
+        file: PathBuf,
+        /// Input format (default: detected from the content)
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
+        /// Tag each bookmark with the names of its folders
+        #[arg(long)]
+        folders_as_tags: bool,
+        /// Drop tags that aren't canonical instead of failing (strict_tags)
+        #[arg(long)]
+        drop_unknown_tags: bool,
+    },
+    /// Print every bookmark: JSON lines (like `ls --json`) or Netscape HTML for browsers
+    Export {
+        #[arg(long, value_enum, default_value_t = FormatArg::Json)]
+        format: FormatArg,
+    },
     /// Show where the config file is and what it sets
     Config {
         #[command(subcommand)]
@@ -156,6 +176,12 @@ enum CanonicalCmd {
     Export,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum FormatArg {
+    Json,
+    Html,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum SortArg {
     Name,
@@ -211,6 +237,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
     }
     let limit = |n: usize| if n == 0 { usize::MAX } else { n };
+    let all = ListQuery {
+        tags: Vec::new(),
+        limit: usize::MAX,
+    };
 
     match cli.cmd {
         Cmd::Add {
@@ -261,7 +291,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Show { id, json } => {
             let b = get(&store, id)?;
             if json {
-                serde_json::to_writer(&mut out, &b)?;
+                serde_json::to_writer(&mut out, &b).map_err(io::Error::from)?;
                 writeln!(out)?;
             } else {
                 print_full(&mut out, &b)?;
@@ -325,6 +355,65 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
         Cmd::Open { id } => open(&get(&store, id)?.url)?,
+        Cmd::Import {
+            file,
+            format,
+            folders_as_tags,
+            drop_unknown_tags,
+        } => {
+            let text = read_input(&file)?;
+            let format = match format {
+                Some(FormatArg::Json) => Format::Json,
+                Some(FormatArg::Html) => Format::Html,
+                None => Format::detect(&text),
+            };
+            let name = file.display();
+            let items = transfer::parse(&text, format, folders_as_tags)
+                .with_context(|| format!("cannot read {name}"))?;
+            let opts = ImportOptions {
+                drop_non_canonical: drop_unknown_tags,
+            };
+            let s = store.import(&items, opts).map_err(|e| {
+                match (e.downcast_ref::<NonCanonicalTags>(), &declared) {
+                    (Some(bad), d) => {
+                        let fix = match d {
+                            Some(d) => format!("declare them in {}", d.path.display()),
+                            None => "make them canonical (`shlv tag canonical add`)".into(),
+                        };
+                        anyhow!(
+                            "nothing imported: {name} has tags that aren't canonical \
+                             (strict_tags is on): {}\n\
+                             hint: pass --drop-unknown-tags to import without them, or {fix}",
+                            bad.0.join(" ")
+                        )
+                    }
+                    _ => e.context(format!("cannot import {name}")),
+                }
+            })?;
+            for (url, why) in &s.skipped {
+                eprintln!("shlv: skipped {why}: {}", truncate(url, 100));
+            }
+            if !s.dropped_tags.is_empty() {
+                eprintln!("shlv: dropped tags: {}", s.dropped_tags.join(" "));
+            }
+            writeln!(
+                out,
+                "imported {name}: {} added, {} updated, {} skipped",
+                s.added,
+                s.updated,
+                s.skipped.len()
+            )?;
+        }
+        Cmd::Export { format } => match format {
+            FormatArg::Json => {
+                store.list_each(&all, |b| print_item(&mut out, &b, true, 0, &style))?;
+            }
+            FormatArg::Html => {
+                netscape::write_header(&mut out)?;
+                store.list_each(&all, |b| Ok(netscape::write_bookmark(&mut out, &b)?))?;
+                netscape::write_footer(&mut out)?;
+            }
+        },
         Cmd::Tag { cmd } => run_tag(&mut store, cmd, declared.as_ref(), &mut out, &style)?,
         Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }
@@ -429,7 +518,7 @@ fn run_tag(
             let width = width.to_string().len();
             for t in &tags {
                 if json {
-                    serde_json::to_writer(&mut *out, t)?;
+                    serde_json::to_writer(&mut *out, t).map_err(io::Error::from)?;
                     writeln!(out)?;
                 } else {
                     print_tag(out, t, width, style)?;
@@ -490,13 +579,7 @@ fn run_tag(
                 }
             }
             CanonicalCmd::Import { file } => {
-                let mut text = String::new();
-                if file.as_os_str() == "-" {
-                    io::stdin().read_to_string(&mut text)?;
-                } else {
-                    text = std::fs::read_to_string(&file)
-                        .with_context(|| format!("cannot read {}", file.display()))?;
-                }
+                let text = read_input(&file)?;
                 let s = store
                     .import_canonical(&parse_canonical(&text))
                     .with_context(|| format!("cannot import {}", file.display()))?;
@@ -528,6 +611,26 @@ fn print_tag(out: &mut impl Write, t: &TagInfo, width: usize, s: &Style) -> io::
         write!(out, "  {}= {}{}", s.dim, t.aliases.join(" "), s.reset)?;
     }
     writeln!(out)
+}
+
+/// Reads a file, or stdin for "-".
+fn read_input(file: &Path) -> Result<String> {
+    if file.as_os_str() == "-" {
+        let mut text = String::new();
+        io::stdin()
+            .read_to_string(&mut text)
+            .context("cannot read stdin")?;
+        return Ok(text);
+    }
+    std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))
+}
+
+/// At most `max` characters of `s`, with `…` if cut.
+fn truncate(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -588,7 +691,7 @@ fn print_item(
     style: &Style,
 ) -> Result<()> {
     if json {
-        serde_json::to_writer(&mut *out, b)?;
+        serde_json::to_writer(&mut *out, b).map_err(io::Error::from)?;
         writeln!(out)?;
     } else {
         print_line(out, b, width, style)?;

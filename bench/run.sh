@@ -84,6 +84,22 @@ hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/resync-
   -n 'ls, declared list (resync)' "SHLV_CONFIG=$PWD/$declared $bin ls"
 rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$config" "$declared"
 
+# Export everything, import it into an empty database, then import it again (all updates). One run
+# each: these take seconds, not milliseconds.
+export SHLV_DB=$PWD/$db
+for format in json html; do
+  TIMEFORMAT="export $format: %3R s"
+  time "$bin" export --format "$format" >"$data/export.$format"
+  export SHLV_DB=$PWD/$scratch
+  rm -f "$scratch" "$scratch"-wal "$scratch"-shm
+  TIMEFORMAT="import $format (new): %3R s"
+  time "$bin" import "$data/export.$format" >/dev/null
+  TIMEFORMAT="import $format (again): %3R s"
+  time "$bin" import "$data/export.$format" >/dev/null
+  export SHLV_DB=$PWD/$db
+done
+rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$data/export.json" "$data/export.html"
+
 echo
 echo "binary: $(stat -c %s "$bin") bytes"
 echo "database: $(stat -c %s "$db") bytes, $(( $(stat -c %s "$db") / count )) bytes/bookmark"

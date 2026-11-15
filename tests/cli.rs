@@ -636,3 +636,302 @@ fn declared_canonical_tags() {
     db.ok(&["tag", "canonical", "add", "go"]);
     db.ok(&["tag", "alias", "golang", "go"]);
 }
+
+fn fixture(name: &str) -> String {
+    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Exported JSON lines without `id`, which a fresh database assigns anew.
+fn without_ids(export: &str) -> Vec<serde_json::Value> {
+    let mut v = json_lines(export);
+    for b in &mut v {
+        b.as_object_mut().unwrap().remove("id");
+    }
+    v
+}
+
+fn find<'a>(v: &'a [serde_json::Value], url: &str) -> &'a serde_json::Value {
+    v.iter()
+        .find(|b| b["url"] == url)
+        .unwrap_or_else(|| panic!("no {url} in {v:?}"))
+}
+
+#[test]
+fn import_firefox_html() {
+    let db = Db::new();
+    db.ok(&["add", "https://lwn.net", "-t", "news", "--note", "mine"]);
+    let (ok, out, err) = db.run(&["import", &fixture("firefox.html")]);
+    assert!(ok, "{err}");
+    assert!(out.ends_with(": 6 added, 2 updated, 2 skipped\n"), "{out}");
+    assert!(
+        err.contains("skipped javascript: URL: javascript:(function"),
+        "{err}"
+    );
+    assert!(
+        err.contains("skipped place: URL: place:sort=8&maxResults=10"),
+        "{err}"
+    );
+
+    let v = json_lines(&db.ok(&["export"]));
+    assert_eq!(v.len(), 7);
+    let rust = find(&v, "https://www.rust-lang.org/");
+    // The duplicate later in the file updates it: its title wins, tags merge, the earlier
+    // creation time wins.
+    assert_eq!(rust["title"], "Rust (older duplicate)");
+    assert_eq!(
+        rust["tags"],
+        serde_json::json!(["lang", "programming", "rust"])
+    );
+    assert_eq!(rust["created_at"], 1_690_000_000_000i64);
+    let article = find(&v, "https://example.com/article?a=1&b=2");
+    assert_eq!(article["title"], "Tom & Jerry: \"A History\" <2023>");
+    assert_eq!(
+        article["note"],
+        "Recommended by Sam's newsletter.\nSecond line of the description."
+    );
+    assert_eq!(article["tags"], serde_json::json!(["long-form", "to-read"]));
+    assert_eq!(article["created_at"], 1_700_000_500_000i64);
+    assert_eq!(article["updated_at"], 1_700_000_600_000i64);
+    assert_eq!(
+        find(&v, "https://example.org/caf%C3%A9")["title"],
+        "Café ☕ guide"
+    );
+    // The folder's <DD> doesn't attach to anything.
+    assert!(find(&v, "https://support.mozilla.org/products/firefox")["note"].is_null());
+    // An untitled bookmark already saved keeps its title, note, and tags.
+    let lwn = find(&v, "https://lwn.net");
+    assert_eq!(lwn["created_at"], 1_700_003_000_000i64);
+    assert_eq!(lwn["note"], "mine");
+    assert_eq!(lwn["tags"], serde_json::json!(["news"]));
+    // No folder tags by default.
+    assert!(
+        find(&v, "https://news.ycombinator.com/")["tags"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn import_chromium_html_with_folders_as_tags() {
+    let db = Db::new();
+    let out = db.ok(&["import", "--folders-as-tags", &fixture("chromium.html")]);
+    assert!(out.ends_with(": 6 added, 0 updated, 1 skipped\n"), "{out}");
+    let v = json_lines(&db.ok(&["export"]));
+    let tags = |url| find(&v, url)["tags"].clone();
+    // The bookmarks bar is the browser's root, not a folder of the user's.
+    assert_eq!(tags("https://github.com/"), serde_json::json!([]));
+    assert_eq!(
+        tags("https://doc.rust-lang.org/std/"),
+        serde_json::json!(["dev-docs"])
+    );
+    assert_eq!(
+        tags("https://developer.mozilla.org/en-US/docs/Web/HTML"),
+        serde_json::json!(["dev-docs", "web"])
+    );
+    assert_eq!(
+        tags("https://www.seriouseats.com/"),
+        serde_json::json!(["recipes"])
+    );
+    let video = find(
+        &v,
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ&utm_source=share",
+    );
+    assert_eq!(video["title"], "Video & <stuff> — \"quoted\"");
+    assert_eq!(video["created_at"], 1_699_001_000_000i64);
+    find(&v, "chrome://settings/");
+}
+
+#[test]
+fn json_round_trip() {
+    let src = Db::new();
+    src.ok(&["import", &fixture("firefox.html")]);
+    src.ok(&[
+        "add",
+        "https://quotes.example/",
+        "--title",
+        "\"Quotes\" & <tags>, 'too'",
+        "--note",
+        "line one\nline two\ttabbed",
+        "-t",
+        "c++",
+        "-t",
+        "été",
+    ]);
+    let export = src.ok(&["export"]);
+    assert_eq!(export, src.ok(&["export", "--format", "json"]));
+    assert_eq!(export, src.ok(&["ls", "-n", "0", "--json"]));
+
+    let dst = Db::new();
+    let file = dst.0.join("export.jsonl");
+    std::fs::create_dir_all(&dst.0).unwrap();
+    std::fs::write(&file, &export).unwrap();
+    let out = dst.ok(&["import", file.to_str().unwrap()]);
+    assert!(out.ends_with(": 8 added, 0 updated, 0 skipped\n"), "{out}");
+    // Everything but ids survives, uids and times included.
+    assert_eq!(without_ids(&dst.ok(&["export"])), without_ids(&export));
+
+    // Importing again updates in place.
+    let out = dst.ok(&["import", file.to_str().unwrap()]);
+    assert!(out.ends_with(": 0 added, 8 updated, 0 skipped\n"), "{out}");
+    assert_eq!(json_lines(&dst.ok(&["export"])).len(), 8);
+}
+
+#[test]
+fn html_round_trip() {
+    let src = Db::new();
+    src.ok(&["import", &fixture("firefox.html")]);
+    src.ok(&[
+        "add",
+        "https://quotes.example/",
+        "--title",
+        "\"Quotes\" & <tags>, 'too'",
+        "--note",
+        "line one\nline two",
+        "-t",
+        "été",
+    ]);
+    let html = src.ok(&["export", "--format", "html"]);
+    assert!(
+        html.starts_with("<!DOCTYPE NETSCAPE-Bookmark-file-1>\n"),
+        "{html}"
+    );
+    assert!(
+        html.contains("TAGS=\"été\">&quot;Quotes&quot; &amp; &lt;tags&gt;, &#39;too&#39;</A>\n    <DD>line one&#10;line two\n"),
+        "{html}"
+    );
+
+    let dst = Db::new();
+    let file = dst.0.join("export.html");
+    std::fs::create_dir_all(&dst.0).unwrap();
+    std::fs::write(&file, &html).unwrap();
+    dst.ok(&["import", file.to_str().unwrap()]);
+    let (a, b) = (
+        json_lines(&src.ok(&["export"])),
+        json_lines(&dst.ok(&["export"])),
+    );
+    assert_eq!(a.len(), b.len());
+    for (a, b) in a.iter().zip(&b) {
+        for key in ["url", "title", "note", "tags"] {
+            assert_eq!(a[key], b[key], "{key}");
+        }
+        // HTML keeps seconds.
+        let secs = |v: &serde_json::Value| v["created_at"].as_i64().unwrap() / 1000;
+        assert_eq!(secs(a), secs(b));
+    }
+}
+
+#[test]
+fn import_format_detection_and_errors() {
+    let db = Db::new();
+    // JSON lines from stdin; blank lines are fine, extra fields are ignored, missing ones default.
+    let mut c = db.cmd(&["import", "-"]);
+    c.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"{\"url\":\"a.example\",\"id\":99,\"tags\":[\"X\"],\"created_at\":5000}\n\n\
+              {\"url\":\"has space.example\"}\n",
+        )
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert!(o.status.success());
+    assert_eq!(
+        String::from_utf8(o.stdout).unwrap(),
+        "imported -: 1 added, 0 updated, 1 skipped\n"
+    );
+    let v = json_lines(&db.ok(&["export"]));
+    assert_eq!(v[0]["url"], "https://a.example");
+    assert_eq!(v[0]["tags"], serde_json::json!(["x"]));
+    assert_eq!(v[0]["created_at"], 5000);
+
+    // --format overrides detection.
+    let err = db.fail(&["import", "--format", "json", &fixture("chromium.html")]);
+    assert!(
+        err.contains("line 1") && err.contains("--format html"),
+        "{err}"
+    );
+    let file = db.0.join("plain.html");
+    std::fs::write(&file, "<dl><dt><a href=\"https://b.example/\">B</a></dl>").unwrap();
+    assert!(
+        db.fail(&["import", file.to_str().unwrap()])
+            .contains("line 1")
+    );
+    db.ok(&["import", "--format", "html", file.to_str().unwrap()]);
+
+    std::fs::write(&file, "{\"url\":\"https://c.example/\"}\n{oops}\n").unwrap();
+    let err = db.fail(&["import", file.to_str().unwrap()]);
+    assert!(err.contains("line 2"), "{err}");
+    assert!(db.fail(&["import", "/nonexistent"]).contains("cannot read"));
+    assert_eq!(json_lines(&db.ok(&["export"])).len(), 2);
+}
+
+#[test]
+fn import_strict_tags() {
+    let db = Db::new();
+    db.ok(&["tag", "canonical", "add", "rust"]);
+    db.ok(&["tag", "alias", "programming", "rust"]);
+    std::fs::write(db.config(), "strict_tags = true\n").unwrap();
+    let err = db.fail(&["import", &fixture("firefox.html")]);
+    assert!(
+        err.contains("nothing imported")
+            && err.contains(": to-read long-form lang\n")
+            && err.contains("--drop-unknown-tags"),
+        "{err}"
+    );
+    assert_eq!(db.ok(&["export"]), "");
+
+    let (ok, out, err) = db.run(&["import", "--drop-unknown-tags", &fixture("firefox.html")]);
+    assert!(ok, "{err}");
+    assert!(out.ends_with(": 7 added, 1 updated, 2 skipped\n"), "{out}");
+    assert!(
+        err.contains("dropped tags: to-read long-form lang\n"),
+        "{err}"
+    );
+    let v = json_lines(&db.ok(&["export"]));
+    assert_eq!(
+        find(&v, "https://www.rust-lang.org/")["tags"],
+        serde_json::json!(["rust"])
+    );
+}
+
+#[test]
+fn closed_pipe_is_not_an_error() {
+    let db = Db::new();
+    std::fs::create_dir_all(&db.0).unwrap();
+    // Well past a pipe buffer, so the writer sees the reader go away.
+    let lines: String = (0..3000)
+        .map(|i| {
+            format!(
+                "{{\"url\":\"https://example.com/{i}\",\"title\":\"{}\"}}\n",
+                "x".repeat(100)
+            )
+        })
+        .collect();
+    let file = db.0.join("many.jsonl");
+    std::fs::write(&file, lines).unwrap();
+    db.ok(&["import", file.to_str().unwrap()]);
+    for args in [
+        &["export"][..],
+        &["export", "--format", "html"],
+        &["ls", "-n", "0", "--json"],
+        &["search", "-n", "0", "--json", "x"],
+    ] {
+        let mut c = db.cmd(args);
+        c.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        let mut first = [0u8; 1];
+        use std::io::Read;
+        child.stdout.take().unwrap().read_exact(&mut first).unwrap();
+        let o = child.wait_with_output().unwrap();
+        let err = String::from_utf8(o.stderr).unwrap();
+        assert!(o.status.success() && err.is_empty(), "{args:?}: {err}");
+    }
+}

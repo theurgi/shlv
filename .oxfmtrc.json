@@ -3,5 +3,5 @@
   "tabWidth": 2,
   "useTabs": false,
   "proseWrap": "always",
-  "ignorePatterns": ["target", "Cargo.lock", "flake.lock"]
+  "ignorePatterns": ["target", "Cargo.lock", "flake.lock", "tests/fixtures"]
 }

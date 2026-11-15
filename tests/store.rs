@@ -395,3 +395,44 @@ fn upgrades_a_version_1_database() {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+#[test]
+fn import_keeps_valid_unused_uids_and_times() {
+    use shlv::{ImportItem, ImportOptions};
+    let (_d, mut s) = open();
+    let gone = s.add(&bm("https://gone.example", "", &[])).unwrap().id;
+    let gone_uid = s.get(gone).unwrap().unwrap().uid;
+    s.delete(gone).unwrap();
+    let uid = "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+    let item = |url: &str, uid: &str| ImportItem {
+        url: url.into(),
+        uid: Some(uid.into()),
+        created_at: Some(1_000),
+        tags: vec!["A b".into(), " ".into()],
+        ..Default::default()
+    };
+    let items = [
+        item("https://a.example/", uid),
+        item("https://b.example/", "not-a-uuid"),
+        item("https://c.example/", &gone_uid),
+        item("https://d.example/", uid),
+    ];
+    let sum = s.import(&items, ImportOptions::default()).unwrap();
+    assert_eq!((sum.added, sum.updated, sum.skipped.len()), (4, 0, 0));
+    let got = |url| s.find_by_url(url).unwrap().unwrap();
+    let a = got("https://a.example/");
+    assert_eq!(a.uid, uid);
+    assert_eq!((a.created_at, a.updated_at), (1_000, 1_000));
+    assert_eq!(a.tags, ["a-b"]);
+    for url in [
+        "https://b.example/",
+        "https://c.example/",
+        "https://d.example/",
+    ] {
+        let b = got(url);
+        assert!(
+            b.uid != uid && b.uid != gone_uid && b.uid != "not-a-uuid",
+            "{url}"
+        );
+    }
+}
