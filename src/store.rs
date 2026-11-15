@@ -300,16 +300,23 @@ impl Store {
     /// relevance, or newest first if the query has only filters.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Bookmark>> {
         let q = search::parse(query);
+        let filtered = !q.tags.is_empty() || !q.sites.is_empty();
         let mut args = Vec::new();
+        // First find the page of ids, then load those rows. Loading full rows (with their tags)
+        // inside the ranked query would do it for every match, not just the page.
         let mut sql = match &q.fts {
+            // The index only holds live bookmarks, so without filters it can rank alone.
+            Some(fts) if !filtered => {
+                args.push(Value::Text(fts.clone()));
+                "SELECT rowid FROM bookmark_fts WHERE bookmark_fts MATCH ?".to_string()
+            }
             Some(fts) => {
                 args.push(Value::Text(fts.clone()));
-                format!(
-                    "{SELECT} JOIN (SELECT rowid, {BM25} AS rank FROM bookmark_fts \
-                     WHERE bookmark_fts MATCH ?) f ON f.rowid = b.id WHERE b.deleted_at IS NULL"
-                )
+                "SELECT b.id FROM bookmark_fts JOIN bookmark b ON b.id = bookmark_fts.rowid \
+                 WHERE bookmark_fts MATCH ?"
+                    .to_string()
             }
-            None => format!("{SELECT} WHERE b.deleted_at IS NULL"),
+            None => "SELECT b.id FROM bookmark b WHERE b.deleted_at IS NULL".to_string(),
         };
         if !self.tag_filter(&q.tags, &mut sql, &mut args)? {
             return Ok(Vec::new());
@@ -318,18 +325,27 @@ impl Store {
             sql.push_str(" AND on_site(b.url_norm, ?)");
             args.push(Value::Text(site.clone()));
         }
-        sql.push_str(match q.fts {
-            Some(_) => " ORDER BY f.rank, b.id DESC LIMIT ?",
-            None => " ORDER BY b.created_at DESC, b.id DESC LIMIT ?",
+        sql.push_str(&match q.fts {
+            Some(_) => format!(" ORDER BY {BM25}, bookmark_fts.rowid DESC LIMIT ?"),
+            None => " ORDER BY b.created_at DESC, b.id DESC LIMIT ?".to_string(),
         });
         args.push(Value::Integer(i64::try_from(limit).unwrap_or(-1)));
-        self.query(&sql, args).map_err(|e| {
+
+        let ids: Vec<i64> = (|| {
+            let mut stmt = self.conn.prepare_cached(&sql)?;
+            let rows = stmt.query_map(params_from_iter(args), |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()
+        })()
+        .map_err(|e| {
             if e.to_string().contains("fts5") {
                 anyhow::anyhow!("invalid search query {query:?}: {e}")
             } else {
-                e
+                e.into()
             }
-        })
+        })?;
+        ids.into_iter()
+            .map(|id| self.get(id)?.context("bookmark vanished during search"))
+            .collect()
     }
 
     /// Appends one EXISTS clause per tag. Returns false if a tag doesn't exist, in which case
