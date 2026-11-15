@@ -21,9 +21,15 @@ impl Db {
         let mut c = Command::new(env!("CARGO_BIN_EXE_shlv"));
         c.args(args)
             .env("SHLV_DB", self.0.join("shlv.db"))
+            .env("SHLV_CONFIG", self.config())
             .env_remove("BROWSER")
             .env_remove("NO_COLOR");
         c
+    }
+
+    /// Where this test's config file goes (absent unless written).
+    fn config(&self) -> PathBuf {
+        self.0.join("config.toml")
     }
 
     /// Runs shlv; returns (success, stdout, stderr).
@@ -420,5 +426,109 @@ fn tag_canonical() {
     assert!(
         db.fail(&["tag", "canonical", "import", "/nonexistent"])
             .contains("cannot read")
+    );
+}
+
+#[test]
+fn config_path_and_show() {
+    let db = Db::new();
+    let path = db.config().display().to_string();
+    assert_eq!(db.ok(&["config", "path"]), format!("{path}\n"));
+    assert_eq!(
+        db.ok(&["config", "show"]),
+        format!("# {path} (not found; defaults)\nstrict_tags = false\n")
+    );
+
+    let mut c = db.cmd(&["config", "path"]);
+    c.env_remove("SHLV_CONFIG")
+        .env("XDG_CONFIG_HOME", "/xdg")
+        .env("HOME", "/home/u");
+    assert_eq!(output(c).1, "/xdg/shlv/config.toml\n");
+    let mut c = db.cmd(&["config", "path"]);
+    c.env_remove("SHLV_CONFIG")
+        .env("XDG_CONFIG_HOME", "relative")
+        .env("HOME", "/home/u");
+    assert_eq!(output(c).1, "/home/u/.config/shlv/config.toml\n");
+
+    // Sections for features this build lacks are accepted and reported.
+    std::fs::create_dir_all(&db.0).unwrap();
+    std::fs::write(
+        db.config(),
+        "strict_tags = true\n[ai]\nmodel = \"m\"\n[provider.x]\nurl = \"u\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        db.ok(&["config", "show"]),
+        format!(
+            "# {path}\n# [ai] ignored: not in this build\n\
+             # [provider] ignored: not in this build\nstrict_tags = true\n"
+        )
+    );
+}
+
+#[test]
+fn config_errors_name_file_and_line_and_only_hit_commands_that_need_it() {
+    let db = Db::new();
+    db.ok(&["add", "a.com"]);
+    std::fs::write(db.config(), "# settings\nstrict_tag = true\n").unwrap();
+    let path = db.config().display().to_string();
+    let err = db.fail(&["add", "b.com"]);
+    assert!(
+        err.contains(&format!("{path}:2:1: unknown field `strict_tag`")),
+        "{err}"
+    );
+    assert!(
+        db.fail(&["config", "show"])
+            .contains(&format!("{path}:2:1"))
+    );
+    // Commands that don't use settings never read the file.
+    assert_eq!(db.ok(&["ls"]).lines().count(), 1);
+
+    std::fs::write(db.config(), "strict_tags = yes\n").unwrap();
+    assert!(
+        db.fail(&["edit", "1", "-t", "x"])
+            .contains(&format!("{path}:1:15: "))
+    );
+
+    // A dangling symlink is an error, not silently "no config".
+    std::fs::remove_file(db.config()).unwrap();
+    std::os::unix::fs::symlink(db.0.join("gone.toml"), db.config()).unwrap();
+    assert!(db.fail(&["add", "c.com"]).contains("broken symlink"));
+}
+
+#[test]
+fn strict_tags_from_a_read_only_symlinked_config() {
+    let db = Db::new();
+    db.ok(&["tag", "canonical", "add", "rust"]);
+    db.ok(&["tag", "alias", "rs", "rust"]);
+    db.ok(&["add", "old.com", "-t", "misc"]);
+
+    // Like a home-manager link into the Nix store: a symlink to a read-only file.
+    let real = db.0.join("store-config.toml");
+    std::fs::write(&real, "strict_tags = true\n").unwrap();
+    let mut perms = std::fs::metadata(&real).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&real, perms).unwrap();
+    std::os::unix::fs::symlink(&real, db.config()).unwrap();
+
+    assert!(db.ok(&["add", "a.com", "-t", "rs"]).contains("#rust"));
+    let err = db.fail(&["add", "b.com", "-t", "rust", "-t", "Web Dev", "-t", "misc"]);
+    assert!(
+        err.contains("not canonical (strict_tags is on): web-dev misc"),
+        "{err}"
+    );
+    assert!(err.contains("shlv tag canonical add web-dev misc"), "{err}");
+    assert_eq!(db.ok(&["ls"]).lines().count(), 2);
+
+    let err = db.fail(&["edit", "1", "-t", "+other"]);
+    assert!(
+        err.contains("not canonical (strict_tags is on): other"),
+        "{err}"
+    );
+    db.ok(&["edit", "1", "-t", "-misc", "-t", "rust"]);
+
+    assert_eq!(
+        std::fs::read_to_string(&real).unwrap(),
+        "strict_tags = true\n"
     );
 }

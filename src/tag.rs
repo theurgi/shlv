@@ -92,7 +92,42 @@ pub fn format_canonical(tags: &[TagInfo]) -> String {
     out
 }
 
+/// Strict mode rejected these tags (normalized, deduplicated, in input order): they aren't
+/// canonical or an alias of a canonical tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NonCanonicalTags(pub Vec<String>);
+
+impl std::fmt::Display for NonCanonicalTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tags = self.0.join(" ");
+        write!(
+            f,
+            "not canonical (strict_tags is on): {tags}\n\
+             hint: use a canonical tag (`shlv tag canonical ls`), make these canonical \
+             (`shlv tag canonical add {tags}`), or alias them to one (`shlv tag alias`)"
+        )
+    }
+}
+
+impl std::error::Error for NonCanonicalTags {}
+
 impl Store {
+    /// Of `tags` (already normalized), those that aren't canonical or an alias of a canonical
+    /// tag, deduplicated, in input order.
+    pub fn non_canonical(&self, tags: &[String]) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM tag t WHERE t.canonical AND t.deleted_at IS NULL \
+             AND (t.name = ?1 OR t.id = (SELECT tag_id FROM tag_alias WHERE alias = ?1)))",
+        )?;
+        let mut bad: Vec<String> = Vec::new();
+        for t in tags {
+            if !bad.contains(t) && !stmt.query_row([t], |r| r.get::<_, bool>(0))? {
+                bad.push(t.clone());
+            }
+        }
+        Ok(bad)
+    }
+
     /// Lists live tags with their bookmark counts and aliases.
     pub fn tags(&self, sort: TagSort) -> Result<Vec<TagInfo>> {
         self.query_tags("", sort)

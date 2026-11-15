@@ -50,11 +50,21 @@ $ shlv search fts5
 | `tag canonical add\|rm\|ls` | Mark, unmark, or list canonical tags                              |
 | `tag canonical import FILE` | Add a canonical list: one tag per line, aliases after it          |
 | `tag canonical export`      | Print the canonical list in that format                           |
+| `config path\|show`         | Print the config file path, or the effective config               |
 
 `ls`, `search`, and `tag ls` take `--json` for one JSON object per line. `-n 0` shows every result.
 
 The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 `~/.local/share/shlv/shlv.db`.
+
+An optional config file lives at `$SHLV_CONFIG`, else `$XDG_CONFIG_HOME/shlv/config.toml`, else
+`~/.config/shlv/config.toml`. shlv only reads it, so it can be a read-only symlink. Unknown keys are
+errors.
+
+```toml
+# Reject tags in add and edit that aren't canonical or an alias of a canonical tag.
+strict_tags = true
+```
 
 ## Performance
 
@@ -67,7 +77,7 @@ in a VM where starting a process takes about 5 ms):
 | `search kalomi` (28 hits)  | 19 ms   |
 | `search rust` (51k hits)   | 47 ms   |
 | `add` (new URL)            | 16 ms   |
-| Release binary             | 3.2 MB  |
+| Release binary             | 3.4 MB  |
 | Database size per bookmark | 723 B   |
 
 ## Development

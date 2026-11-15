@@ -387,3 +387,55 @@ fn import_adds_without_removing_and_is_atomic() {
         "{e}"
     );
 }
+
+#[test]
+fn strict_mode_rejects_non_canonical_tags_before_writing() {
+    let mut s = store();
+    s.add_canonical(&strings(&["javascript", "rust"])).unwrap();
+    s.add_alias("js", "javascript").unwrap();
+    add(&mut s, "https://free.com", &["loose"]);
+    s.set_strict_tags(true);
+
+    // Canonical names and aliases of canonical tags pass, in any spelling.
+    let id = add(&mut s, "https://a.com", &["Rust", "JS", "#javascript"]);
+    assert_eq!(tags_of(&s, id), ["javascript", "rust"]);
+
+    // A live tag that isn't canonical, an unknown tag, and a duplicate: listed once each.
+    let e = s
+        .add(&NewBookmark {
+            url: "https://b.com".into(),
+            tags: strings(&["rust", "loose", "new tag", "Loose"]),
+            ..Default::default()
+        })
+        .unwrap_err();
+    let bad = e.downcast_ref::<shlv::NonCanonicalTags>().unwrap();
+    assert_eq!(bad.0, ["loose", "new-tag"]);
+    assert!(e.to_string().contains("shlv tag canonical"), "{e}");
+    assert!(s.find_by_url("https://b.com").unwrap().is_none());
+    assert!(
+        s.tags(TagSort::Name)
+            .unwrap()
+            .iter()
+            .all(|t| t.name != "new-tag")
+    );
+
+    // edit checks added tags only; removing a non-canonical tag is fine.
+    let free = s.find_by_url("https://free.com").unwrap().unwrap().id;
+    let edit = |add: &[&str], rm: &[&str]| shlv::Edit {
+        add_tags: strings(add),
+        remove_tags: strings(rm),
+        ..Default::default()
+    };
+    let e = err(s.edit(free, &edit(&["nope"], &[])));
+    assert!(e.contains("is on): nope"), "{e}");
+    assert_eq!(tags_of(&s, free), ["loose"]);
+    assert!(s.edit(free, &edit(&["js"], &["loose"])).unwrap());
+    assert_eq!(tags_of(&s, free), ["javascript"]);
+
+    // Unmarking a tag makes its aliases fail too.
+    s.remove_canonical(&strings(&["javascript"])).unwrap();
+    assert!(err(s.edit(free, &edit(&["js"], &[]))).contains("is on): js"));
+
+    s.set_strict_tags(false);
+    add(&mut s, "https://c.com", &["anything"]);
+}

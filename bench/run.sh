@@ -37,14 +37,30 @@ hyperfine "${opts[@]}" \
   -n 'search site: (500 hits)' "$bin search site:blog.omulri7.com" \
   -n 'search site: (5.8k hits)' "$bin search site:esmarulka0.co.uk"
 
-# add writes, so give it a scratch copy and a fresh URL each run.
+# add writes, so give it a scratch copy and a fresh URL each run. It's the only benchmarked
+# command that reads the config, so it runs without one and with a typical one.
 scratch=$data/scratch.db
 cp "$db" "$scratch"
 export SHLV_DB=$PWD/$scratch
+config=$data/config.toml
+cat > "$config" <<'TOML'
+strict_tags = true
+
+[ai]
+model = "example"
+
+[provider.example]
+url = "http://localhost:11434"
+TOML
+SHLV_CONFIG=/nonexistent "$bin" tag canonical add bench > /dev/null
+add="$bin add \"https://bench.example/\$RANDOM\$RANDOM\$RANDOM\" -t bench"
 hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/add-$count.md" \
-  -n 'add new url' "$bin add \"https://bench.example/\$RANDOM\$RANDOM\$RANDOM\" -t bench" \
-  -n 'add duplicate' "$bin add https://bench.example/same -t bench"
-rm -f "$scratch" "$scratch"-wal "$scratch"-shm
+  -n 'add new url' "SHLV_CONFIG=/nonexistent $add" \
+  -n 'add duplicate' "SHLV_CONFIG=/nonexistent $bin add https://bench.example/same -t bench" \
+  -n 'add new url, strict config' "SHLV_CONFIG=$PWD/$config $add" \
+  -n 'add duplicate, strict config' \
+  "SHLV_CONFIG=$PWD/$config $bin add https://bench.example/same -t bench"
+rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$config"
 
 echo
 echo "binary: $(stat -c %s "$bin") bytes"

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 
+use crate::tag::NonCanonicalTags;
 use crate::{db, search, url};
 
 /// bm25 column weights, in FTS column order: title, url, note, summary, tags.
@@ -118,6 +119,7 @@ fn non_empty(s: &Option<String>) -> Option<&str> {
 
 pub struct Store {
     pub(crate) conn: Connection,
+    strict_tags: bool,
 }
 
 impl Store {
@@ -125,6 +127,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Ok(Store {
             conn: db::open(path)?,
+            strict_tags: false,
         })
     }
 
@@ -136,7 +139,27 @@ impl Store {
     pub fn open_in_memory() -> Result<Self> {
         Ok(Store {
             conn: db::open_in_memory()?,
+            strict_tags: false,
         })
+    }
+
+    /// In strict mode, adding a tag that isn't canonical or an alias of a canonical tag fails
+    /// with [`NonCanonicalTags`] before anything is written. Off by default.
+    pub fn set_strict_tags(&mut self, on: bool) {
+        self.strict_tags = on;
+    }
+
+    /// Fails with [`NonCanonicalTags`] if strict mode is on and any of `tags` (normalized) isn't
+    /// canonical or an alias of a canonical tag.
+    pub(crate) fn check_strict(&self, tags: &[String]) -> Result<()> {
+        if !self.strict_tags {
+            return Ok(());
+        }
+        let bad = self.non_canonical(tags)?;
+        if !bad.is_empty() {
+            return Err(NonCanonicalTags(bad).into());
+        }
+        Ok(())
     }
 
     /// The underlying connection, for inspection and tests.
@@ -153,6 +176,7 @@ impl Store {
         }
         let norm = url::normalize(&full);
         let tags = normalize_tags(&new.tags)?;
+        self.check_strict(&tags)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let existing: Option<i64> = tx
@@ -224,6 +248,7 @@ impl Store {
     pub fn edit(&mut self, id: i64, edit: &Edit) -> Result<bool> {
         let add = normalize_tags(&edit.add_tags)?;
         let remove = normalize_tags(&edit.remove_tags)?;
+        self.check_strict(&add)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let n = tx.execute(

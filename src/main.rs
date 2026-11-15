@@ -4,6 +4,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use shlv::config::{self, Config};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, parse_canonical};
 use shlv::{Bookmark, Edit, ListQuery, NewBookmark, Store, TagInfo, TagSort};
@@ -87,6 +88,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
+    /// Show where the config file is and what it sets
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Print the config file path ($SHLV_CONFIG, else $XDG_CONFIG_HOME/shlv/config.toml)
+    Path,
+    /// Print the effective config, defaults included
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -167,7 +181,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let stdout = io::stdout();
     let style = Style::detect(stdout.is_terminal());
     let mut out = BufWriter::new(stdout.lock());
+    if let Cmd::Config { cmd } = cli.cmd {
+        run_config(cmd, &mut out)?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let mut store = Store::open_default()?;
+    // Only commands that write tags need settings; the rest don't touch the config file.
+    if matches!(cli.cmd, Cmd::Add { .. } | Cmd::Edit { .. }) {
+        let config = Config::load(&config::default_path()?)?;
+        store.set_strict_tags(config.strict_tags);
+    }
     let limit = |n: usize| if n == 0 { usize::MAX } else { n };
 
     match cli.cmd {
@@ -279,9 +303,31 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Cmd::Open { id } => open(&get(&store, id)?.url)?,
         Cmd::Tag { cmd } => run_tag(&mut store, cmd, &mut out, &style)?,
+        Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+fn run_config(cmd: ConfigCmd, out: &mut impl Write) -> Result<()> {
+    let path = config::default_path()?;
+    match cmd {
+        ConfigCmd::Path => writeln!(out, "{}", path.display())?,
+        ConfigCmd::Show => {
+            let config = Config::load(&path)?;
+            let status = if path.exists() {
+                ""
+            } else {
+                " (not found; defaults)"
+            };
+            writeln!(out, "# {}{status}", path.display())?;
+            for s in config.ignored_sections() {
+                writeln!(out, "# [{s}] ignored: not in this build")?;
+            }
+            out.write_all(config.to_toml().as_bytes())?;
+        }
+    }
+    Ok(())
 }
 
 fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) -> Result<()> {
