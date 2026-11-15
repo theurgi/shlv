@@ -16,7 +16,7 @@ const SELECT: &str = "SELECT b.id, b.uid, b.url, b.title, b.note, b.summary, b.c
      b.updated_at, (SELECT group_concat(t.name, ' ' ORDER BY t.name) FROM bookmark_tag bt \
      JOIN tag t ON t.id = bt.tag_id WHERE bt.bookmark_id = b.id) FROM bookmark b";
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Bookmark {
     pub id: i64,
     pub uid: String,
@@ -292,7 +292,7 @@ impl Store {
             return Ok(Vec::new());
         }
         sql.push_str(" ORDER BY b.created_at DESC, b.id DESC LIMIT ?");
-        args.push(Value::Integer(q.limit as i64));
+        args.push(Value::Integer(i64::try_from(q.limit).unwrap_or(-1)));
         self.query(&sql, args)
     }
 
@@ -322,7 +322,7 @@ impl Store {
             Some(_) => " ORDER BY f.rank, b.id DESC LIMIT ?",
             None => " ORDER BY b.created_at DESC, b.id DESC LIMIT ?",
         });
-        args.push(Value::Integer(limit as i64));
+        args.push(Value::Integer(i64::try_from(limit).unwrap_or(-1)));
         self.query(&sql, args).map_err(|e| {
             if e.to_string().contains("fts5") {
                 anyhow::anyhow!("invalid search query {query:?}: {e}")
