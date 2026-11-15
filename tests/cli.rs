@@ -935,3 +935,160 @@ fn closed_pipe_is_not_an_error() {
         assert!(o.status.success() && err.is_empty(), "{args:?}: {err}");
     }
 }
+
+#[test]
+fn suggest_from_domain_rules() {
+    let db = Db::new();
+    let path = db.config().display().to_string();
+    // Without rules there's nothing to suggest with, and add prints nothing extra.
+    assert_eq!(
+        db.ok(&["add", "github.com/a"]),
+        "added 1  https://github.com/a\n"
+    );
+    let e = db.fail(&["suggest", "--all"]);
+    assert!(
+        e.contains(&format!("no domain rules in {path} ([tags.rules])")),
+        "{e}"
+    );
+
+    std::fs::write(
+        db.config(),
+        "[tags.rules]\n\"github.com\" = [\"code\"]\n\"docs.rs\" = [\"rust\", \"docs\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        db.ok(&["add", "docs.rs/serde", "--title", "Serde", "-t", "rust"]),
+        "added 2  Serde  https://docs.rs/serde  #rust\n\
+         suggested  #docs (rule)  (shlv suggest accept 2)\n"
+    );
+    assert_eq!(
+        db.ok(&["add", "example.com"]),
+        "added 3  https://example.com\n"
+    );
+    // Bookmark 1 predates the rules.
+    assert_eq!(
+        db.ok(&["suggest", "ls"]),
+        "2  Serde  https://docs.rs/serde  #docs (rule)\n"
+    );
+    assert_eq!(
+        db.ok(&["suggest", "1", "3"]),
+        "rules matched 1 of 2 bookmarks: 1 new suggestion\n\
+         1  https://github.com/a  #code (rule)\n"
+    );
+    assert_eq!(
+        db.ok(&["suggest", "--all"]),
+        "rules matched 2 of 3 bookmarks: 0 new suggestions\n"
+    );
+    let json = json_lines(&db.ok(&["suggest", "ls", "--json"]));
+    assert_eq!(json.len(), 2);
+    assert_eq!(
+        json[0],
+        serde_json::json!({"id": 2, "url": "https://docs.rs/serde", "title": "Serde",
+                           "tag": "docs", "source": "rule", "confidence": 1.0})
+    );
+    assert_eq!(
+        db.ok(&["suggest", "ls", "1"]),
+        "1  https://github.com/a  #code (rule)\n"
+    );
+
+    assert_eq!(db.ok(&["suggest", "reject", "2"]), "rejected for 2: docs\n");
+    assert_eq!(
+        db.ok(&["suggest", "accept", "1", "code"]),
+        "accepted code; now 1  https://github.com/a  #code\n"
+    );
+    assert_eq!(db.ok(&["suggest", "ls"]), "");
+    assert_eq!(
+        db.ok(&["suggest", "--all"]),
+        "rules matched 2 of 3 bookmarks: 0 new suggestions\n"
+    );
+    assert_eq!(
+        db.ok(&["suggest", "accept", "--all"]),
+        "accepted 0 tags on 0 bookmarks\n"
+    );
+    let e = db.fail(&["suggest", "accept", "2"]);
+    assert_eq!(e, "shlv: no pending suggestions for bookmark 2\n");
+    let e = db.fail(&["suggest", "accept", "9"]);
+    assert_eq!(e, "shlv: no bookmark with id 9\n");
+
+    // Usage: ids or --all, not both or neither; subcommand names aren't ids.
+    assert!(db.fail(&["suggest"]).contains("required arguments"));
+    assert!(
+        db.fail(&["suggest", "1", "--all"])
+            .contains("cannot be used with")
+    );
+    assert!(
+        db.fail(&["suggest", "accept", "--all", "1"])
+            .contains("cannot be used with")
+    );
+    assert!(db.fail(&["suggest", "x"]).contains("invalid value 'x'"));
+}
+
+#[test]
+fn suggest_auto_mode() {
+    let db = Db::new();
+    std::fs::create_dir_all(&db.0).unwrap();
+    std::fs::write(
+        db.config(),
+        "[tags]\nsuggestions = \"auto\"\n\n[tags.rules]\n\"github.com\" = [\"code\", \"git\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        db.ok(&["add", "gist.github.com/x", "-t", "snippet"]),
+        "added 1  https://gist.github.com/x  #code  #git  #snippet\n"
+    );
+    // Removing a tag a rule applied rejects it: it doesn't come back.
+    db.ok(&["edit", "1", "-t", "-git"]);
+    assert_eq!(
+        db.ok(&["suggest", "--all"]),
+        "rules matched 1 of 1 bookmark: 0 tags applied to 0 bookmarks\n"
+    );
+    assert!(db.ok(&["show", "1"]).contains("tags:     code snippet\n"));
+    assert!(
+        db.ok(&["config", "show"])
+            .contains("[tags]\nsuggestions = \"auto\"\n")
+    );
+}
+
+#[test]
+fn suggest_strict_rules() {
+    let db = Db::new();
+    let path = db.config().display().to_string();
+    db.ok(&["tag", "canonical", "add", "code"]);
+    std::fs::write(
+        db.config(),
+        "strict_tags = true\n[tags.rules]\n\"github.com\" = [\"code\"]\n\"docs.rs\" = [\"rust\"]\n",
+    )
+    .unwrap();
+    // The canonical list is in the database: commands that apply rules check it.
+    let e = db.fail(&["add", "example.com", "-t", "code"]);
+    assert_eq!(
+        e,
+        format!(
+            "shlv: {path}: [tags.rules] uses tags that aren't canonical (strict_tags is on): \
+             rust (docs.rs)\nhint: make the tags canonical, or change the rules\n"
+        )
+    );
+    assert!(db.fail(&["suggest", "--all"]).contains("rust (docs.rs)"));
+    // Others still work, so the list can be fixed.
+    db.ok(&["tag", "canonical", "add", "rust"]);
+    db.ok(&["add", "docs.rs/x"]);
+    assert_eq!(
+        db.ok(&["suggest", "accept", "1"]),
+        "accepted rust; now 1  https://docs.rs/x  #rust\n"
+    );
+
+    // A declared list is checked when the config loads, with a position.
+    std::fs::write(
+        db.config(),
+        "strict_tags = true\n[tags.canonical]\ncode = []\n\
+         [tags.rules]\n\"github.com\" = [\"code\"]\n\"docs.rs\" = [\"rust\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        db.fail(&["ls"]),
+        format!(
+            "shlv: {path}:6:13: rule \"docs.rs\": not in [tags.canonical] (strict_tags is on): \
+             rust\n"
+        )
+    );
+}

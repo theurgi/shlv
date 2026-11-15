@@ -7,8 +7,13 @@ use anyhow::{Context, Result, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 
+use crate::suggest::{self, DomainRules, SuggestMode};
 use crate::tag::NonCanonicalTags;
 use crate::{db, search, url};
+
+/// Page cache for bulk writes, in KiB as `PRAGMA cache_size` takes it (negative); see
+/// [`Store::with_bulk_cache`].
+const BULK_CACHE_KIB: i64 = -32 * 1024;
 
 /// bm25 column weights, in FTS column order: title, url, note, summary, tags.
 const BM25: &str = "bm25(bookmark_fts, 10.0, 2.0, 5.0, 3.0, 5.0)";
@@ -120,15 +125,14 @@ pub(crate) fn non_empty(s: &Option<String>) -> Option<&str> {
 pub struct Store {
     pub(crate) conn: Connection,
     strict_tags: bool,
+    pub(crate) rules: DomainRules,
+    pub(crate) suggest_mode: SuggestMode,
 }
 
 impl Store {
     /// Opens the database at `path`, creating it and applying migrations as needed.
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Store {
-            conn: db::open(path)?,
-            strict_tags: false,
-        })
+        Ok(Store::new(db::open(path)?))
     }
 
     /// Opens the database at the default location (see [`db::default_path`]).
@@ -137,10 +141,16 @@ impl Store {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Store {
-            conn: db::open_in_memory()?,
+        Ok(Store::new(db::open_in_memory()?))
+    }
+
+    fn new(conn: Connection) -> Self {
+        Store {
+            conn,
             strict_tags: false,
-        })
+            rules: DomainRules::default(),
+            suggest_mode: SuggestMode::default(),
+        }
     }
 
     /// In strict mode, adding a tag that isn't canonical or an alias of a canonical tag fails
@@ -167,17 +177,34 @@ impl Store {
         Ok(())
     }
 
+    /// Runs `f` with a page cache big enough for one transaction that rewrites a large part of
+    /// the database (import, bulk tagging). Those outgrow SQLite's default 2 MiB cache and spill
+    /// to the WAL over and over.
+    pub(crate) fn with_bulk_cache<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let cache: i64 = self.conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
+        self.conn
+            .pragma_update(None, "cache_size", BULK_CACHE_KIB)?;
+        let out = f(self);
+        self.conn.pragma_update(None, "cache_size", cache)?;
+        out
+    }
+
     /// The underlying connection, for inspection and tests.
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
 
     /// Adds a bookmark. If its normalized URL is already bookmarked, updates that bookmark
-    /// instead: given title and note replace the old ones, tags are added.
+    /// instead: given title and note replace the old ones, tags are added. Matching domain rules
+    /// (see [`Store::set_rules`]) are recorded as suggestions or applied in the same transaction.
     pub fn add(&mut self, new: &NewBookmark) -> Result<Added> {
         let (full, norm) = check_url(&new.url)?;
         let tags = normalize_tags(&new.tags)?;
         self.check_strict(&tags)?;
+        self.check_rules()?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let added = put(
@@ -195,6 +222,9 @@ impl Store {
             },
             now,
         )?;
+        if !self.rules.is_empty() {
+            suggest::offer_rules(&tx, &self.rules, self.suggest_mode, added.id, &norm, now)?;
+        }
         reindex(&tx, added.id)?;
         tx.commit()?;
         Ok(added)
@@ -246,6 +276,7 @@ impl Store {
         }
         for tag in &remove {
             if let Some(tag_id) = resolve_tag(&tx, tag)? {
+                suggest::reject_applied(&tx, id, tag_id, now)?;
                 tx.execute(
                     "DELETE FROM bookmark_tag WHERE bookmark_id = ?1 AND tag_id = ?2",
                     params![id, tag_id],
@@ -278,6 +309,7 @@ impl Store {
             return Ok(false);
         }
         tx.execute("DELETE FROM bookmark_tag WHERE bookmark_id = ?1", [id])?;
+        tx.execute("DELETE FROM tag_suggestion WHERE bookmark_id = ?1", [id])?;
         tx.execute("DELETE FROM bookmark_fts WHERE rowid = ?1", [id])?;
         tx.commit()?;
         Ok(true)

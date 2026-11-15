@@ -99,9 +99,6 @@ pub struct ImportSummary {
     pub dropped_tags: Vec<String>,
 }
 
-/// Page cache for an import, in KiB as `PRAGMA cache_size` takes it (negative).
-const IMPORT_CACHE_KIB: i64 = -32 * 1024;
-
 /// URL schemes that only mean something inside a browser.
 fn browser_only(url: &str) -> Option<&'static str> {
     let scheme = url.split_once(':')?.0.trim().to_ascii_lowercase();
@@ -178,15 +175,9 @@ impl Store {
             }
         }
 
-        // One transaction writes the whole import, which outgrows SQLite's default 2 MiB page
-        // cache and spills to the WAL over and over: at 100k bookmarks on the VM's virtiofs, 13.3 s
-        // with the default against 5.0 s with 32 MiB (and 4.7 s with 128 MiB).
-        let cache: i64 = self.conn.query_row("PRAGMA cache_size", [], |r| r.get(0))?;
-        self.conn
-            .pragma_update(None, "cache_size", IMPORT_CACHE_KIB)?;
-        let written = self.write_import(&ready, &mut summary);
-        self.conn.pragma_update(None, "cache_size", cache)?;
-        written?;
+        // At 100k bookmarks on the VM's virtiofs: 13.3 s with the default cache, 5.0 s with the
+        // bulk cache (and 4.7 s with 128 MiB).
+        self.with_bulk_cache(|s| s.write_import(&ready, &mut summary))?;
         Ok(summary)
     }
 

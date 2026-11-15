@@ -48,6 +48,11 @@ in
           are unmarked; bookmarks keep their tags), and `shlv tag canonical add|rm|import` and
           `shlv tag alias` are refused. Names must be normalized tags (`"web-dev"`, not
           `"Web Dev"`).
+        - `tags.rules`: domain rules mapping a host (which also matches its subdomains) to tags,
+          as in `tags.rules."github.com" = [ "code" ]`. `shlv add` and `shlv suggest` turn them
+          into tag suggestions. With `strict_tags`, rule tags must be canonical.
+        - `tags.suggestions`: `"confirm"` (the default) keeps suggestions for review with
+          `shlv suggest ls|accept|reject`; `"auto"` applies them at once.
 
         Secrets must not go here: everything in `settings` ends up in the world-readable Nix
         store. AI providers (a later feature) name the environment variable holding their key

@@ -100,6 +100,47 @@ for format in json html; do
 done
 rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$data/export.json" "$data/export.html"
 
+# Domain rules: the 40 most common hosts (a fifth of the bookmarks) with two tags each, plus 20
+# rules that match nothing. `add` with rules, then the rules on every bookmark, in confirm mode
+# (record suggestions, run again with nothing new, accept them all) and in auto mode.
+rules=$data/rules.toml
+{
+  echo "[tags.rules]"
+  sqlite3 "$db" "SELECT substr(url_norm, 9, instr(substr(url_norm, 9), '/') - 1) h FROM bookmark \
+    GROUP BY h ORDER BY count(*) DESC LIMIT 40" |
+    awk '{ printf "\"%s\" = [\"site%d\", \"topic%d\"]\n", $0, NR, NR % 7 }'
+  for i in $(seq 20); do echo "\"nomatch$i.example\" = [\"nm$i\"]"; done
+} >"$rules"
+auto=$data/rules-auto.toml
+printf '[tags]\nsuggestions = "auto"\n\n' | cat - "$rules" >"$auto"
+fresh() {
+  rm -f "$scratch" "$scratch"-wal "$scratch"-shm
+  cp "$db" "$scratch"
+  SHLV_CONFIG=/nonexistent "$bin" ls -n 1 >/dev/null # migrate outside the timings
+}
+export SHLV_DB=$PWD/$scratch
+fresh
+match="$bin add \"https://$(sed -n 2p "$rules" | cut -d'"' -f2)/\$RANDOM\$RANDOM\$RANDOM\""
+hyperfine --warmup 5 --min-runs 30 --shell bash --export-markdown "$data/rules-$count.md" \
+  -n 'add new url, no config' "SHLV_CONFIG=/nonexistent $add" \
+  -n 'add new url, 60 rules, no match' "SHLV_CONFIG=$PWD/$rules $add" \
+  -n 'add new url, 60 rules, match' "SHLV_CONFIG=$PWD/$rules $match" \
+  -n 'ls, 60 rules' "SHLV_CONFIG=$PWD/$rules $bin ls"
+fresh
+export SHLV_CONFIG=$PWD/$rules
+TIMEFORMAT="suggest --all (confirm): %3R s"
+time "$bin" suggest --all
+TIMEFORMAT="suggest --all (again, nothing new): %3R s"
+time "$bin" suggest --all >/dev/null
+TIMEFORMAT="suggest accept --all: %3R s"
+time "$bin" suggest accept --all
+fresh
+export SHLV_CONFIG=$PWD/$auto
+TIMEFORMAT="suggest --all (auto): %3R s"
+time "$bin" suggest --all
+export SHLV_CONFIG=/nonexistent
+rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$rules" "$auto"
+
 echo
 echo "binary: $(stat -c %s "$bin") bytes"
 echo "database: $(stat -c %s "$db") bytes, $(( $(stat -c %s "$db") / count )) bytes/bookmark"

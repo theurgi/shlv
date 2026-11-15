@@ -41,6 +41,7 @@ let
         ];
         rust = [ ];
       };
+      tags.rules."docs.rs" = [ "rust" ];
     };
   };
   # `{ }` still declares the list (and unmarks every canonical tag), so it must render.
@@ -83,7 +84,10 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
 
     [tags.canonical]
     javascript = ["js", "ecmascript"]
-    rust = []''}' "$(cat ${configOf full})"
+    rust = []
+
+    [tags.rules]
+    "docs.rs" = ["rust"]''}' "$(cat ${configOf full})"
   check "rendered empty list" '[tags.canonical]' "$(cat ${configOf emptyList})"
 
   # shlv reads the store file through a symlink, as home-manager installs it.
@@ -95,6 +99,9 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
   # A tag in the database that the config declares as an alias gets merged into its tag.
   SHLV_CONFIG=/nonexistent shlv add https://example.com/a -t js >/dev/null
   shlv add https://example.com/b -t rust >/dev/null
+  # The rule's quoted host survives rendering.
+  check "rule suggestion" "3  https://docs.rs/serde  #rust (rule)" \
+    "$(shlv add https://docs.rs/serde >/dev/null && shlv suggest ls)"
   check "mirrored list" "$(printf 'javascript ecmascript js\nrust')" "$(shlv tag canonical export)"
   check "alias merged" "1  https://example.com/a  #javascript" "$(shlv ls -t javascript)"
   if shlv add https://example.com/c -t nope 2>/dev/null; then

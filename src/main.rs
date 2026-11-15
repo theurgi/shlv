@@ -8,8 +8,8 @@ use shlv::config::{self, Config};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, parse_canonical};
 use shlv::{
-    Bookmark, DeclaredTags, Edit, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalTags,
-    Store, TagInfo, TagSort,
+    Bookmark, DeclaredTags, Edit, Format, ImportOptions, ListQuery, NewBookmark,
+    NonCanonicalRuleTags, NonCanonicalTags, Store, SuggestMode, Suggestion, TagInfo, TagSort,
 };
 use shlv::{netscape, transfer};
 
@@ -92,6 +92,27 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
+    /// Suggest tags for bookmarks (domain rules from config), and review the suggestions
+    #[command(
+        args_conflicts_with_subcommands = true,
+        subcommand_negates_reqs = true,
+        after_help = "With [tags] suggestions = \"auto\" in the config, suggested tags are \
+                      applied at once instead of waiting for `shlv suggest accept`."
+    )]
+    Suggest {
+        #[command(subcommand)]
+        cmd: Option<SuggestCmd>,
+        /// Bookmarks to suggest tags for
+        #[arg(
+            value_name = "ID",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        ids: Vec<i64>,
+        /// Suggest tags for every bookmark (one transaction)
+        #[arg(long)]
+        all: bool,
+    },
     /// Import bookmarks from a browser export (Netscape HTML) or JSON lines ("-" for stdin)
     Import {
         file: PathBuf,
@@ -123,6 +144,30 @@ enum ConfigCmd {
     Path,
     /// Print the effective config, defaults included
     Show,
+}
+
+#[derive(Subcommand)]
+enum SuggestCmd {
+    /// List pending suggestions, newest bookmarks first
+    Ls {
+        /// Only this bookmark's
+        id: Option<i64>,
+        /// One JSON object per suggestion and line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a bookmark's pending suggestions (all, or the TAGs given), or every one with --all
+    Accept {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<i64>,
+        #[arg(conflicts_with = "all")]
+        tags: Vec<String>,
+        /// Accept every pending suggestion (one transaction)
+        #[arg(long)]
+        all: bool,
+    },
+    /// Reject a bookmark's pending suggestions (all, or the TAGs given); they aren't offered again
+    Reject { id: i64, tags: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +265,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
     let config_path = config::default_path()?;
     let config = Config::load(&config_path)?;
     store.set_strict_tags(config.strict_tags);
+    store.set_suggest_mode(config.tags.suggestions);
+    store.set_rules(config.tags.rules.clone());
     let declared = config.tags.canonical.as_ref().map(|tags| Declared {
         tags,
         path: &config_path,
@@ -260,11 +307,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     note,
                     tags,
                 })
-                .map_err(|e| declared_hint(e, declared.as_ref()))?;
+                .map_err(|e| declared_hint(rules_hint(e, &config_path), declared.as_ref()))?;
             let b = store.get(added.id)?.context("bookmark vanished")?;
             let verb = if added.created { "added" } else { "updated" };
             write!(out, "{verb} ")?;
             print_line(&mut out, &b, 0, &style)?;
+            if !store.rules().is_empty() {
+                let pending = store.pending(Some(added.id))?;
+                if !pending.is_empty() {
+                    write!(out, "suggested")?;
+                    print_suggested(&mut out, &pending, &style)?;
+                    writeln!(out, "  (shlv suggest accept {})", added.id)?;
+                }
+            }
         }
         Cmd::Ls {
             tags,
@@ -415,6 +470,46 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
         },
         Cmd::Tag { cmd } => run_tag(&mut store, cmd, declared.as_ref(), &mut out, &style)?,
+        Cmd::Suggest {
+            cmd: None,
+            ids,
+            all,
+        } => {
+            if store.rules().is_empty() {
+                bail!(
+                    "nothing to suggest with: no domain rules in {} ([tags.rules])",
+                    config_path.display()
+                );
+            }
+            let s = store
+                .apply_rules((!all).then_some(ids.as_slice()))
+                .map_err(|e| rules_hint(e, &config_path))?;
+            let matched = format!(
+                "rules matched {} of {}",
+                s.matched,
+                plural(s.checked, "bookmark")
+            );
+            match store.suggest_mode() {
+                SuggestMode::Confirm => {
+                    writeln!(out, "{matched}: {}", plural(s.pending, "new suggestion"))?;
+                    if !all {
+                        let width = id_width(&store)?;
+                        for id in ids {
+                            print_pending(&mut out, &store.pending(Some(id))?, width, &style)?;
+                        }
+                    }
+                }
+                SuggestMode::Auto => writeln!(
+                    out,
+                    "{matched}: {} applied to {}",
+                    plural(s.applied, "tag"),
+                    plural(s.tagged, "bookmark")
+                )?,
+            }
+        }
+        Cmd::Suggest { cmd: Some(cmd), .. } => {
+            run_suggest(&mut store, cmd, declared.as_ref(), &mut out, &style)?
+        }
         Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }
     out.flush()?;
@@ -482,6 +577,118 @@ fn declared_hint(e: anyhow::Error, declared: Option<&Declared>) -> anyhow::Error
         ),
         _ => e,
     }
+}
+
+/// Names the config file when domain rules break strict mode.
+fn rules_hint(e: anyhow::Error, config: &Path) -> anyhow::Error {
+    match e.downcast_ref::<NonCanonicalRuleTags>() {
+        Some(bad) => anyhow!(
+            "{}: {bad}\nhint: make the tags canonical, or change the rules",
+            config.display()
+        ),
+        None => e,
+    }
+}
+
+fn run_suggest(
+    store: &mut Store,
+    cmd: SuggestCmd,
+    declared: Option<&Declared>,
+    out: &mut impl Write,
+    style: &Style,
+) -> Result<()> {
+    match cmd {
+        SuggestCmd::Ls { id, json } => {
+            if let Some(id) = id {
+                get(store, id)?;
+            }
+            if json {
+                store.pending_each(id, |s| {
+                    serde_json::to_writer(&mut *out, &s).map_err(io::Error::from)?;
+                    Ok(writeln!(out)?)
+                })?;
+            } else {
+                // Rows come grouped by bookmark; print one line per bookmark.
+                let width = id_width(store)?;
+                let mut group: Vec<Suggestion> = Vec::new();
+                store.pending_each(id, |s| {
+                    if group.first().is_some_and(|g| g.id != s.id) {
+                        print_pending(out, &group, width, style)?;
+                        group.clear();
+                    }
+                    group.push(s);
+                    Ok(())
+                })?;
+                print_pending(out, &group, width, style)?;
+            }
+        }
+        SuggestCmd::Accept { all: true, .. } => {
+            let (bookmarks, tags) = store.accept_all().map_err(|e| declared_hint(e, declared))?;
+            writeln!(
+                out,
+                "accepted {} on {}",
+                plural(tags, "tag"),
+                plural(bookmarks, "bookmark")
+            )?;
+        }
+        SuggestCmd::Accept {
+            id: Some(id), tags, ..
+        } => {
+            get(store, id)?;
+            let accepted = store
+                .accept(id, &tags)
+                .map_err(|e| declared_hint(e, declared))?;
+            write!(out, "accepted {}; now ", accepted.join(" "))?;
+            print_line(out, &get(store, id)?, 0, style)?;
+        }
+        SuggestCmd::Accept { id: None, .. } => unreachable!("clap requires ID unless --all"),
+        SuggestCmd::Reject { id, tags } => {
+            get(store, id)?;
+            let rejected = store.reject(id, &tags)?;
+            writeln!(out, "rejected for {id}: {}", rejected.join(" "))?;
+        }
+    }
+    Ok(())
+}
+
+/// One bookmark's pending suggestions on one line: id, title, URL, then the suggested tags.
+fn print_pending(
+    out: &mut impl Write,
+    group: &[Suggestion],
+    width: usize,
+    s: &Style,
+) -> io::Result<()> {
+    let Some(first) = group.first() else {
+        return Ok(());
+    };
+    write!(out, "{}{:>width$}{}  ", s.id, first.id, s.reset)?;
+    if let Some(title) = &first.title {
+        write!(out, "{}  ", one_line(title))?;
+    }
+    write!(out, "{}{}{}", s.dim, first.url, s.reset)?;
+    print_suggested(out, group, s)?;
+    writeln!(out)
+}
+
+/// Suggested tags with their source, and their confidence when it's below 1:
+/// `  #code (rule)  #rust (model 0.82)`.
+fn print_suggested(out: &mut impl Write, group: &[Suggestion], s: &Style) -> io::Result<()> {
+    for g in group {
+        write!(
+            out,
+            "  {}#{}{} {}({}",
+            s.tag,
+            g.tag,
+            s.reset,
+            s.dim,
+            g.source.as_str()
+        )?;
+        if let Some(c) = g.confidence.filter(|c| *c < 1.0) {
+            write!(out, " {c:.2}")?;
+        }
+        write!(out, "){}", s.reset)?;
+    }
+    Ok(())
 }
 
 fn run_tag(

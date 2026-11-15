@@ -576,6 +576,13 @@ fn merge_into(tx: &Transaction, from_id: i64, from: &str, into_id: i64, now: i64
         params![from_id, into_id],
     )?;
     tx.execute("DELETE FROM bookmark_tag WHERE tag_id = ?1", [from_id])?;
+    // Suggestions follow the bookmarks. Where the bookmark already has a row for `into`, that
+    // row wins, so a rejection of `into` outlasts a pending `from`.
+    tx.execute(
+        "UPDATE OR IGNORE tag_suggestion SET tag_id = ?2 WHERE tag_id = ?1",
+        params![from_id, into_id],
+    )?;
+    tx.execute("DELETE FROM tag_suggestion WHERE tag_id = ?1", [from_id])?;
     tx.execute(
         "UPDATE tag_alias SET tag_id = ?2 WHERE tag_id = ?1",
         params![from_id, into_id],

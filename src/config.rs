@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
+use crate::suggest::{DomainRules, SuggestMode};
 use crate::tag::DeclaredTags;
 
 /// Settings from `config.toml`. Unknown keys are errors, so typos surface; add new settings as
@@ -36,11 +37,18 @@ pub struct Tags {
     /// source of truth and the database mirrors it; see [`crate::Store::sync_declared`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical: Option<DeclaredTags>,
+    /// Whether tag suggestions (from domain rules, and later the model and LLM) are applied at
+    /// once (`auto`) or wait for `shlv suggest accept` (`confirm`, the default).
+    #[serde(default, skip_serializing_if = "SuggestMode::is_default")]
+    pub suggestions: SuggestMode,
+    /// Domain rules, `host = [tags]`; a host also matches its subdomains.
+    #[serde(default, skip_serializing_if = "DomainRules::is_empty")]
+    pub rules: DomainRules,
 }
 
 impl Tags {
     fn is_empty(&self) -> bool {
-        self.canonical.is_none()
+        self.canonical.is_none() && self.suggestions.is_default() && self.rules.is_empty()
     }
 }
 
@@ -63,15 +71,41 @@ impl Config {
 
     /// Parses config text; errors read `PATH:LINE:COLUMN: message`.
     pub fn parse(text: &str, path: &Path) -> Result<Config> {
-        toml::from_str(text).map_err(|e| {
-            let msg = e.message().trim_end();
-            match e.span() {
-                Some(span) => {
-                    let (line, col) = line_col(text, span.start);
-                    anyhow!("{}:{line}:{col}: {msg}", path.display())
-                }
-                None => anyhow!("{}: {msg}", path.display()),
+        let at = |pos: Option<usize>, msg: &str| match pos {
+            Some(pos) => {
+                let (line, col) = line_col(text, pos);
+                anyhow!("{}:{line}:{col}: {msg}", path.display())
             }
+            None => anyhow!("{}: {msg}", path.display()),
+        };
+        let config: Config = toml::from_str(text)
+            .map_err(|e| at(e.span().map(|s| s.start), e.message().trim_end()))?;
+        if let Some((host, msg)) = config.undeclared_rule_tag() {
+            return Err(at(config.tags.rules.span(host).map(|s| s.start), &msg));
+        }
+        Ok(config)
+    }
+
+    /// With strict tags and a declared canonical list, rule tags must be declared tags or
+    /// aliases. Returns the first offending rule's host and an error message. Without a declared
+    /// list the canonical list lives in the database; see [`crate::Store::check_rules`].
+    fn undeclared_rule_tag(&self) -> Option<(&str, String)> {
+        let declared = self.tags.canonical.as_ref().filter(|_| self.strict_tags)?;
+        self.tags.rules.iter().find_map(|(host, tags)| {
+            let bad: Vec<&str> = tags
+                .iter()
+                .map(String::as_str)
+                .filter(|t| declared.resolve(t).is_none())
+                .collect();
+            (!bad.is_empty()).then(|| {
+                (
+                    host,
+                    format!(
+                        "rule {host:?}: not in [tags.canonical] (strict_tags is on): {}",
+                        bad.join(" ")
+                    ),
+                )
+            })
         })
     }
 
@@ -239,6 +273,63 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.starts_with("/c.toml:2:8: "), "{e}");
+    }
+
+    #[test]
+    fn parses_rules_and_suggestion_mode() {
+        let c = parse("").unwrap();
+        assert!(c.tags.rules.is_empty());
+        assert_eq!(c.tags.suggestions, SuggestMode::Confirm);
+
+        let text = "[tags]\nsuggestions = \"auto\"\n\n[tags.rules]\n\"github.com\" = [\"code\"]\n\
+                    \"docs.rs\" = [\"rust\", \"docs\"]\n";
+        let c = parse(text).unwrap();
+        assert_eq!(c.tags.suggestions, SuggestMode::Auto);
+        let rules: Vec<_> = c.tags.rules.iter().collect();
+        assert_eq!(
+            rules,
+            [
+                ("docs.rs", &["rust".to_string(), "docs".into()][..]),
+                ("github.com", &["code".to_string()][..]),
+            ]
+        );
+        assert_eq!(
+            c.to_toml(),
+            "strict_tags = false\n\n[tags]\nsuggestions = \"auto\"\n\n[tags.rules]\n\
+             \"docs.rs\" = [\"rust\", \"docs\"]\n\"github.com\" = [\"code\"]\n"
+        );
+        assert!(parse(&c.to_toml()).is_ok());
+
+        let e = parse("[tags]\nsuggestions = \"always\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("/c.toml:2:15: unknown variant `always`"),
+            "{e}"
+        );
+        let e = parse("[tags.rules]\n\"GitHub.com\" = [\"code\"]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("/c.toml:1:1: "), "{e}");
+        assert!(
+            e.contains("rule \"GitHub.com\": not a normalized host; write \"github.com\""),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn strict_rules_must_use_declared_tags() {
+        let text = "strict_tags = true\n[tags.canonical]\njavascript = [\"js\"]\ncode = []\n\
+                    [tags.rules]\n\"github.com\" = [\"code\"]\n\"nodejs.org\" = [\"js\", \"node\"]\n";
+        let e = parse(text).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "/c.toml:7:16: rule \"nodejs.org\": not in [tags.canonical] (strict_tags is on): node"
+        );
+        // Aliases count; without strict mode, or without a declared list, nothing is checked here.
+        assert!(parse(&text.replace(", \"node\"", "")).is_ok());
+        assert!(parse(&text.replace("strict_tags = true", "")).is_ok());
+        assert!(parse("strict_tags = true\n[tags.rules]\n\"a.com\" = [\"x\"]\n").is_ok());
     }
 
     #[test]
