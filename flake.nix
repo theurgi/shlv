@@ -6,7 +6,12 @@
   outputs =
     { nixpkgs, ... }:
     let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forAll = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
     in
     {
@@ -18,11 +23,13 @@
             clippy
             rustfmt
             rust-analyzer
+            oxfmt
+            nixfmt
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
       });
 
-      formatter = forAll (pkgs: pkgs.nixfmt-rfc-style);
+      formatter = forAll (pkgs: pkgs.nixfmt);
     };
 }
