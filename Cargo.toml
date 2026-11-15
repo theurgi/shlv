@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.104"
+rusqlite = { version = "0.42.0", features = ["bundled", "functions"] }
+uuid = { version = "1.29.2", features = ["v7"] }
 
 [profile.release]
 lto = true
