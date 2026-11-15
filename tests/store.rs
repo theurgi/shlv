@@ -343,3 +343,33 @@ fn search_fts_syntax_and_errors() {
     let err = s.search("AND", 10).unwrap_err().to_string();
     assert!(err.contains("invalid search query"), "{err}");
 }
+
+#[test]
+fn each_variants_stream_and_stop_on_error() {
+    let (_d, mut s) = open();
+    for i in 0..5 {
+        s.add(&bm(&format!("https://{i}.com"), "Same title", &[]))
+            .unwrap();
+    }
+    let mut seen = 0;
+    let err = s
+        .list_each(&ListQuery::default(), |_| {
+            seen += 1;
+            if seen == 2 {
+                anyhow::bail!("stop");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(err.to_string(), "stop");
+    assert_eq!(seen, 2);
+
+    let mut seen = 0;
+    s.search_each("same", 3, |_| {
+        seen += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, 3);
+    assert_eq!(s.max_id().unwrap(), 5);
+}

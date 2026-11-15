@@ -286,24 +286,60 @@ impl Store {
 
     /// Lists live bookmarks, newest first.
     pub fn list(&self, q: &ListQuery) -> Result<Vec<Bookmark>> {
+        let mut found = Vec::new();
+        self.list_each(q, |b| {
+            found.push(b);
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// Like [`Store::list`], but calls `f` for each bookmark as it's read instead of collecting
+    /// them. An error from `f` stops the listing and is returned as is.
+    pub fn list_each(
+        &self,
+        q: &ListQuery,
+        mut f: impl FnMut(Bookmark) -> Result<()>,
+    ) -> Result<()> {
         let mut sql = format!("{SELECT} WHERE b.deleted_at IS NULL");
         let mut args = Vec::new();
         if !self.tag_filter(&q.tags, &mut sql, &mut args)? {
-            return Ok(Vec::new());
+            return Ok(());
         }
         sql.push_str(" ORDER BY b.created_at DESC, b.id DESC LIMIT ?");
         args.push(Value::Integer(i64::try_from(q.limit).unwrap_or(-1)));
-        self.query(&sql, args)
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args))?;
+        while let Some(row) = rows.next()? {
+            f(Bookmark::from_row(row)?)?;
+        }
+        Ok(())
     }
 
     /// Searches live bookmarks; see [`search`] for the query language. Results are ranked by
     /// relevance, or newest first if the query has only filters.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Bookmark>> {
+        let mut found = Vec::new();
+        self.search_each(query, limit, |b| {
+            found.push(b);
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
+    /// Like [`Store::search`], but calls `f` for each bookmark as it's found instead of
+    /// collecting them. An error from `f` stops the search and is returned as is.
+    pub fn search_each(
+        &self,
+        query: &str,
+        limit: usize,
+        mut f: impl FnMut(Bookmark) -> Result<()>,
+    ) -> Result<()> {
         let q = search::parse(query);
         let filtered = !q.tags.is_empty() || !q.sites.is_empty();
         let mut args = Vec::new();
-        // First find the page of ids, then load those rows. Loading full rows (with their tags)
-        // inside the ranked query would do it for every match, not just the page.
+        // Rank ids first, then load each row as it's emitted. Loading full rows (with their
+        // tags) inside the ranked query would do it for every match, not just the ones returned.
         let mut sql = match &q.fts {
             // The index only holds live bookmarks, so without filters it can rank alone.
             Some(fts) if !filtered => {
@@ -319,7 +355,7 @@ impl Store {
             None => "SELECT b.id FROM bookmark b WHERE b.deleted_at IS NULL".to_string(),
         };
         if !self.tag_filter(&q.tags, &mut sql, &mut args)? {
-            return Ok(Vec::new());
+            return Ok(());
         }
         for site in &q.sites {
             sql.push_str(" AND on_site(b.url_norm, ?)");
@@ -331,21 +367,29 @@ impl Store {
         });
         args.push(Value::Integer(i64::try_from(limit).unwrap_or(-1)));
 
-        let ids: Vec<i64> = (|| {
-            let mut stmt = self.conn.prepare_cached(&sql)?;
-            let rows = stmt.query_map(params_from_iter(args), |r| r.get(0))?;
-            rows.collect::<rusqlite::Result<_>>()
-        })()
-        .map_err(|e| {
+        let invalid = |e: rusqlite::Error| {
             if e.to_string().contains("fts5") {
                 anyhow::anyhow!("invalid search query {query:?}: {e}")
             } else {
                 e.into()
             }
-        })?;
-        ids.into_iter()
-            .map(|id| self.get(id)?.context("bookmark vanished during search"))
-            .collect()
+        };
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(params_from_iter(args)).map_err(invalid)?;
+        while let Some(row) = rows.next().map_err(invalid)? {
+            let id = row.get(0)?;
+            f(self.get(id)?.context("bookmark vanished during search")?)?;
+        }
+        Ok(())
+    }
+
+    /// The largest bookmark id ever used (0 if none), e.g. to size an id column.
+    pub fn max_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT coalesce(max(id), 0) FROM bookmark", [], |r| {
+                r.get(0)
+            })?)
     }
 
     /// Appends one EXISTS clause per tag. Returns false if a tag doesn't exist, in which case
@@ -362,12 +406,6 @@ impl Store {
             args.push(Value::Integer(tag_id));
         }
         Ok(true)
-    }
-
-    fn query(&self, sql: &str, args: Vec<Value>) -> Result<Vec<Bookmark>> {
-        let mut stmt = self.conn.prepare_cached(sql)?;
-        let rows = stmt.query_map(params_from_iter(args), Bookmark::from_row)?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 

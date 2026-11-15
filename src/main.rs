@@ -132,19 +132,22 @@ fn run(cli: Cli) -> Result<ExitCode> {
             limit: n,
             json,
         } => {
-            let found = store.list(&ListQuery {
+            let q = ListQuery {
                 tags,
                 limit: limit(n),
-            })?;
-            print_list(&mut out, &found, json, &style)?;
+            };
+            let width = id_width(&store)?;
+            store.list_each(&q, |b| print_item(&mut out, &b, json, width, &style))?;
         }
         Cmd::Search {
             query,
             limit: n,
             json,
         } => {
-            let found = store.search(&query.join(" "), limit(n))?;
-            print_list(&mut out, &found, json, &style)?;
+            let width = id_width(&store)?;
+            store.search_each(&query.join(" "), limit(n), |b| {
+                print_item(&mut out, &b, json, width, &style)
+            })?;
         }
         Cmd::Show { id, json } => {
             let b = get(&store, id)?;
@@ -215,6 +218,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Width of the id column: the widest id the database has handed out, so rows align without
+/// collecting them first.
+fn id_width(store: &Store) -> Result<usize> {
+    Ok(store.max_id()?.to_string().len())
+}
+
 fn get(store: &Store, id: i64) -> Result<Bookmark> {
     store
         .get(id)?
@@ -250,20 +259,18 @@ impl Style {
     }
 }
 
-fn print_list(out: &mut impl Write, list: &[Bookmark], json: bool, style: &Style) -> Result<()> {
+/// Prints one listed bookmark: a JSON line, or a human line with the id padded to `width`.
+fn print_item(
+    out: &mut impl Write,
+    b: &Bookmark,
+    json: bool,
+    width: usize,
+    style: &Style,
+) -> Result<()> {
     if json {
-        for b in list {
-            serde_json::to_writer(&mut *out, b)?;
-            writeln!(out)?;
-        }
-        return Ok(());
-    }
-    let width = list
-        .iter()
-        .map(|b| b.id.to_string().len())
-        .max()
-        .unwrap_or(0);
-    for b in list {
+        serde_json::to_writer(&mut *out, b)?;
+        writeln!(out)?;
+    } else {
         print_line(out, b, width, style)?;
     }
     Ok(())

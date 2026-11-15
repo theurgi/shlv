@@ -231,3 +231,18 @@ fn no_color_when_piped() {
     db.ok(&["add", "https://a.com", "-t", "x"]);
     assert!(!db.ok(&["ls"]).contains('\x1b'));
 }
+
+#[test]
+fn ids_align_to_widest_id_in_database() {
+    let db = Db::new();
+    for i in 1..=10 {
+        let tag = if i == 9 { "nine" } else { "other" };
+        db.ok(&["add", &format!("https://{i}.com"), "-t", tag]);
+    }
+    assert_eq!(db.ok(&["ls", "-t", "nine"]), " 9  https://9.com  #nine\n");
+    assert_eq!(db.ok(&["search", "#nine"]), " 9  https://9.com  #nine\n");
+    assert_eq!(
+        db.ok(&["ls", "-n", "2"]).lines().nth(1),
+        Some(" 9  https://9.com  #nine")
+    );
+}
