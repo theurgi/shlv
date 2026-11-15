@@ -32,6 +32,8 @@
     {
       overlays.default = final: _prev: { shlv = final.callPackage ./nix/package.nix { }; };
 
+      homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };
+
       packages = forAll (pkgs: rec {
         shlv = pkgs.callPackage ./nix/package.nix { };
         default = shlv;
@@ -77,6 +79,10 @@
             pkgs.rustfmt
           ] "cargo fmt --check";
           oxfmt = lint "oxfmt" [ pkgs.oxfmt ] "oxfmt --check .";
+          hm-module = import ./nix/hm-module-test.nix {
+            inherit lib pkgs;
+            module = self.homeManagerModules.default;
+          };
           nixfmt = lint "nixfmt" [ pkgs.nixfmt ] "nixfmt --check flake.nix nix/*.nix";
         }
       );

@@ -14,6 +14,30 @@ nix profile add github:theurgi/shlv
 
 The flake also provides `overlays.default`, which adds `pkgs.shlv`.
 
+With [Home Manager](https://github.com/nix-community/home-manager), add `shlv` as a flake input,
+then import its module. `settings` is written to `~/.config/shlv/config.toml` (see
+[Config](#config)):
+
+```nix
+{ shlv, ... }:
+{
+  imports = [ shlv.homeManagerModules.default ];
+
+  programs.shlv = {
+    enable = true;
+    settings = {
+      strict_tags = true;
+      tags.canonical = {
+        javascript = [ "js" "ecmascript" ];
+        rust = [ ];
+      };
+    };
+  };
+}
+```
+
+Don't put secrets in `settings`, since it ends up in the Nix store.
+
 With Cargo:
 
 ```sh
@@ -64,6 +88,8 @@ import with non-canonical tags writes nothing unless you pass `--drop-unknown-ta
 
 The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 `~/.local/share/shlv/shlv.db`.
+
+### Config
 
 An optional config file lives at `$SHLV_CONFIG`, else `$XDG_CONFIG_HOME/shlv/config.toml`, else
 `~/.config/shlv/config.toml`. shlv only reads it, so it can be a read-only symlink. Unknown keys are
