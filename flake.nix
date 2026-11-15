@@ -25,6 +25,8 @@
             rust-analyzer
             oxfmt
             nixfmt
+            hyperfine
+            sqlite
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };
