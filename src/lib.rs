@@ -21,7 +21,9 @@ pub mod url;
 
 pub use config::Config;
 pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
-pub use suggest::{DomainRules, NonCanonicalRuleTags, RuleStats, Source, SuggestMode, Suggestion};
+pub use suggest::{
+    DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source, SuggestMode, Suggestion,
+};
 pub use tag::{
     CanonicalEntry, DeclaredEntry, DeclaredTags, ImportStats, NonCanonicalTags, Retagged,
     SyncStats, TagInfo, TagSort,

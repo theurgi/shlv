@@ -209,6 +209,15 @@ arrives (an interrupted run keeps them; rerun to continue), prints token use, an
 any failed. It says how many bookmarks it will send where before it starts, and above 20 it needs
 `--yes`.
 
+With `[ai] tag` set, `shlv suggest ID...` also asks that provider to choose tags from the canonical
+list (with aliases and descriptions; tags the bookmark has or rejected are left out), and its
+choices join the rules' as suggestions with source `llm` and no confidence score, since a model's
+own confidence isn't calibrated. The bookmark's summary is sent if it has one, else the page text.
+`suggest --all` sends bookmarks with fewer than `--max-tags` tags (default 1: untagged ones) that
+the provider hasn't tagged before (`--force` sends them again), with the same `-j`, `--yes`, and
+failure reporting as `summarize`. When `[ai] summarize` and `[ai] tag` name the same provider, a
+bookmark without a summary gets both from one request.
+
 Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped, and
 empty or overlong summaries are rejected. If a server doesn't support JSON-schema output, shlv falls
 back to JSON mode with the schema in the prompt.

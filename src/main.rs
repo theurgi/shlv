@@ -113,9 +113,12 @@ enum Cmd {
             conflicts_with = "all"
         )]
         ids: Vec<i64>,
-        /// Suggest tags for every bookmark (one transaction)
+        /// Suggest tags for every bookmark (rules: one transaction)
         #[arg(long)]
         all: bool,
+        #[cfg(feature = "ai")]
+        #[command(flatten)]
+        llm: ai_cmd::LlmArgs,
     },
     /// Import bookmarks from a browser export (Netscape HTML) or JSON lines ("-" for stdin)
     Import {
@@ -541,23 +544,48 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cmd: None,
             ids,
             all,
+            #[cfg(feature = "ai")]
+            llm,
         } => {
-            if store.rules().is_empty() {
+            #[cfg(feature = "ai")]
+            let provider = ai_cmd::tag_provider(&config)?;
+            #[cfg(not(feature = "ai"))]
+            let provider: Option<()> = None;
+            if store.rules().is_empty() && provider.is_none() {
+                let llm = if cfg!(feature = "ai") {
+                    ", and no [ai] tag provider"
+                } else {
+                    ""
+                };
                 bail!(
-                    "nothing to suggest with: no domain rules in {} ([tags.rules])",
+                    "nothing to suggest with: no domain rules in {} ([tags.rules]){llm}",
                     config_path.display()
                 );
             }
-            let s = store
-                .apply_rules((!all).then_some(ids.as_slice()))
-                .map_err(|e| rules_hint(e, &config_path))?;
-            print_rule_stats(&mut out, &s, store.suggest_mode())?;
+            if !store.rules().is_empty() {
+                let s = store
+                    .apply_rules((!all).then_some(ids.as_slice()))
+                    .map_err(|e| rules_hint(e, &config_path))?;
+                print_rule_stats(&mut out, &s, store.suggest_mode())?;
+            }
+            #[cfg(feature = "ai")]
+            let code = match provider {
+                Some(p) => {
+                    out.flush()?;
+                    ai_cmd::run_suggest_llm(&mut store, &config, &p, &ids, all, &llm, &mut out)?
+                }
+                None => ExitCode::SUCCESS,
+            };
+            #[cfg(not(feature = "ai"))]
+            let code = ExitCode::SUCCESS;
             if store.suggest_mode() == SuggestMode::Confirm && !all {
                 let width = id_width(&store)?;
                 for id in ids {
                     print_pending(&mut out, &store.pending(Some(id))?, width, &style)?;
                 }
             }
+            out.flush()?;
+            return Ok(code);
         }
         Cmd::Suggest { cmd: Some(cmd), .. } => {
             run_suggest(&mut store, cmd, declared.as_ref(), &mut out, &style)?

@@ -249,6 +249,15 @@ pub enum Offered {
     Skipped,
 }
 
+/// What [`Store::offer_choices`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OfferStats {
+    /// New pending suggestions (confirm mode).
+    pub pending: usize,
+    /// Tags applied (auto mode).
+    pub applied: usize,
+}
+
 /// What [`Store::apply_rules`], or the rules in [`Store::import`], did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuleStats {
@@ -408,6 +417,69 @@ const PENDING: &str = "s.state = 'pending' AND NOT EXISTS (SELECT 1 FROM bookmar
      WHERE bt.bookmark_id = s.bookmark_id AND bt.tag_id = s.tag_id)";
 
 impl Store {
+    /// Offers a choose-tags layer's choices for one bookmark, in one short transaction, through
+    /// the same path as domain rules: confirm mode records them as pending, auto mode applies
+    /// them; tags the bookmark has or that were rejected for it are skipped. Choices must name
+    /// canonical tags (as [`crate::choose::Canonical`] returns them); others are ignored.
+    pub fn offer_choices(
+        &mut self,
+        bookmark: i64,
+        source: Source,
+        choices: &[crate::choose::Choice],
+    ) -> Result<OfferStats> {
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let mut stats = OfferStats::default();
+        for c in choices {
+            let Some(tag_id) = resolve_tag(&tx, &c.tag)? else {
+                continue;
+            };
+            match offer(
+                &tx,
+                bookmark,
+                tag_id,
+                source,
+                c.confidence,
+                self.suggest_mode,
+                now,
+            )? {
+                Offered::Pending => stats.pending += 1,
+                Offered::Applied => stats.applied += 1,
+                Offered::Skipped => {}
+            }
+        }
+        if stats.applied > 0 {
+            touch_many(&tx, &[bookmark], now)?;
+        }
+        tx.commit()?;
+        Ok(stats)
+    }
+
+    /// Tags a layer shouldn't offer for `bookmark`: the ones it has and the ones rejected for it.
+    pub fn excluded_tags(&self, bookmark: i64) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT t.name FROM bookmark_tag bt JOIN tag t ON t.id = bt.tag_id \
+             WHERE bt.bookmark_id = ?1 \
+             UNION SELECT t.name FROM tag_suggestion s JOIN tag t ON t.id = s.tag_id \
+             WHERE s.bookmark_id = ?1 AND s.state = 'rejected'",
+        )?;
+        let names = stmt.query_map([bookmark], |r| r.get(0))?;
+        Ok(names.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether `source` has suggested anything for `bookmark` before: a suggestion pending or
+    /// rejected, or a tag it suggested that was accepted.
+    pub fn suggested_by(&self, bookmark: i64, source: Source) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM tag_suggestion WHERE bookmark_id = ?1 \
+                 AND source = ?2) OR EXISTS (SELECT 1 FROM bookmark_tag WHERE bookmark_id = ?1 \
+                 AND source = ?2)",
+            )?
+            .query_row(params![bookmark, source.as_str()], |r| r.get(0))?)
+    }
+
     /// Domain rules applied by [`Store::add`] and [`Store::apply_rules`]. None by default.
     pub fn set_rules(&mut self, rules: DomainRules) {
         self.rules = rules;
