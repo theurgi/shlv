@@ -1,0 +1,16 @@
+[package]
+name = "tag-models"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Task 025: which tag-choosing layer works? Not shipped."
+
+[dependencies]
+anyhow = "1.0.104"
+serde_json = "1.0.154"
+toml = { version = "1.2.1", default-features = false, features = ["std", "serde", "parse"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+shlv = { path = "../..", features = ["ai"] }
+
+[profile.release]
+debug = false

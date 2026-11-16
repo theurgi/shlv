@@ -1,0 +1,215 @@
+# The canonical list for the experiment, written the way a user would write [tags.canonical]:
+# each tag with the raw Delicious tags that map to it (aliases) and a one-line description.
+# Generic raw tags (web, internet, technology, free, online, cool) map to nothing.
+
+[tags.canonical]
+design = { aliases = [
+  "graphicdesign",
+  "graphic_design",
+  "graphics",
+  "logo",
+  "logos",
+], description = "visual and graphic design" }
+webdesign = { aliases = [
+  "web_design",
+  "web-design",
+  "templates",
+  "template",
+  "portfolio",
+], description = "designing websites: layouts, templates, site examples" }
+ux = { aliases = [
+  "usability",
+  "ui",
+  "userexperience",
+  "interaction",
+  "interface",
+  "interactiondesign",
+], description = "user experience, usability, and interface design" }
+typography = { aliases = [
+  "fonts",
+  "font",
+  "type",
+], description = "fonts, typefaces, and lettering" }
+css = { aliases = ["css3", "stylesheet"], description = "CSS styling for web pages" }
+html = { aliases = ["html5", "xhtml", "w3c"], description = "HTML markup and web standards" }
+javascript = { aliases = [
+  "js",
+  "jquery",
+  "ajax",
+  "node",
+  "nodejs",
+], description = "the JavaScript language and its libraries" }
+programming = { aliases = [
+  "development",
+  "code",
+  "coding",
+  "dev",
+  "webdev",
+  "software_development",
+], description = "writing software and programming techniques" }
+python = { aliases = ["django"], description = "the Python language" }
+ruby = { aliases = ["rails", "rubyonrails"], description = "the Ruby language and Rails" }
+php = { aliases = [], description = "the PHP language" }
+database = { aliases = ["sql", "mysql", "db", "nosql"], description = "databases and SQL" }
+api = { aliases = ["apis", "webservices"], description = "web APIs and services for developers" }
+linux = { aliases = ["ubuntu", "unix", "debian"], description = "Linux and Unix systems" }
+mac = { aliases = ["apple", "osx", "macosx"], description = "Apple Macs and macOS" }
+windows = { aliases = ["microsoft", "win7"], description = "Microsoft Windows" }
+mobile = { aliases = [
+  "iphone",
+  "ipad",
+  "android",
+  "ipodtouch",
+  "apps",
+  "app",
+  "ios",
+], description = "phones, tablets, and mobile apps" }
+opensource = { aliases = [
+  "open_source",
+  "open-source",
+  "oss",
+  "foss",
+], description = "open-source software and projects" }
+security = { aliases = ["hacking", "encryption"], description = "computer security and hacking" }
+privacy = { aliases = [], description = "privacy and personal data online" }
+tools = { aliases = [
+  "tool",
+  "utilities",
+  "utility",
+  "generator",
+  "converter",
+], description = "useful online tools and utilities" }
+software = { aliases = [
+  "freeware",
+  "download",
+  "downloads",
+], description = "desktop software and programs to download" }
+socialmedia = { aliases = [
+  "social_media",
+  "social",
+  "socialnetworking",
+  "socialnetwork",
+  "web20",
+  "twitter",
+  "facebook",
+  "social-media",
+], description = "social networks and social media" }
+blog = { aliases = ["blogs", "blogging"], description = "blogs and blogging" }
+wordpress = { aliases = ["wp"], description = "the WordPress platform, themes, and plugins" }
+google = { aliases = [], description = "Google and its services" }
+search = { aliases = [
+  "searchengine",
+  "search_engine",
+], description = "search engines and finding things online" }
+seo = { aliases = [], description = "search engine optimization" }
+video = { aliases = [
+  "videos",
+  "youtube",
+  "film",
+  "movies",
+  "movie",
+  "tv",
+], description = "video, film, and television" }
+music = { aliases = [
+  "mp3",
+  "audio",
+  "songs",
+  "podcast",
+  "podcasts",
+], description = "music, audio, and podcasts" }
+photography = { aliases = [
+  "photo",
+  "photos",
+  "images",
+  "image",
+  "pictures",
+  "flickr",
+], description = "photography and images" }
+art = { aliases = [
+  "illustration",
+  "painting",
+  "drawing",
+  "artist",
+  "artists",
+], description = "art and illustration" }
+animation = { aliases = ["motion", "flash"], description = "animation and motion graphics" }
+visualization = { aliases = [
+  "infographics",
+  "infographic",
+  "dataviz",
+  "charts",
+  "graphs",
+], description = "data visualization and infographics" }
+data = { aliases = [
+  "statistics",
+  "stats",
+  "opendata",
+  "datasets",
+], description = "data, statistics, and datasets" }
+education = { aliases = [
+  "learning",
+  "teaching",
+  "school",
+  "teacher",
+  "teachers",
+  "elearning",
+  "be_teacher_librarians",
+  "edtech",
+], description = "teaching, learning, and schools" }
+library = { aliases = [
+  "libraries",
+  "librarian",
+  "librarians",
+], description = "libraries and librarianship" }
+research = { aliases = ["academic", "scholarly"], description = "research and academic work" }
+science = { aliases = ["physics", "biology", "chemistry"], description = "the natural sciences" }
+math = { aliases = ["mathematics", "maths"], description = "mathematics" }
+history = { aliases = [], description = "history" }
+politics = { aliases = ["government", "election"], description = "politics and government" }
+news = { aliases = ["journalism", "newspaper", "media"], description = "news and journalism" }
+business = { aliases = [
+  "management",
+  "entrepreneur",
+  "startup",
+  "startups",
+  "economy",
+  "economics",
+  "finance",
+], description = "business, management, and the economy" }
+marketing = { aliases = [
+  "advertising",
+  "ads",
+  "branding",
+], description = "marketing and advertising" }
+writing = { aliases = ["writers", "writer", "poetry"], description = "writing and writers" }
+books = { aliases = [
+  "book",
+  "reading",
+  "literature",
+  "ebooks",
+  "ebook",
+], description = "books and reading" }
+food = { aliases = ["recipes", "recipe", "cooking"], description = "food, cooking, and recipes" }
+games = { aliases = ["game", "gaming"], description = "games and gaming" }
+humor = { aliases = ["funny", "fun", "humour", "comics"], description = "humor and funny things" }
+tutorial = { aliases = [
+  "howto",
+  "how-to",
+  "tutorials",
+  "tips",
+  "guide",
+], description = "how-to guides and tutorials" }
+reference = { aliases = [
+  "resources",
+  "resource",
+  "documentation",
+  "docs",
+], description = "reference material and resource lists" }
+inspiration = { aliases = [
+  "ideas",
+  "creativity",
+  "creative",
+], description = "inspiration and creative ideas" }
+travel = { aliases = ["maps", "map", "geography"], description = "travel, places, and maps" }
+shopping = { aliases = ["shop", "store"], description = "shopping and online stores" }
+jobs = { aliases = ["career", "work", "employment"], description = "jobs and careers" }
