@@ -45,3 +45,7 @@ strip = true
 [[example]]
 name = "extract"
 required-features = ["fetch"]
+
+[dev-dependencies]
+# Already in the tree through ureq; the TLS test serves HTTPS with it.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }

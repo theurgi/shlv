@@ -149,6 +149,7 @@ pub(crate) fn agent(config: &ProviderConfig) -> ureq::Agent {
         .timeout_global(Some(config.timeout()))
         .http_status_as_error(false)
         .user_agent(crate::fetch::USER_AGENT)
+        .tls_config(crate::fetch::tls())
         .build()
         .new_agent()
 }

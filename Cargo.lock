@@ -457,6 +457,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "toml",

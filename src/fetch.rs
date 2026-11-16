@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::Read;
+use std::path::Path;
 use std::time::Duration;
 
 use ureq::ResponseExt;
@@ -81,16 +82,26 @@ impl std::error::Error for FetchError {}
 
 impl From<ureq::Error> for FetchError {
     fn from(e: ureq::Error) -> Self {
-        match e {
-            ureq::Error::StatusCode(code) => FetchError::Status(code),
-            ureq::Error::Timeout(_) => FetchError::Timeout,
-            ureq::Error::TooManyRedirects => FetchError::TooManyRedirects,
-            ureq::Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => FetchError::Timeout,
-            ureq::Error::Io(e) => FetchError::Network(e.to_string()),
-            ureq::Error::HostNotFound => FetchError::Network("host not found".into()),
-            ureq::Error::ConnectionFailed => FetchError::Network("connection failed".into()),
-            e => FetchError::Network(e.to_string()),
+        let msg = match e {
+            ureq::Error::StatusCode(code) => return FetchError::Status(code),
+            ureq::Error::Timeout(_) => return FetchError::Timeout,
+            ureq::Error::TooManyRedirects => return FetchError::TooManyRedirects,
+            ureq::Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return FetchError::Timeout;
+            }
+            ureq::Error::Io(e) => e.to_string(),
+            ureq::Error::HostNotFound => "host not found".into(),
+            ureq::Error::ConnectionFailed => "connection failed".into(),
+            e => e.to_string(),
+        };
+        if msg.contains("UnknownIssuer") {
+            return FetchError::Network(format!(
+                "{msg}: the server's certificate isn't signed by a trusted CA; if a proxy \
+                 re-signs HTTPS, add its CA to the system store or point SSL_CERT_FILE at a \
+                 bundle that has it"
+            ));
         }
+        FetchError::Network(msg)
     }
 }
 
@@ -115,6 +126,7 @@ impl Fetcher {
             .max_redirects(limits.redirects)
             .user_agent(USER_AGENT)
             .accept("text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
+            .tls_config(tls())
             .build()
             .new_agent();
         Fetcher { agent, limits }
@@ -156,6 +168,46 @@ impl Fetcher {
     }
 }
 
+/// Where CA bundles usually are: the variables curl and Nix honor, then Debian/NixOS/Arch,
+/// Fedora/RHEL, openSUSE, and macOS/Alpine/BSD.
+const CA_FILES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+/// TLS settings for every request: the system's CA bundle when there is one, so a proxy's CA
+/// that the system trusts works; else the bundled Mozilla roots. Read once per process.
+pub(crate) fn tls() -> ureq::tls::TlsConfig {
+    static ROOTS: std::sync::OnceLock<ureq::tls::RootCerts> = std::sync::OnceLock::new();
+    let roots = ROOTS.get_or_init(|| {
+        let env = |v: &str| std::env::var(v).ok().filter(|s| !s.is_empty());
+        let candidates = ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE"]
+            .iter()
+            .filter_map(|v| env(v))
+            .chain(CA_FILES.iter().map(|s| s.to_string()));
+        candidates
+            .filter_map(|p| ca_bundle(Path::new(&p)))
+            .next()
+            .unwrap_or(ureq::tls::RootCerts::WebPki)
+    });
+    ureq::tls::TlsConfig::builder()
+        .root_certs(roots.clone())
+        .build()
+}
+
+/// The certificates in a PEM bundle, if it has any.
+fn ca_bundle(path: &Path) -> Option<ureq::tls::RootCerts> {
+    let pem = std::fs::read(path).ok()?;
+    let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(&pem)
+        .filter_map(|item| match item {
+            Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+            _ => None,
+        })
+        .collect();
+    (!certs.is_empty()).then(|| ureq::tls::RootCerts::new_with_certs(&certs))
+}
 /// Sniffs a body served without a content type.
 fn looks_like_html(bytes: &[u8]) -> bool {
     let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]);
