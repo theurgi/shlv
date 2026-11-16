@@ -45,7 +45,8 @@ in
         what it read.
 
         - `strict_tags`: when true, `add`, `edit`, and `import` reject tags that aren't canonical
-          or an alias of a canonical tag.
+          or an alias of a canonical tag. With `"propose"`, they become proposals for the list
+          instead, reviewed with `shlv tag proposals`.
         - `tags.canonical`: the declared canonical tag list, mapping each tag to its aliases, or
           to `{ aliases = [ ... ]; description = "..."; }`. A description (one line, at most 200
           characters) says what belongs under the tag; the tag suggestion layers match against it.

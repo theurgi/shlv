@@ -274,6 +274,10 @@ fn live_anthropic() {
     let p = Provider::new("live", &c).unwrap();
     let tags = p.choose_tags(&item(), &list()).unwrap();
     assert!(tags.iter().any(|t| t.tag == "rust"), "{tags:?}");
-    let (summary, _) = p.summarize_and_tag(&item(), &list()).unwrap();
+    let summary = p
+        .summarize_and_tag(&item(), &list())
+        .unwrap()
+        .summary
+        .unwrap();
     eprintln!("summary: {summary}\nusage: {:?}", p.usage());
 }

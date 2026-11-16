@@ -1349,3 +1349,79 @@ fn import_urls_only_refuses_tag_options() {
     let err = db.fail(&["import", "--no-titles", &file]);
     assert!(err.contains("--urls-only"), "{err}");
 }
+
+#[test]
+fn strict_propose_and_tag_proposals() {
+    let db = Db::new();
+    db.ok(&["tag", "canonical", "add", "rust"]);
+    std::fs::write(db.config(), "strict_tags = \"propose\"\n").unwrap();
+    let out = db.ok(&["add", "a.example", "-t", "rust", "-t", "Web Dev"]);
+    assert_eq!(
+        out,
+        "added 1  https://a.example  #rust\n\
+         proposed  #web-dev  (not canonical; `shlv tag proposals accept web-dev` adds them)\n"
+    );
+    let out = db.ok(&["edit", "1", "-t", "css"]);
+    assert!(
+        out.ends_with(
+            "proposed  #css  (not canonical; `shlv tag proposals accept css` adds them)\n"
+        ),
+        "{out}"
+    );
+    assert_eq!(
+        db.ok(&["tag", "proposals"]),
+        "1  css  (user)\n1  web-dev  (user)\n"
+    );
+
+    // Rejected names are dropped, with a note.
+    assert_eq!(
+        db.ok(&["tag", "proposals", "reject", "css"]),
+        "rejected css (it was proposed for 1 bookmark); it won't be proposed again\n"
+    );
+    let (ok, out, err) = db.run(&["add", "b.example", "-t", "css"]);
+    assert!(ok, "{err}");
+    assert_eq!(out, "added 2  https://b.example\n");
+    assert!(err.contains("dropped css: rejected as proposals"), "{err}");
+
+    // Import proposes too, in this mode or with --propose-unknown-tags.
+    let (ok, out, err) = db.run(&["import", &fixture("firefox.html")]);
+    assert!(ok, "{err}");
+    assert!(out.contains("7 added"), "{out}");
+    assert!(
+        err.contains(
+            "kept 4 tags as proposals (not canonical): programming to-read long-form lang\n"
+        ),
+        "{err}"
+    );
+    std::fs::write(db.config(), "strict_tags = true\n").unwrap();
+    let err = db.fail(&["import", &fixture("firefox.html")]);
+    assert!(err.contains("--propose-unknown-tags"), "{err}");
+    let (ok, _, err) = db.run(&["import", "--propose-unknown-tags", &fixture("firefox.html")]);
+    assert!(ok, "{err}");
+    let err = db.fail(&[
+        "import",
+        "--propose-unknown-tags",
+        "--drop-unknown-tags",
+        "x",
+    ]);
+    assert!(err.contains("cannot be used with"), "{err}");
+
+    let out = db.ok(&["tag", "proposals", "accept", "web-dev"]);
+    assert_eq!(out, "accepted web-dev: canonical, tagged 1 bookmark\n");
+    assert!(db.ok(&["show", "1"]).contains("tags:     rust web-dev\n"));
+    let err = db.fail(&["tag", "proposals", "accept", "nope"]);
+    assert!(err.contains("no proposal \"nope\""), "{err}");
+    let err = db.fail(&["tag", "proposals", "alias", "lang", "nope"]);
+    assert!(err.contains("no tag \"nope\""), "{err}");
+    let out = db.ok(&["tag", "proposals", "alias", "lang", "rust"]);
+    assert!(out.starts_with("aliased lang to rust: tagged "), "{out}");
+    assert!(db.ok(&["tag", "ls"]).contains("rust  = lang"));
+    let err = db.fail(&["tag", "proposals", "reject", "rust"]);
+    assert!(err.contains("is on the list"), "{err}");
+    let v = json_lines(&db.ok(&["tag", "proposals", "ls", "--rejected", "--json"]));
+    assert_eq!(v.len(), 1);
+    assert_eq!(
+        (&v[0]["name"], &v[0]["state"]),
+        (&serde_json::json!("css"), &serde_json::json!("rejected"))
+    );
+}

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 
+use crate::proposal::{Diverted, ProposalSource, StrictTags, divert};
 use crate::store::{Put, check_url, non_empty, normalize_tag, now_ms, put, reindex_many};
 use crate::suggest::{RuleStats, offer_rules_many};
 use crate::tag::NonCanonicalTags;
@@ -159,6 +160,9 @@ pub struct ImportOptions {
     pub drop_non_canonical: bool,
     /// Don't run the domain rules (see [`Store::set_rules`]) on the imported bookmarks.
     pub skip_rules: bool,
+    /// Keep tags that aren't canonical as proposals for their bookmarks (source `import`)
+    /// instead of tags. Always on with `strict_tags = "propose"`.
+    pub propose_unknown: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -168,8 +172,11 @@ pub struct ImportSummary {
     pub updated: usize,
     /// Items not imported: their URL and why.
     pub skipped: Vec<(String, String)>,
-    /// Tags dropped by [`ImportOptions::drop_non_canonical`], in first-seen order.
+    /// Tags dropped by [`ImportOptions::drop_non_canonical`], or because they were rejected as
+    /// proposals, in first-seen order.
     pub dropped_tags: Vec<String>,
+    /// Tags kept as proposals ([`ImportOptions::propose_unknown`]), in first-seen order.
+    pub proposed: Vec<String>,
     /// What the domain rules did; `checked` counts distinct bookmarks.
     pub rules: RuleStats,
 }
@@ -198,6 +205,8 @@ struct Ready<'a> {
     /// The item's title, unless it's empty or only the URL.
     title: Option<&'a str>,
     tags: Vec<String>,
+    /// Tags kept as proposals instead.
+    proposed: Vec<String>,
 }
 
 impl Store {
@@ -210,8 +219,10 @@ impl Store {
     /// the import's own tags, they're part of the write that brings the bookmark in.
     ///
     /// In strict mode, fails with [`NonCanonicalTags`] listing every offending tag, or with
-    /// [`NonCanonicalRuleTags`](crate::NonCanonicalRuleTags) for the rules, before anything is written, unless `opts` drops
-    /// the tags or skips the rules.
+    /// [`NonCanonicalRuleTags`](crate::NonCanonicalRuleTags) for the rules, before anything is
+    /// written, unless `opts` drops the tags or skips the rules. Tags that aren't canonical become
+    /// proposals for their bookmarks instead with [`ImportOptions::propose_unknown`] or
+    /// `strict_tags = "propose"` (see [`crate::proposal`]).
     pub fn import(&mut self, items: &[ImportItem], opts: ImportOptions) -> Result<ImportSummary> {
         let mut summary = ImportSummary::default();
         let mut ready = Vec::with_capacity(items.len());
@@ -235,6 +246,7 @@ impl Store {
                         url,
                         norm,
                         tags,
+                        proposed: Vec::new(),
                     });
                 }
                 Err(_) => summary
@@ -250,12 +262,21 @@ impl Store {
             .filter(|t| seen.insert(t.as_str()))
             .cloned()
             .collect();
-        if opts.drop_non_canonical {
+        let propose = opts.propose_unknown || self.strict_mode() == StrictTags::Propose;
+        if opts.drop_non_canonical || propose {
             let bad: HashSet<String> = self.non_canonical(&all)?.into_iter().collect();
             if !bad.is_empty() {
-                summary.dropped_tags = all.into_iter().filter(|t| bad.contains(t)).collect();
+                if !propose {
+                    summary.dropped_tags = all.into_iter().filter(|t| bad.contains(t)).collect();
+                }
                 for r in &mut ready {
-                    r.tags.retain(|t| !bad.contains(t));
+                    let (keep, off) = std::mem::take(&mut r.tags)
+                        .into_iter()
+                        .partition(|t| !bad.contains(t));
+                    r.tags = keep;
+                    if propose {
+                        r.proposed = off;
+                    }
                 }
             }
         } else if self.strict_tags() {
@@ -284,6 +305,7 @@ impl Store {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let mut ids = Vec::with_capacity(ready.len());
+        let mut diverted = Diverted::default();
         for r in ready {
             let created_at = r.item.created_at.unwrap_or(now);
             let added = put(
@@ -303,12 +325,22 @@ impl Store {
             )
             .with_context(|| format!("cannot import {}", r.url))?;
             ids.push(added.id);
+            divert(
+                &tx,
+                &r.proposed,
+                ProposalSource::Import,
+                added.id,
+                now,
+                &mut diverted,
+            )?;
             if added.created {
                 summary.added += 1;
             } else {
                 summary.updated += 1;
             }
         }
+        summary.proposed = diverted.proposed;
+        summary.dropped_tags.extend(diverted.rejected);
         if rules {
             // Before reindexing, so applied tags are searchable; the reindex covers every id.
             let mut seen = HashSet::new();

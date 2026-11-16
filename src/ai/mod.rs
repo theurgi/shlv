@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use toml::Spanned;
 
-use crate::choose::{Canonical, Choice, ChooseTags, Item, TagOption};
+use crate::choose::{Canonical, Choice, ChooseTags, Item, NewTag, TagOption};
 
 /// Longest summary accepted, in characters.
 pub const MAX_SUMMARY: usize = 1000;
@@ -41,6 +41,10 @@ pub struct AiConfig {
     pub summarize: Option<Spanned<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<Spanned<String>>,
+    /// Most new tag names the `tag` provider may propose per bookmark, alongside tags from the
+    /// list (default 3; 0 turns proposals off). They become proposals, never tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposals: Option<usize>,
 }
 
 /// A `[provider.NAME]` section.
@@ -213,10 +217,34 @@ pub trait Llm: Send + Sync {
     }
 }
 
+/// New tag names per bookmark the `tag` provider may propose unless `[ai] proposals` says
+/// otherwise.
+pub const DEFAULT_PROPOSALS: usize = 3;
+
+impl AiConfig {
+    /// `[ai] proposals`, or its default.
+    pub fn proposals(&self) -> usize {
+        self.proposals.unwrap_or(DEFAULT_PROPOSALS)
+    }
+}
+
+/// Asking for new tag names alongside tags from the list (task 031). Off by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Proposing {
+    /// Most new names per bookmark; 0 asks for none.
+    pub max: usize,
+    /// Names already waiting as proposals, for the model to reuse rather than coin synonyms of.
+    pub known: Vec<String>,
+}
+
+/// Most pending proposal names put in the prompt.
+pub const MAX_KNOWN: usize = 100;
+
 /// A configured provider.
 pub struct Provider {
     name: String,
     llm: Box<dyn Llm>,
+    proposing: Proposing,
 }
 
 impl Provider {
@@ -243,11 +271,22 @@ impl Provider {
         Provider {
             name: name.to_string(),
             llm,
+            proposing: Proposing::default(),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Asks for new tag names in tag requests from now on; see [`Proposing`].
+    pub fn set_proposing(&mut self, p: Proposing) {
+        self.proposing = p;
+    }
+
+    /// Whether tag requests ask for new names.
+    pub fn proposes(&self) -> bool {
+        self.proposing.max > 0
     }
 
     /// Tokens used by this provider so far.
@@ -266,36 +305,41 @@ impl Provider {
     /// Tags from `list` that fit the bookmark. Unknown names in the reply are dropped and aliases
     /// resolved; confidence is `None` (LLMs' stated confidence isn't calibrated).
     pub fn choose_tags(&self, item: &Item, list: &[TagOption]) -> Result<Vec<Choice>> {
-        Ok(self.run(Job::Tags, item, list)?.tags)
+        Ok(self.tag(item, list)?.tags)
     }
 
-    /// Both in one request.
-    pub fn summarize_and_tag(
-        &self,
-        item: &Item,
-        list: &[TagOption],
-    ) -> Result<(String, Vec<Choice>)> {
-        if list.is_empty() {
-            return Ok((self.summarize(item)?, Vec::new()));
+    /// Tags from `list` that fit the bookmark, as [`Provider::choose_tags`] returns them, and,
+    /// when proposing ([`Provider::set_proposing`]), new names for the list. `list` may be empty
+    /// when proposing; then the reply has only new names.
+    pub fn tag(&self, item: &Item, list: &[TagOption]) -> Result<Answer> {
+        self.run(Job::Tags, item, list)
+    }
+
+    /// Both in one request: the summary, list tags, and new names when proposing.
+    pub fn summarize_and_tag(&self, item: &Item, list: &[TagOption]) -> Result<Answer> {
+        if list.is_empty() && !self.proposes() {
+            return Ok(Answer {
+                summary: Some(self.summarize(item)?),
+                ..Answer::default()
+            });
         }
-        let a = self.run(Job::Both, item, list)?;
-        Ok((a.summary.unwrap_or_default(), a.tags))
+        self.run(Job::Both, item, list)
     }
 
     /// Sends one job; a reply that isn't valid is retried once, with what was wrong.
     fn run(&self, job: Job, item: &Item, list: &[TagOption]) -> Result<Answer> {
         let at = || format!("provider {} ({})", self.name, job.task().as_str());
-        if job != Job::Summary && list.is_empty() {
+        if job != Job::Summary && list.is_empty() && !self.proposes() {
             bail!(
                 "provider {} (tag): the canonical tag list is empty; declare tags in \
                  [tags.canonical] or mark some with `shlv tag canonical add`",
                 self.name
             );
         }
-        let mut req = job.request(item, list);
+        let mut req = job.request(item, list, &self.proposing);
         for attempt in 0..2 {
             let reply = self.llm.complete(&req).with_context(at)?;
-            match job.check(&reply, list) {
+            match job.check(&reply, list, self.proposing.max) {
                 Ok(a) => return Ok(a),
                 Err(why) if attempt == 1 => {
                     return Err(anyhow!("invalid reply twice: {why}")).with_context(at);
@@ -326,7 +370,12 @@ impl Provider {
         let b = self.batches()?;
         let requests = jobs
             .iter()
-            .map(|(id, job, item)| (id.clone(), b.body(&job.request(item, list))))
+            .map(|(id, job, item)| {
+                (
+                    id.clone(),
+                    b.body(&job.request(item, list, &self.proposing)),
+                )
+            })
             .collect();
         b.submit_batch(requests)
             .with_context(|| format!("provider {} (batch)", self.name))
@@ -354,7 +403,7 @@ impl Provider {
             .into_iter()
             .map(|(id, r)| {
                 let a = match (r, job_of(&id)) {
-                    (Ok(text), Some(job)) => job.check(&text, list),
+                    (Ok(text), Some(job)) => job.check(&text, list, self.proposing.max),
                     (Ok(_), None) => Err(format!("unknown custom_id {id:?}")),
                     (Err(e), _) => Err(e),
                 };
@@ -377,6 +426,9 @@ pub enum Job {
 pub struct Answer {
     pub summary: Option<String>,
     pub tags: Vec<Choice>,
+    /// New names for the list, when proposing: normalized, none of them on the list (a list
+    /// name or alias given as new is moved to `tags`), at most [`Proposing::max`].
+    pub proposed: Vec<NewTag>,
 }
 
 impl Job {
@@ -387,31 +439,32 @@ impl Job {
         }
     }
 
-    /// The structured-output request for this job.
-    pub fn request(self, item: &Item, list: &[TagOption]) -> Request {
-        let summary = json!({ "type": "string" });
-        let (system, name, props, required) = match self {
-            Job::Summary => (
-                SUMMARY_PROMPT.to_string(),
-                "summary",
-                json!({ "summary": summary }),
-                json!(["summary"]),
-            ),
-            Job::Tags => (
-                format!("{TAG_PROMPT}\n\n{}", tag_list(list)),
-                "tags",
-                json!({ "tags": tags_schema(list) }),
-                json!(["tags"]),
-            ),
-            Job::Both => (
-                format!("{SUMMARY_PROMPT}\n\n{TAG_PROMPT}\n\n{}", tag_list(list)),
-                "summary_and_tags",
-                json!({ "summary": summary, "tags": tags_schema(list) }),
-                json!(["summary", "tags"]),
-            ),
+    /// The structured-output request for this job. With an empty `list`, a tag job asks only
+    /// for new names (when `proposing`).
+    pub fn request(self, item: &Item, list: &[TagOption], proposing: &Proposing) -> Request {
+        let mut props = serde_json::Map::new();
+        let mut system = Vec::new();
+        if self != Job::Tags {
+            system.push(SUMMARY_PROMPT.to_string());
+            props.insert("summary".into(), json!({ "type": "string" }));
+        }
+        if self != Job::Summary {
+            system.push(tag_prompt(list, proposing));
+            if !list.is_empty() {
+                props.insert("tags".into(), tags_schema(list));
+            }
+            if proposing.max > 0 {
+                props.insert("new_tags".into(), new_tags_schema());
+            }
+        }
+        let name = match self {
+            Job::Summary => "summary",
+            Job::Tags => "tags",
+            Job::Both => "summary_and_tags",
         };
+        let required: Vec<&String> = props.keys().collect();
         Request {
-            system,
+            system: system.join("\n\n"),
             user: describe(item),
             schema_name: name,
             schema: json!({
@@ -424,26 +477,69 @@ impl Job {
         }
     }
 
-    /// Checks a reply: valid JSON with the job's fields; tags resolved against `list`.
-    pub fn check(self, reply: &str, list: &[TagOption]) -> Result<Answer, String> {
+    /// Checks a reply: valid JSON with the job's fields; tags resolved against `list`; with
+    /// `proposals` above 0, up to that many new names.
+    pub fn check(
+        self,
+        reply: &str,
+        list: &[TagOption],
+        proposals: usize,
+    ) -> Result<Answer, String> {
         let v: Value =
             serde_json::from_str(strip_fences(reply)).map_err(|e| format!("not JSON ({e})"))?;
         let canonical = Canonical::new(list);
-        Ok(match self {
-            Job::Summary => Answer {
-                summary: Some(summary_of(&v)?),
-                tags: Vec::new(),
-            },
-            Job::Tags => Answer {
-                summary: None,
-                tags: tags_of(&v, &canonical)?,
-            },
-            Job::Both => Answer {
-                summary: Some(summary_of(&v)?),
-                tags: tags_of(&v, &canonical)?,
-            },
-        })
+        let mut a = Answer::default();
+        if self != Job::Tags {
+            a.summary = Some(summary_of(&v)?);
+        }
+        if self != Job::Summary {
+            // A reply to a request sent with an empty list (a batch collected after names were
+            // accepted) has only new names.
+            let only_new = proposals > 0 && v.get("tags").is_none() && v.get("new_tags").is_some();
+            if !list.is_empty() && !only_new {
+                a.tags = tags_of(&v, &canonical)?;
+            }
+            if proposals > 0 {
+                let new = new_tags_of(&v)?;
+                let raw = new_tags_into(new, &canonical, proposals, &mut a.proposed);
+                let mut tags = std::mem::take(&mut a.tags);
+                tags.extend(raw);
+                a.tags = canonical.filter(tags).0;
+            }
+        }
+        Ok(a)
     }
+}
+
+/// Splits checked new names: those on the list (or aliases of list tags) become choices, which
+/// are returned; the rest go into `out`, deduplicated, at most `max`.
+fn new_tags_into(
+    new: Vec<NewTag>,
+    canonical: &Canonical,
+    max: usize,
+    out: &mut Vec<NewTag>,
+) -> Vec<Choice> {
+    let mut listed = Vec::new();
+    for t in new {
+        let name = crate::store::normalize_tag(&t.name);
+        if name.is_empty() {
+            continue;
+        }
+        if canonical.resolve(&name).is_some() {
+            listed.push(Choice {
+                tag: name,
+                confidence: None,
+            });
+        } else if out.len() < max && !out.iter().any(|o| o.name == name) {
+            let description = t.description.and_then(|d| {
+                crate::tag::check_description(&crate::html::collapse_ws(&d))
+                    .ok()
+                    .flatten()
+            });
+            out.push(NewTag { name, description });
+        }
+    }
+    listed
 }
 
 impl ChooseTags for Provider {
@@ -478,6 +574,92 @@ const SUMMARY_PROMPT: &str = "You summarize bookmarked web pages. Write two or t
 const TAG_PROMPT: &str = "You tag bookmarked web pages with tags from a fixed list. Choose the \
     tags that clearly fit the page: usually one to three, and none if nothing fits well. Use only \
     names from the list below, exactly as written. Reply with JSON only: {\"tags\": [...]}.";
+
+/// What a proposed name should look like.
+const NEW_TAG_STYLE: &str = "A new tag is a short, general topic name in lowercase, words joined \
+    by hyphens, like GitHub topics (rust, wifi, security, home-lab): one concept each (pages get \
+    several tags rather than one compound tag), the common name, a singular noun, never a synonym \
+    of a listed tag, and never about format or quality (article, tutorial, useful).";
+
+/// The tagging instructions, the list (if any), and with proposing, the names already proposed.
+fn tag_prompt(list: &[TagOption], p: &Proposing) -> String {
+    let n = p.max;
+    let new_format = "\"new_tags\": [{\"name\": \"...\", \"description\": \"...\"}]";
+    let mut s = if n == 0 {
+        TAG_PROMPT.to_string()
+    } else if list.is_empty() {
+        format!(
+            "You tag bookmarked web pages. There is no tag list yet: propose up to {n} tags that \
+             fit the page in \"new_tags\", usually one to three, each with a one-line description \
+             of what belongs under it. {NEW_TAG_STYLE} Reply with JSON only: {{{new_format}}}."
+        )
+    } else {
+        format!(
+            "You tag bookmarked web pages with tags from a fixed list. Choose the tags that \
+             clearly fit the page: usually one to three, and none if nothing fits well. Use only \
+             names from the list below, exactly as written, in \"tags\". If a main topic of the \
+             page has no tag on the list, propose up to {n} new tags for the list in \
+             \"new_tags\", each with a one-line description of what belongs under it; otherwise \
+             leave \"new_tags\" empty. {NEW_TAG_STYLE} Reply with JSON only: \
+             {{\"tags\": [...], {new_format}}}."
+        )
+    };
+    if !list.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(&tag_list(list));
+    }
+    if n > 0 && !p.known.is_empty() {
+        s.push_str(
+            "\n\nNames already proposed for other pages; propose one of these rather than a \
+             synonym when it fits: ",
+        );
+        s.push_str(&p.known.join(", "));
+    }
+    s
+}
+
+/// The new_tags array: names with descriptions. Its length isn't constrained in the schema (not
+/// every structured-output implementation supports `maxItems`); extra names are dropped.
+fn new_tags_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+            },
+            "required": ["name", "description"],
+            "additionalProperties": false,
+        },
+    })
+}
+
+/// New names from a reply. A missing `new_tags` means none (a model in JSON mode may leave it
+/// out); entries without a name string are skipped.
+fn new_tags_of(v: &Value) -> Result<Vec<NewTag>, String> {
+    let Some(arr) = v.get("new_tags") else {
+        return Ok(Vec::new());
+    };
+    let arr = arr.as_array().ok_or("\"new_tags\" is not an array")?;
+    Ok(arr
+        .iter()
+        .filter_map(|t| {
+            // A bare string is a name without a description.
+            let (name, description) = match t {
+                Value::String(s) => (s.as_str(), None),
+                _ => (
+                    t.get("name")?.as_str()?,
+                    t.get("description").and_then(Value::as_str),
+                ),
+            };
+            Some(NewTag {
+                name: name.to_string(),
+                description: description.map(str::to_string),
+            })
+        })
+        .collect())
+}
 
 /// The canonical list for the prompt: `- name: description (also: aliases)`.
 fn tag_list(list: &[TagOption]) -> String {

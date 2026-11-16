@@ -10,7 +10,7 @@ use shlv::choose::Item;
 use shlv::config::Config;
 use shlv::extract::extract;
 use shlv::fetch::Fetcher;
-use shlv::{Bookmark, ListQuery, Store};
+use shlv::{Bookmark, ListQuery, ProposalSource, ProposalState, Store};
 
 use crate::{Style, get, plural};
 
@@ -258,9 +258,33 @@ pub struct LlmArgs {
     pub batch: bool,
 }
 
-/// The `[ai] tag` provider, if one is configured.
-pub fn tag_provider(config: &Config) -> Result<Option<Provider>> {
-    ai::for_task(config.ai.as_ref(), &config.provider, Task::Tag)
+/// The `[ai] tag` provider, if one is configured, set to propose new names as `[ai] proposals`
+/// says (see [`proposing`]).
+pub fn tag_provider(config: &Config, store: &Store) -> Result<Option<Provider>> {
+    let Some(mut p) = ai::for_task(config.ai.as_ref(), &config.provider, Task::Tag)? else {
+        return Ok(None);
+    };
+    p.set_proposing(proposing(config, store)?);
+    Ok(Some(p))
+}
+
+/// How many new names the `tag` provider may propose per bookmark (`[ai] proposals`), and the
+/// names already waiting, most proposed first, for it to reuse.
+pub fn proposing(config: &Config, store: &Store) -> Result<ai::Proposing> {
+    let max = config
+        .ai
+        .as_ref()
+        .map_or(ai::DEFAULT_PROPOSALS, |a| a.proposals());
+    if max == 0 {
+        return Ok(ai::Proposing::default());
+    }
+    let known = store
+        .proposals(ProposalState::Pending)?
+        .into_iter()
+        .take(ai::MAX_KNOWN)
+        .map(|p| p.name)
+        .collect();
+    Ok(ai::Proposing { max, known })
 }
 
 /// Whether one request can return both a summary and tags: the same provider does both tasks.
@@ -275,14 +299,24 @@ fn same_provider(config: &Config) -> bool {
     }
 }
 
-struct Tagged {
-    tags: Vec<shlv::choose::Choice>,
-    /// Set when the same request also summarized the page.
-    summary: Option<String>,
+/// Offers an answer's list tags for a bookmark and records its new names as proposals. Returns
+/// the suggestion stats (including names that turned out to be list tags) and the names newly
+/// proposed for the bookmark.
+fn record(
+    store: &mut Store,
+    bookmark: i64,
+    a: &ai::Answer,
+) -> Result<(shlv::OfferStats, Vec<String>)> {
+    let mut st = store.offer_choices(bookmark, shlv::Source::Llm, &a.tags)?;
+    let p = store.propose_tags(bookmark, ProposalSource::Llm, &a.proposed)?;
+    st.pending += p.suggested.pending;
+    st.applied += p.suggested.applied;
+    Ok((st, p.proposed))
 }
 
 /// The LLM layer of `suggest`: asks the `[ai] tag` provider to choose from the canonical list,
-/// and offers its choices like the other layers (source `llm`, no confidence).
+/// and offers its choices like the other layers (source `llm`, no confidence). New names it
+/// proposes become proposals for the list; with an empty list, that is all it does.
 #[allow(clippy::too_many_arguments)]
 pub fn run_suggest_llm(
     store: &mut Store,
@@ -302,10 +336,11 @@ pub fn run_suggest_llm(
         .iter()
         .map(TagOption::from)
         .collect();
-    if list.is_empty() {
+    if list.is_empty() && !provider.proposes() {
         bail!(
-            "the [ai] tag provider chooses from the canonical tag list, which is empty; declare \
-             tags in [tags.canonical] or mark some with `shlv tag canonical add`"
+            "the [ai] tag provider chooses from the canonical tag list, which is empty, and \
+             [ai] proposals = 0 turns proposing new tags off; declare tags in [tags.canonical], \
+             mark some with `shlv tag canonical add`, or allow proposals"
         );
     }
     // Explicit ids are always sent; --max-tags narrows --all.
@@ -326,7 +361,8 @@ pub fn run_suggest_llm(
             .filter(|t| !excluded.contains(&t.name))
             .cloned()
             .collect();
-        if !options.is_empty() {
+        // With nothing left to choose, it can still propose.
+        if !options.is_empty() || provider.proposes() {
             work.push((b, options));
         }
     }
@@ -389,46 +425,41 @@ pub fn run_suggest_llm(
     }
     let fetcher = Fetcher::default();
     let mut progress = Progress::new("suggesting", work.len());
-    let (mut pending, mut applied, mut summarized) = (0, 0, 0);
+    let (mut pending, mut applied, mut proposed, mut summarized) = (0, 0, 0, 0);
     let mut failed: Vec<(i64, String, String)> = Vec::new();
     let mode = store.suggest_mode();
     bulk::run(
         &work,
         args.jobs.into(),
-        |(b, options)| -> Result<Tagged> {
+        |(b, options)| -> Result<ai::Answer> {
             let mut item = Item::from_bookmark(b);
             if item.summary.is_none() {
                 // Without a summary, the page text; if that fails, what's left still helps.
                 item.text = page_text(&fetcher, &b.url).ok().flatten();
                 if combined && item.text.is_some() {
-                    let (summary, tags) = provider.summarize_and_tag(&item, options)?;
-                    return Ok(Tagged {
-                        tags,
-                        summary: Some(summary),
-                    });
+                    return provider.summarize_and_tag(&item, options);
                 }
             }
-            Ok(Tagged {
-                tags: provider.choose_tags(&item, options)?,
-                summary: None,
-            })
+            provider.tag(&item, options)
         },
         |i, r| -> Result<()> {
             let b = &work[i].0;
             progress.clear();
             match r {
-                Ok(t) => {
-                    if let Some(s) = &t.summary
+                Ok(a) => {
+                    if let Some(s) = &a.summary
                         && store.set_summary(b.id, Some(s))?
                     {
                         summarized += 1;
                     }
-                    let st = store.offer_choices(b.id, Source::Llm, &t.tags)?;
+                    let (st, new) = record(store, b.id, &a)?;
                     pending += st.pending;
                     applied += st.applied;
+                    proposed += new.len();
                     if all {
-                        let names: Vec<&str> = t.tags.iter().map(|c| c.tag.as_str()).collect();
-                        writeln!(out, "{}  {}", b.id, names.join(" "))?;
+                        let mut line: Vec<String> = a.tags.iter().map(|c| c.tag.clone()).collect();
+                        line.extend(a.proposed.iter().map(|t| format!("+{}", t.name)));
+                        writeln!(out, "{}  {}", b.id, line.join(" "))?;
                         out.flush()?;
                     }
                 }
@@ -442,10 +473,13 @@ pub fn run_suggest_llm(
     for (id, url, e) in &failed {
         eprintln!("shlv: {id}: failed: {url}: {e}");
     }
-    let what = match mode {
+    let mut what = match mode {
         shlv::SuggestMode::Confirm => plural(pending, "new suggestion"),
         shlv::SuggestMode::Auto => format!("{} applied", plural(applied, "tag")),
     };
+    if proposed > 0 {
+        what.push_str(&format!(", {}", plural(proposed, "new proposal")));
+    }
     let also = if summarized > 0 {
         format!(
             ", {} summarized in the same request",
@@ -583,7 +617,6 @@ pub fn run_batch(
     cmd: BatchCmd,
     out: &mut impl Write,
 ) -> Result<ExitCode> {
-    use shlv::Source;
     use shlv::choose::TagOption;
 
     let pending = store.pending_batches()?;
@@ -606,7 +639,12 @@ pub fn run_batch(
             code = ExitCode::FAILURE;
             continue;
         };
-        let provider = Provider::new(&pb.provider, pc.get_ref())?;
+        let mut provider = Provider::new(&pb.provider, pc.get_ref())?;
+        // New names in the results are kept up to the current `[ai] proposals`.
+        provider.set_proposing(ai::Proposing {
+            known: Vec::new(),
+            ..proposing(config, store)?
+        });
         let st = provider.batch_status(&pb.id)?;
         let counts = format!(
             "{} processing, {} succeeded, {} errored, {} expired, {} canceled",
@@ -634,7 +672,7 @@ pub fn run_batch(
             },
             &list,
         )?;
-        let (mut summaries, mut suggested, mut failed) = (0, 0, Vec::new());
+        let (mut summaries, mut suggested, mut proposed, mut failed) = (0, 0, 0, Vec::new());
         for (cid, r) in results {
             let Some((id, _, tags)) = shlv::batch::parse_custom_id(&cid) else {
                 failed.push((cid, "unknown custom_id".to_string()));
@@ -648,8 +686,9 @@ pub fn run_batch(
                         summaries += 1;
                     }
                     if tags && store.get(id)?.is_some() {
-                        let st = store.offer_choices(id, Source::Llm, &a.tags)?;
+                        let (st, new) = record(store, id, &a)?;
                         suggested += st.pending + st.applied;
+                        proposed += new.len();
                     }
                 }
                 Err(e) => failed.push((format!("bookmark {id}"), e)),
@@ -658,9 +697,14 @@ pub fn run_batch(
         for (what, e) in &failed {
             eprintln!("shlv: batch {}: {what}: {e}", pb.id);
         }
+        let proposed = if proposed > 0 {
+            format!(", {}", plural(proposed, "new proposal"))
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "collected batch {}: {} summaries, {} tag suggestions, {} failed",
+            "collected batch {}: {} summaries, {} tag suggestions{proposed}, {} failed",
             pb.id,
             summaries,
             suggested,

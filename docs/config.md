@@ -5,7 +5,8 @@ An optional config file lives at `$SHLV_CONFIG`, else `$XDG_CONFIG_HOME/shlv/con
 errors.
 
 ```toml
-# Reject tags in add and edit that aren't canonical or an alias of a canonical tag.
+# Reject tags in add, edit, and import that aren't canonical or an alias of a canonical tag
+# (true), or keep them as proposals for the list instead ("propose").
 strict_tags = true
 
 # Pin a base for the canonical list: each tag with its aliases, or a table that adds a one-line
@@ -54,3 +55,35 @@ suggestion isn't offered again for that bookmark, and neither is a rule's tag th
 and tags must be normalized, like declared names (`github.com`, not `GitHub.com` or a URL). Opt-in
 tagging layers, the [classifier](classifier.md) and the [`[ai] tag` provider](ai.md), add their
 suggestions to the same list.
+
+## Proposals
+
+A tag outside the canonical list can be a _proposal_ for the list: a name with an optional
+description and the bookmarks it was proposed for, collected across runs. It never lands on a
+bookmark until you decide. Proposals come from:
+
+- the [`[ai] tag` provider](ai.md#proposals), which proposes names for topics the list doesn't cover
+  (and, with an empty list, only proposes);
+- tags you type in `add` or `edit` with `strict_tags = "propose"`: the bookmark gets its canonical
+  tags, and the others become proposals for it (instead of an error, as with `strict_tags = true`);
+- `import --propose-unknown-tags`, which keeps the tags `--drop-unknown-tags` would drop as
+  proposals for their bookmarks (`import` does this anyway with `strict_tags = "propose"`).
+
+Names are normalized first. A name that is a canonical tag or an alias of one isn't proposed: from
+the provider it becomes a suggestion of that tag. A name that is an alias of a tag off the list is
+proposed as that tag.
+
+`tag proposals` (or `tag proposals ls`) lists them, those on the most bookmarks first, with their
+descriptions and who proposed them first (`llm`, `user`, or `import`); `--json` prints one object
+per line, with the bookmark ids. Each decision is one command:
+
+- `tag proposals accept NAME...` adds the names to the canonical list, with their descriptions
+  (unless the tag already has one), and tags the bookmarks they were proposed for. With a declared
+  list, accepted tags go on the list in the database, like `tag canonical add`.
+- `tag proposals alias NAME TAG` makes NAME an alias of TAG and tags NAME's bookmarks with TAG. If
+  NAME is also a tag off the list, it is merged into TAG, as `tag merge` would.
+- `tag proposals reject NAME...` remembers the names: they are never proposed again, from any source
+  (a typed one is dropped with a note). A name can be rejected before anyone proposes it.
+  `tag proposals ls --rejected` lists them; accepting a rejected name undoes the rejection.
+
+Removing a proposed name from a bookmark with `edit -t -NAME` withdraws it for that bookmark.

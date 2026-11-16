@@ -42,6 +42,12 @@ fn result(req: &Value) -> Value {
         }
         if id.ends_with('t') {
             out.insert("tags".into(), json!(["rust"]));
+            if user.contains("PROPOSE") {
+                out.insert(
+                    "new_tags".into(),
+                    json!([{"name": "Tokio", "description": "the Tokio runtime"}]),
+                );
+            }
         }
         json!({"type": "succeeded", "message": message(&Value::Object(out).to_string())})
     };
@@ -219,7 +225,7 @@ fn summaries_by_batch() {
 #[test]
 fn tag_suggestions_by_batch() {
     let f = Fixture::new();
-    f.ok(&["add", &f.server.url("/p/a")]);
+    f.ok(&["add", &f.server.url("/p/a"), "--note", "PROPOSE"]);
     f.ok(&["add", &f.server.url("/p/b"), "-t", "python"]);
     let out = f.ok(&["suggest", "1", "2", "--batch"]);
     assert!(
@@ -229,16 +235,23 @@ fn tag_suggestions_by_batch() {
     let reqs = f.api.lock().unwrap().batches[0].clone();
     // Same provider for both tasks and no summary yet: one request asks for both.
     assert_eq!(reqs[0]["custom_id"], "b1-st");
+    // New names are asked for alongside list tags.
+    let schema = &reqs[0]["params"]["output_config"]["format"]["schema"];
+    assert!(schema["properties"]["new_tags"].is_object(), "{schema}");
     let (code, out, _) = f.run(&["batch", "collect"]);
     assert_eq!(code, 0);
     assert!(out.contains("in progress"), "{out}");
     let out = f.ok(&["batch", "collect"]);
     assert_eq!(
         out,
-        "collected batch msgbatch_1: 2 summaries, 2 tag suggestions, 0 failed\n"
+        "collected batch msgbatch_1: 2 summaries, 2 tag suggestions, 1 new proposal, 0 failed\n"
     );
     let pending = f.ok(&["suggest", "ls"]);
     assert!(pending.contains("#rust (llm)"), "{pending}");
+    assert_eq!(
+        f.ok(&["tag", "proposals"]),
+        "1  tokio  # the Tokio runtime  (llm)\n"
+    );
 }
 
 #[test]

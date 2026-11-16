@@ -8,8 +8,9 @@ use shlv::config::{self, Config};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, format_canonical_nix, format_canonical_toml, parse_canonical};
 use shlv::{
-    Bookmark, Edit, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalRuleTags,
-    NonCanonicalTags, Pinned, RuleStats, Store, SuggestMode, Suggestion, TagInfo, TagSort,
+    Bookmark, Diverted, Edit, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalRuleTags,
+    NonCanonicalTags, Pinned, Proposal, ProposalState, RuleStats, Store, SuggestMode, Suggestion,
+    TagInfo, TagSort,
 };
 use shlv::{netscape, transfer};
 
@@ -133,12 +134,16 @@ enum Cmd {
         /// Drop tags that aren't canonical instead of failing (strict_tags)
         #[arg(long)]
         drop_unknown_tags: bool,
+        /// Keep tags that aren't canonical as proposals for the list instead of tags (always on
+        /// with strict_tags = "propose"); review them with `shlv tag proposals`
+        #[arg(long, conflicts_with = "drop_unknown_tags")]
+        propose_unknown_tags: bool,
         /// Don't run the domain rules ([tags.rules]) on the imported bookmarks
         #[arg(long)]
         no_rules: bool,
         /// Keep only URLs, add dates, and titles: no tags, notes, or summaries (for moving from
         /// another app and tagging afresh)
-        #[arg(long, conflicts_with_all = ["folders_as_tags", "drop_unknown_tags"])]
+        #[arg(long, conflicts_with_all = ["folders_as_tags", "drop_unknown_tags", "propose_unknown_tags"])]
         urls_only: bool,
         /// With --urls-only, drop titles too (`shlv fetch --all` gets them again)
         #[arg(long, requires = "urls_only")]
@@ -275,6 +280,36 @@ enum TagCmd {
         #[command(subcommand)]
         cmd: CanonicalCmd,
     },
+    /// Review names proposed for the canonical list: list (the default), accept, alias, reject
+    Proposals {
+        #[command(subcommand)]
+        cmd: Option<ProposalCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProposalCmd {
+    /// List proposals, those on the most bookmarks first
+    Ls {
+        /// One JSON object per line
+        #[arg(long)]
+        json: bool,
+        /// List rejected names instead
+        #[arg(long)]
+        rejected: bool,
+    },
+    /// Add proposed names to the list (with their descriptions) and tag their bookmarks
+    Accept {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Make NAME an alias of TAG and tag NAME's bookmarks with TAG
+    Alias { name: String, tag: String },
+    /// Reject names: they aren't proposed again, from any source
+    Reject {
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -402,6 +437,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let verb = if added.created { "added" } else { "updated" };
             write!(out, "{verb} ")?;
             print_line(&mut out, &b, 0, &style)?;
+            print_diverted(&mut out, &added.diverted, &style)?;
             // The classifier runs on new bookmarks too: offline and fast, with the stored model
             // (`suggest` retrains it; `add` doesn't wait for that).
             #[cfg(feature = "model")]
@@ -480,13 +516,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
             {
                 bail!("nothing to change; pass --title, --note, or -t");
             }
-            let edited = store.edit(id, &edit)?;
-            if !edited {
+            let Some(diverted) = store.edit_diverting(id, &edit)? else {
                 bail!("no bookmark with id {id}");
-            }
+            };
             let b = get(&store, id)?;
             write!(out, "updated ")?;
             print_line(&mut out, &b, 0, &style)?;
+            print_diverted(&mut out, &diverted, &style)?;
         }
         Cmd::Rm { targets } => {
             let mut failed = false;
@@ -515,6 +551,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             format,
             folders_as_tags,
             drop_unknown_tags,
+            propose_unknown_tags,
             no_rules,
             urls_only,
             no_titles,
@@ -536,14 +573,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let opts = ImportOptions {
                 drop_non_canonical: drop_unknown_tags,
                 skip_rules: no_rules,
+                propose_unknown: propose_unknown_tags,
             };
             let s = store.import(&items, opts).map_err(|e| {
                 match e.downcast_ref::<NonCanonicalTags>() {
                     Some(bad) => anyhow!(
                         "nothing imported: {name} has tags that aren't canonical \
                          (strict_tags is on): {}\n\
-                         hint: pass --drop-unknown-tags to import without them, or make them \
-                         canonical (`shlv tag canonical add`)",
+                         hint: pass --drop-unknown-tags to import without them, \
+                         --propose-unknown-tags to keep them as proposals for the list, or make \
+                         them canonical (`shlv tag canonical add`)",
                         bad.0.join(" ")
                     ),
                     _ if let Some(bad) = e.downcast_ref::<NonCanonicalRuleTags>() => anyhow!(
@@ -559,6 +598,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if !s.dropped_tags.is_empty() {
                 eprintln!("shlv: dropped tags: {}", s.dropped_tags.join(" "));
+            }
+            if !s.proposed.is_empty() {
+                eprintln!(
+                    "shlv: kept {} as proposals (not canonical): {}\n\
+                     hint: review them with `shlv tag proposals`",
+                    plural(s.proposed.len(), "tag"),
+                    s.proposed.join(" ")
+                );
             }
             writeln!(
                 out,
@@ -599,7 +646,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             #[cfg(feature = "ai")]
             let provider = match config.model.provider {
                 config::ProviderUse::Never if model_on => None,
-                _ => ai_cmd::tag_provider(&config)?,
+                _ => ai_cmd::tag_provider(&config, &store)?,
             };
             #[cfg(not(feature = "ai"))]
             let provider: Option<()> = None;
@@ -656,10 +703,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             #[cfg(not(feature = "ai"))]
             let (code, _) = (ExitCode::SUCCESS, sure);
-            if store.suggest_mode() == SuggestMode::Confirm && !all {
+            if !all {
                 let width = id_width(&store)?;
                 for id in ids {
-                    print_pending(&mut out, &store.pending(Some(id))?, width, &style)?;
+                    if store.suggest_mode() == SuggestMode::Confirm {
+                        print_pending(&mut out, &store.pending(Some(id))?, width, &style)?;
+                    }
+                    let proposed = store.proposals_for(id)?;
+                    if !proposed.is_empty() {
+                        write!(out, "{}{id:>width$}{}  proposed", style.id, style.reset)?;
+                        for p in &proposed {
+                            write!(out, "  {}#{p}{}", style.tag, style.reset)?;
+                        }
+                        writeln!(out, "  (shlv tag proposals)")?;
+                    }
                 }
             }
             out.flush()?;
@@ -1103,6 +1160,123 @@ fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) 
                 out.write_all(text.as_bytes())?
             }
         },
+        TagCmd::Proposals { cmd } => run_proposals(
+            store,
+            cmd.unwrap_or(ProposalCmd::Ls {
+                json: false,
+                rejected: false,
+            }),
+            out,
+            style,
+        )?,
+    }
+    Ok(())
+}
+
+fn run_proposals(
+    store: &mut Store,
+    cmd: ProposalCmd,
+    out: &mut impl Write,
+    style: &Style,
+) -> Result<()> {
+    match cmd {
+        ProposalCmd::Ls { json, rejected } => {
+            let state = if rejected {
+                ProposalState::Rejected
+            } else {
+                ProposalState::Pending
+            };
+            let list = store.proposals(state)?;
+            let width = list.iter().map(|p| p.bookmarks.len()).max().unwrap_or(0);
+            let width = width.to_string().len();
+            for p in &list {
+                if json {
+                    serde_json::to_writer(&mut *out, p).map_err(io::Error::from)?;
+                    writeln!(out)?;
+                } else {
+                    print_proposal(out, p, width, style)?;
+                }
+            }
+        }
+        ProposalCmd::Accept { names } => {
+            for name in &names {
+                let d = store.accept_proposal(name)?;
+                let described = if d.described { ", described" } else { "" };
+                writeln!(
+                    out,
+                    "accepted {}: canonical{described}, tagged {}",
+                    d.tag,
+                    plural(d.tagged, "bookmark")
+                )?;
+            }
+        }
+        ProposalCmd::Alias { name, tag } => {
+            let d = store.alias_proposal(&name, &tag)?;
+            writeln!(
+                out,
+                "aliased {} to {}: tagged {}",
+                normalize_tag(&name),
+                d.tag,
+                plural(d.tagged, "bookmark")
+            )?;
+        }
+        ProposalCmd::Reject { names } => {
+            for name in &names {
+                let n = store.reject_proposal(name)?;
+                let was = if n > 0 {
+                    format!(" (it was proposed for {})", plural(n, "bookmark"))
+                } else {
+                    String::new()
+                };
+                writeln!(
+                    out,
+                    "rejected {}{was}; it won't be proposed again",
+                    normalize_tag(name)
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One proposal: bookmark count, name, description, source.
+fn print_proposal(out: &mut impl Write, p: &Proposal, width: usize, s: &Style) -> io::Result<()> {
+    write!(
+        out,
+        "{}{:>width$}{}  {}{}{}",
+        s.dim,
+        p.bookmarks.len(),
+        s.reset,
+        s.tag,
+        p.name,
+        s.reset
+    )?;
+    if let Some(d) = &p.description {
+        write!(out, "  {}# {d}{}", s.dim, s.reset)?;
+    }
+    writeln!(out, "  {}({}){}", s.dim, p.source.as_str(), s.reset)
+}
+
+/// Says which typed tags became proposals (`strict_tags = "propose"`) or were dropped as
+/// rejected names.
+fn print_diverted(out: &mut impl Write, d: &Diverted, s: &Style) -> io::Result<()> {
+    if !d.proposed.is_empty() {
+        write!(out, "proposed")?;
+        for t in &d.proposed {
+            write!(out, "  {}#{t}{}", s.tag, s.reset)?;
+        }
+        writeln!(
+            out,
+            "  (not canonical; `shlv tag proposals accept {}` adds them)",
+            d.proposed.join(" ")
+        )?;
+    }
+    if !d.rejected.is_empty() {
+        out.flush()?;
+        eprintln!(
+            "shlv: dropped {}: rejected as proposals (`shlv tag proposals ls --rejected`)",
+            d.rejected.join(" ")
+        );
     }
     Ok(())
 }

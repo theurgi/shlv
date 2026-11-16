@@ -525,7 +525,7 @@ impl std::fmt::Display for Pinned {
 
 impl std::error::Error for Pinned {}
 
-fn pinned(what: String) -> anyhow::Error {
+pub(crate) fn pinned(what: String) -> anyhow::Error {
     Pinned(what).into()
 }
 
@@ -893,7 +893,13 @@ impl Store {
 /// Moves every bookmark from live tag `from_id` (named `from`) to live tag `into_id`, tombstones
 /// `from`, leaves `from` as an alias of `into`, and moves `from`'s aliases over. `into` becomes
 /// canonical if `from` was. Returns how many bookmarks were retagged.
-fn merge_into(tx: &Transaction, from_id: i64, from: &str, into_id: i64, now: i64) -> Result<usize> {
+pub(crate) fn merge_into(
+    tx: &Transaction,
+    from_id: i64,
+    from: &str,
+    into_id: i64,
+    now: i64,
+) -> Result<usize> {
     let bookmarks = tagged(tx, from_id)?;
     // Bookmarks that already have `into` keep that row (and its source); the rest move.
     tx.execute(
@@ -934,7 +940,7 @@ fn merge_into(tx: &Transaction, from_id: i64, from: &str, into_id: i64, now: i64
 /// declared list syncs it even if the list itself is unchanged (say, after the list was removed
 /// from config, a declared tag unmarked, and the same list declared again). With a pinned list,
 /// edits that would undo it are refused, so the stored hash stays valid.
-fn forget_declared(tx: &Transaction, forget: bool) -> Result<()> {
+pub(crate) fn forget_declared(tx: &Transaction, forget: bool) -> Result<()> {
     if forget {
         meta_delete(tx, DECLARED_HASH)?;
     }
@@ -942,7 +948,7 @@ fn forget_declared(tx: &Transaction, forget: bool) -> Result<()> {
 }
 
 /// Normalizes a single tag name, rejecting empty ones.
-fn tag_name(name: &str) -> Result<String> {
+pub(crate) fn tag_name(name: &str) -> Result<String> {
     let n = normalize_tag(name);
     if n.is_empty() {
         bail!("empty tag name");
@@ -951,7 +957,7 @@ fn tag_name(name: &str) -> Result<String> {
 }
 
 /// A live tag's id by exact name; aliases aren't followed.
-fn live_tag(conn: &Connection, name: &str) -> Result<Option<i64>> {
+pub(crate) fn live_tag(conn: &Connection, name: &str) -> Result<Option<i64>> {
     Ok(conn
         .prepare_cached("SELECT id FROM tag WHERE name = ?1 AND deleted_at IS NULL")?
         .query_row([name], |r| r.get(0))
@@ -959,7 +965,7 @@ fn live_tag(conn: &Connection, name: &str) -> Result<Option<i64>> {
 }
 
 /// The tag an alias points at: (id, name).
-fn alias_target(conn: &Connection, alias: &str) -> Result<Option<(i64, String)>> {
+pub(crate) fn alias_target(conn: &Connection, alias: &str) -> Result<Option<(i64, String)>> {
     Ok(conn
         .prepare_cached(
             "SELECT t.id, t.name FROM tag_alias a JOIN tag t ON t.id = a.tag_id WHERE a.alias = ?1",
@@ -992,7 +998,13 @@ fn mark_canonical(tx: &Transaction, name: &str, now: i64) -> Result<bool> {
 }
 
 /// Points `alias` at the live tag `tag_id` (named `tag`). Returns false if it already did.
-fn add_alias(tx: &Transaction, alias: &str, tag_id: i64, tag: &str, now: i64) -> Result<bool> {
+pub(crate) fn add_alias(
+    tx: &Transaction,
+    alias: &str,
+    tag_id: i64,
+    tag: &str,
+    now: i64,
+) -> Result<bool> {
     if alias == tag {
         bail!("{alias:?} can't be an alias of itself");
     }
@@ -1042,7 +1054,12 @@ fn free_name(tx: &Transaction, name: &str) -> Result<()> {
 }
 
 /// Sets a tag's description; returns whether it changed.
-fn set_description(tx: &Transaction, id: i64, text: Option<&str>, now: i64) -> Result<bool> {
+pub(crate) fn set_description(
+    tx: &Transaction,
+    id: i64,
+    text: Option<&str>,
+    now: i64,
+) -> Result<bool> {
     let n = tx.execute(
         "UPDATE tag SET description = ?2, updated_at = ?3 WHERE id = ?1 \
          AND description IS NOT ?2",

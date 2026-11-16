@@ -3,10 +3,11 @@
 `import` detects the format and treats URLs already saved the way `add` does: it updates the
 bookmark and merges tags. It keeps creation times, titles, tags, and notes, and skips `javascript:`
 and `place:` URLs. Browser folders become tags only with `--folders-as-tags`. With `strict_tags`, an
-import with non-canonical tags writes nothing unless you pass `--drop-unknown-tags`. `export` then
-`import` (JSON) reproduces a database, uids included. Domain rules run on imported bookmarks as they
-do on `add`; `--no-rules` skips them. A title that is only the bookmark's URL is dropped, so
-`shlv fetch --all` can find a real one.
+import with non-canonical tags writes nothing unless you pass `--drop-unknown-tags`, or
+`--propose-unknown-tags` to keep them as [proposals](config.md#proposals) for the list (always the
+case with `strict_tags = "propose"`). `export` then `import` (JSON) reproduces a database, uids
+included. Domain rules run on imported bookmarks as they do on `add`; `--no-rules` skips them. A
+title that is only the bookmark's URL is dropped, so `shlv fetch --all` can find a real one.
 
 To move from another app and tag afresh, `import --urls-only` keeps each bookmark's URL, add date,
 and title, and drops its tags, notes, and summaries (`--no-titles` drops titles too). Titles stay by

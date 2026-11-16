@@ -57,6 +57,14 @@ pub struct Choice {
     pub confidence: Option<f64>,
 }
 
+/// A tag name a layer proposes for the list (see [`crate::proposal`]), with what belongs under it.
+/// It never lands on a bookmark directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct NewTag {
+    pub name: String,
+    pub description: Option<String>,
+}
+
 /// A tagging layer that chooses from the canonical list.
 pub trait ChooseTags {
     /// Tags from `list` that fit `item`, most likely first. Implementations must only return

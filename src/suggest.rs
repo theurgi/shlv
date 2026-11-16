@@ -449,14 +449,15 @@ impl Store {
     }
 
     /// Whether `source` has suggested anything for `bookmark` before: a suggestion pending or
-    /// rejected, or a tag it suggested that was accepted.
+    /// rejected, a tag it suggested that was accepted, or (for `llm`) a name it proposed.
     pub fn suggested_by(&self, bookmark: i64, source: Source) -> Result<bool> {
         Ok(self
             .conn
             .prepare_cached(
                 "SELECT EXISTS (SELECT 1 FROM tag_suggestion WHERE bookmark_id = ?1 \
                  AND source = ?2) OR EXISTS (SELECT 1 FROM bookmark_tag WHERE bookmark_id = ?1 \
-                 AND source = ?2)",
+                 AND source = ?2) OR EXISTS (SELECT 1 FROM tag_proposal_bookmark \
+                 WHERE bookmark_id = ?1 AND source = ?2)",
             )?
             .query_row(params![bookmark, source.as_str()], |r| r.get(0))?)
     }

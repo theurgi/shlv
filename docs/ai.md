@@ -35,9 +35,10 @@ price for that prefix once. 429 and 529 responses are retried (honoring `retry-a
 
 **What is sent.** For each bookmark, a request to the provider's `base_url` with the bookmark's URL,
 title, note, and summary (when it has them), the page's extracted main text (up to 3000 words) when
-the task fetches the page, and for tagging the canonical tag list with aliases and descriptions.
-Nothing else from the database, and nothing at all unless `[ai]` names a provider. The API key is
-read from the named environment variable only when a request is made.
+the task fetches the page, and for tagging the canonical tag list with aliases and descriptions, and
+the names already proposed for it. Nothing else from the database, and nothing at all unless `[ai]`
+names a provider. The API key is read from the named environment variable only when a request is
+made.
 
 `shlv summarize ID...` (or `--all` for every bookmark without a summary; `--force` redoes them)
 fetches each page, extracts its main text, and stores the provider's two- or three-sentence summary,
@@ -56,12 +57,37 @@ the provider hasn't tagged before (`--force` sends them again), with the same `-
 failure reporting as `summarize`. When `[ai] summarize` and `[ai] tag` name the same provider, a
 bookmark without a summary gets both from one request.
 
+### Proposals
+
+The `tag` provider can also propose names that aren't on the list, with a one-line description each,
+when a page has a main topic the list doesn't cover. They become [proposals](config.md#proposals)
+for the list, never tags on the bookmark: review them with `shlv tag proposals`. Up to three per
+bookmark by default:
+
+```toml
+[ai]
+tag = "local"
+proposals = 3 # new names per bookmark; 0 turns proposals off
+```
+
+The prompt asks for short, general, one-concept names and lists the names already proposed (up to
+100, most proposed first), so the model reuses them rather than inventing synonyms. Replies are
+normalized: a name on the list (or an alias of one) becomes a suggestion of that tag, a rejected
+name is dropped, and names past the cap are ignored. `suggest` prints the proposals for the
+bookmarks it was given; `suggest --all` marks them with `+` on each bookmark's line.
+
+With an empty list, the provider only proposes, so `suggest` works from the first bookmark: let
+proposals pile up, then accept the most proposed names to start the list. With `proposals = 0` and
+an empty list, `suggest` has nothing to ask the provider and says so. The classifier never proposes;
+it only chooses from the list.
+
 With an `anthropic` provider, `summarize --batch` and `suggest --batch` submit one Message Batch
 instead of live requests: half the price, with results within 24 hours. Pages are fetched when
 submitting. `shlv batch status` shows submitted batches, and `shlv batch collect` applies the
 results of ended ones (from any later run, since pending batches are recorded in the database).
 Failed or expired items are reported; rerunning the command without `--batch` retries them live.
 
-Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped, and
-empty or overlong summaries are rejected. If a server doesn't support JSON-schema output, shlv falls
-back to JSON mode with the schema in the prompt.
+Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped (new
+names go to proposals only when asked for), and empty or overlong summaries are rejected. If a
+server doesn't support JSON-schema output, shlv falls back to JSON mode with the schema in the
+prompt.

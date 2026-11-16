@@ -15,6 +15,7 @@ pub mod html;
 #[cfg(feature = "model")]
 pub mod model;
 pub mod netscape;
+pub mod proposal;
 pub mod search;
 pub mod store;
 pub mod suggest;
@@ -23,6 +24,9 @@ pub mod transfer;
 pub mod url;
 
 pub use config::Config;
+pub use proposal::{
+    Decided, Diverted, Proposal, ProposalSource, ProposalState, ProposeStats, StrictTags,
+};
 pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
 pub use suggest::{
     DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source, SuggestMode, Suggestion,

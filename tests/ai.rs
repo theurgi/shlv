@@ -126,8 +126,9 @@ fn summarizes() {
         p.summarize(&item()).unwrap(),
         "The Tokio tutorial. Async Rust."
     );
-    let (summary, tags) = p.summarize_and_tag(&item(), &list()).unwrap();
-    assert_eq!((summary.as_str(), names(&tags)), ("Both.", vec!["python"]));
+    let a = p.summarize_and_tag(&item(), &list()).unwrap();
+    assert_eq!(a.summary.as_deref(), Some("Both."));
+    assert_eq!(names(&a.tags), ["python"]);
     let both = s.requests()[1].json();
     let props = &both["response_format"]["json_schema"]["schema"]["properties"];
     assert!(props["summary"].is_object() && props["tags"].is_object());
@@ -388,4 +389,82 @@ fn api_keys_from_a_file() {
         "{e}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn proposes_new_names_alongside_list_tags() {
+    use shlv::ai::Proposing;
+    let s = scripted(vec![
+        chat(
+            r#"{"tags": ["rust"], "new_tags": [
+                {"name": "Tokio", "description": " the Tokio\n runtime "},
+                {"name": "py", "description": "an alias: a list tag after all"},
+                "runtime",
+                {"name": "x", "description": "over the cap"},
+                {"description": "no name"}]}"#,
+        ),
+        // JSON mode may leave new_tags out: none.
+        chat(r#"{"tags": ["async"]}"#),
+        // Not an array: invalid, retried.
+        chat(r#"{"tags": [], "new_tags": "tokio"}"#),
+        chat(r#"{"tags": [], "new_tags": []}"#),
+        // Only new names (a request sent while the list was empty): fine.
+        chat(r#"{"new_tags": [{"name": "tokio", "description": ""}]}"#),
+    ]);
+    let mut p = provider(&s);
+    p.set_proposing(Proposing {
+        max: 2,
+        known: vec!["tokio".into(), "wifi".into()],
+    });
+    let a = p.tag(&item(), &list()).unwrap();
+    assert_eq!(names(&a.tags), ["rust", "python"]);
+    let new: Vec<(&str, Option<&str>)> = a
+        .proposed
+        .iter()
+        .map(|t| (t.name.as_str(), t.description.as_deref()))
+        .collect();
+    assert_eq!(
+        new,
+        [("tokio", Some("the Tokio runtime")), ("runtime", None)]
+    );
+
+    let body = s.requests()[0].json();
+    let schema = &body["response_format"]["json_schema"]["schema"];
+    assert_eq!(schema["required"], json!(["new_tags", "tags"]));
+    assert_eq!(
+        schema["properties"]["new_tags"]["items"]["required"],
+        json!(["name", "description"])
+    );
+    let system = messages(&s.requests()[0])[0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        system.contains("propose up to 2 new tags for the list"),
+        "{system}"
+    );
+    assert!(
+        system.contains("- python (also: py)\n\nNames already proposed"),
+        "{system}"
+    );
+    assert!(system.ends_with("when it fits: tokio, wifi"), "{system}");
+
+    let a = p.tag(&item(), &list()).unwrap();
+    assert_eq!((names(&a.tags), a.proposed.len()), (vec!["async"], 0));
+    let a = p.tag(&item(), &list()).unwrap();
+    assert!(a.tags.is_empty() && a.proposed.is_empty());
+    let retry = messages(&s.requests()[3]);
+    assert!(
+        retry[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("\"new_tags\" is not an array"),
+        "{retry:?}"
+    );
+    let a = p.tag(&item(), &list()).unwrap();
+    assert_eq!((a.tags.len(), a.proposed[0].name.as_str()), (0, "tokio"));
+
+    // Without proposing, an empty list is still an error.
+    p.set_proposing(Proposing::default());
+    assert!(p.tag(&item(), &[]).is_err());
 }

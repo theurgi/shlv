@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 
+use crate::proposal::{self, Diverted, ProposalSource, StrictTags};
 use crate::suggest::{self, DomainRules, SuggestMode};
 use crate::tag::NonCanonicalTags;
 use crate::{db, search, url};
@@ -74,11 +75,13 @@ pub struct Edit {
     pub remove_tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Added {
     pub id: i64,
     /// False if the URL was already bookmarked and that bookmark was updated instead.
     pub created: bool,
+    /// With `strict_tags = "propose"`: given tags that weren't canonical.
+    pub diverted: Diverted,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +127,7 @@ pub(crate) fn non_empty(s: &Option<String>) -> Option<&str> {
 
 pub struct Store {
     pub(crate) conn: Connection,
-    strict_tags: bool,
+    strict_tags: StrictTags,
     /// The declared list, once [`Store::pin`] has synced it.
     pub(crate) pinned: Option<crate::tag::DeclaredTags>,
     pub(crate) rules: DomainRules,
@@ -149,7 +152,7 @@ impl Store {
     fn new(conn: Connection) -> Self {
         Store {
             conn,
-            strict_tags: false,
+            strict_tags: StrictTags::Off,
             pinned: None,
             rules: DomainRules::default(),
             suggest_mode: SuggestMode::default(),
@@ -157,20 +160,39 @@ impl Store {
     }
 
     /// In strict mode, adding a tag that isn't canonical or an alias of a canonical tag fails
-    /// with [`NonCanonicalTags`] before anything is written. Off by default.
-    pub fn set_strict_tags(&mut self, on: bool) {
-        self.strict_tags = on;
+    /// with [`NonCanonicalTags`] before anything is written ([`StrictTags::On`], or `true`), or
+    /// becomes a proposal instead ([`StrictTags::Propose`]). Off by default.
+    pub fn set_strict_tags(&mut self, mode: impl Into<StrictTags>) {
+        self.strict_tags = mode.into();
     }
 
-    /// Whether strict mode is on; see [`Store::set_strict_tags`].
+    /// Whether strict mode is on, either way; see [`Store::set_strict_tags`].
     pub fn strict_tags(&self) -> bool {
+        self.strict_tags != StrictTags::Off
+    }
+
+    /// The strict mode; see [`Store::set_strict_tags`].
+    pub fn strict_mode(&self) -> StrictTags {
         self.strict_tags
+    }
+
+    /// Splits typed tags (normalized) into those a bookmark gets and those that become
+    /// proposals: with `strict_tags = "propose"`, the ones that aren't canonical. In the other
+    /// modes nothing is split off, and strict mode fails as [`Store::check_strict`] does.
+    pub(crate) fn split_strict(&self, tags: Vec<String>) -> Result<(Vec<String>, Vec<String>)> {
+        if self.strict_tags != StrictTags::Propose {
+            self.check_strict(&tags)?;
+            return Ok((tags, Vec::new()));
+        }
+        let bad = self.non_canonical(&tags)?;
+        let keep = tags.into_iter().filter(|t| !bad.contains(t)).collect();
+        Ok((keep, bad))
     }
 
     /// Fails with [`NonCanonicalTags`] if strict mode is on and any of `tags` (normalized) isn't
     /// canonical or an alias of a canonical tag.
     pub(crate) fn check_strict(&self, tags: &[String]) -> Result<()> {
-        if !self.strict_tags {
+        if !self.strict_tags() {
             return Ok(());
         }
         let bad = self.non_canonical(tags)?;
@@ -203,14 +225,15 @@ impl Store {
     /// Adds a bookmark. If its normalized URL is already bookmarked, updates that bookmark
     /// instead: given title and note replace the old ones, tags are added. Matching domain rules
     /// (see [`Store::set_rules`]) are recorded as suggestions or applied in the same transaction.
+    /// With `strict_tags = "propose"`, given tags that aren't canonical become proposals for the
+    /// bookmark ([`Added::diverted`]).
     pub fn add(&mut self, new: &NewBookmark) -> Result<Added> {
         let (full, norm) = check_url(&new.url)?;
-        let tags = normalize_tags(&new.tags)?;
-        self.check_strict(&tags)?;
+        let (tags, divert) = self.split_strict(normalize_tags(&new.tags)?)?;
         self.check_rules()?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
-        let added = put(
+        let mut added = put(
             &tx,
             &Put {
                 url: &full,
@@ -224,6 +247,14 @@ impl Store {
                 updated_at: now,
             },
             now,
+        )?;
+        proposal::divert(
+            &tx,
+            &divert,
+            ProposalSource::User,
+            added.id,
+            now,
+            &mut added.diverted,
         )?;
         if !self.rules.is_empty() {
             suggest::offer_rules(&tx, &self.rules, self.suggest_mode, added.id, &norm, now)?;
@@ -253,9 +284,14 @@ impl Store {
 
     /// Applies `edit` to a bookmark. Returns false if there's no live bookmark with that id.
     pub fn edit(&mut self, id: i64, edit: &Edit) -> Result<bool> {
-        let add = normalize_tags(&edit.add_tags)?;
+        Ok(self.edit_diverting(id, edit)?.is_some())
+    }
+
+    /// Like [`Store::edit`], but says which added tags became proposals (with
+    /// `strict_tags = "propose"`). Returns `None` if there's no live bookmark with that id.
+    pub fn edit_diverting(&mut self, id: i64, edit: &Edit) -> Result<Option<Diverted>> {
+        let (add, divert) = self.split_strict(normalize_tags(&edit.add_tags)?)?;
         let remove = normalize_tags(&edit.remove_tags)?;
-        self.check_strict(&add)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let n = tx.execute(
@@ -263,8 +299,10 @@ impl Store {
             params![id, now],
         )?;
         if n == 0 {
-            return Ok(false);
+            return Ok(None);
         }
+        let mut diverted = Diverted::default();
+        proposal::divert(&tx, &divert, ProposalSource::User, id, now, &mut diverted)?;
         if let Some(title) = &edit.title {
             tx.execute(
                 "UPDATE bookmark SET title = ?2 WHERE id = ?1",
@@ -285,6 +323,21 @@ impl Store {
                     params![id, tag_id],
                 )?;
             }
+            // Removing a name proposed for the bookmark withdraws it there, and the proposal
+            // with it if that was its last bookmark.
+            let withdrawn = tx
+                .prepare_cached(
+                    "DELETE FROM tag_proposal_bookmark WHERE bookmark_id = ?1 \
+                     AND proposal_id = (SELECT id FROM tag_proposal WHERE name = ?2)",
+                )?
+                .execute(params![id, tag])?;
+            if withdrawn > 0 {
+                tx.prepare_cached(
+                    "DELETE FROM tag_proposal WHERE name = ?1 AND state = 'pending' AND NOT \
+                     EXISTS (SELECT 1 FROM tag_proposal_bookmark WHERE proposal_id = id)",
+                )?
+                .execute([tag])?;
+            }
         }
         for tag in &add {
             let tag_id = ensure_tag(&tx, tag, now)?;
@@ -295,7 +348,7 @@ impl Store {
         }
         reindex(&tx, id)?;
         tx.commit()?;
-        Ok(true)
+        Ok(Some(diverted))
     }
 
     /// Sets (or with `None`, clears) a bookmark's summary in its own short transaction: the
@@ -331,6 +384,10 @@ impl Store {
         }
         tx.execute("DELETE FROM bookmark_tag WHERE bookmark_id = ?1", [id])?;
         tx.execute("DELETE FROM tag_suggestion WHERE bookmark_id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM tag_proposal_bookmark WHERE bookmark_id = ?1",
+            [id],
+        )?;
         tx.execute("DELETE FROM bookmark_fts WHERE rowid = ?1", [id])?;
         tx.commit()?;
         Ok(true)
@@ -506,7 +563,11 @@ pub(crate) fn put(tx: &Transaction, p: &Put, now: i64) -> Result<Added> {
                  updated_at = ?6 WHERE id = ?1",
             )?
             .execute(params![id, p.title, p.note, p.summary, p.created_at, now])?;
-            Added { id, created: false }
+            Added {
+                id,
+                created: false,
+                diverted: Diverted::default(),
+            }
         }
         None => {
             let uid = match p.uid.and_then(|u| uuid::Uuid::parse_str(u).ok()) {
@@ -530,6 +591,7 @@ pub(crate) fn put(tx: &Transaction, p: &Put, now: i64) -> Result<Added> {
             Added {
                 id: tx.last_insert_rowid(),
                 created: true,
+                diverted: Diverted::default(),
             }
         }
     };

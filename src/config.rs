@@ -22,9 +22,10 @@ use crate::tag::DeclaredTags;
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// `add`, `edit`, and import reject tags that aren't canonical or an alias of one.
+    /// `add`, `edit`, and import reject tags that aren't canonical or an alias of one (`true`), or
+    /// turn them into proposals for the list (`"propose"`).
     #[serde(default)]
-    pub strict_tags: bool,
+    pub strict_tags: crate::proposal::StrictTags,
     #[serde(default, skip_serializing_if = "Tags::is_empty")]
     pub tags: Tags,
     /// The tag classifier (feature `model`): thresholds and when to ask the provider. Parsed in
@@ -283,8 +284,19 @@ mod tests {
 
     #[test]
     fn parses() {
-        assert!(!parse("").unwrap().strict_tags);
-        assert!(parse("strict_tags = true").unwrap().strict_tags);
+        use crate::StrictTags;
+        let strict = |t: &str| parse(t).map(|c| c.strict_tags);
+        assert_eq!(strict("").unwrap(), StrictTags::Off);
+        assert_eq!(strict("strict_tags = true").unwrap(), StrictTags::On);
+        assert_eq!(strict("strict_tags = false").unwrap(), StrictTags::Off);
+        assert_eq!(
+            strict("strict_tags = \"propose\"").unwrap(),
+            StrictTags::Propose
+        );
+        let e = strict("strict_tags = \"yes\"").unwrap_err().to_string();
+        assert!(e.contains("expected true, false, or \"propose\""), "{e}");
+        let c = parse("strict_tags = \"propose\"").unwrap();
+        assert_eq!(c.to_toml(), "strict_tags = \"propose\"\n");
     }
 
     #[cfg(not(feature = "ai"))]
@@ -294,7 +306,7 @@ mod tests {
             "strict_tags = true\n[ai]\nmodel = \"x\"\n[provider.openai]\nkey_cmd = \"pass x\"\n",
         )
         .unwrap();
-        assert!(c.strict_tags);
+        assert_eq!(c.strict_tags, crate::StrictTags::On);
         assert_eq!(c.ignored_sections(), ["ai", "provider"]);
         assert_eq!(c.to_toml(), "strict_tags = true\n");
     }

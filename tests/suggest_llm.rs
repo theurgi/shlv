@@ -227,8 +227,9 @@ fn same_provider_also_summarizes() {
 }
 
 #[test]
-fn needs_a_canonical_list_and_reports_failures() {
-    let f = Fixture::new("[ai]\ntag = \"local\"\n");
+fn needs_a_list_or_proposals_and_reports_failures() {
+    // With proposals off, an empty list leaves the provider nothing to do.
+    let f = Fixture::new("[ai]\ntag = \"local\"\nproposals = 0\n");
     f.ok(&["add", &f.url("/p/tokio")]);
     let (code, _, err) = f.run(&["suggest", "1"]);
     assert_eq!(code, 1);
@@ -261,4 +262,153 @@ fn needs_a_canonical_list_and_reports_failures() {
         err.contains("no domain rules") && err.contains("no [ai] tag provider"),
         "{err}"
     );
+}
+
+/// The JSON body of chat request `i`.
+fn chat(f: &Fixture, i: usize) -> Value {
+    let chats: Vec<_> = f
+        .server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path == "/v1/chat/completions")
+        .collect();
+    chats[i].json()
+}
+
+fn system(body: &Value) -> String {
+    body["messages"][0]["content"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn without_a_list_the_provider_proposes() {
+    let f = Fixture::new("[ai]\ntag = \"local\"\n");
+    // Adding works with AI on and no list.
+    let out = f.ok(&["add", &f.url("/p/tokio"), "--title", "Tokio"]);
+    assert!(out.starts_with("added 1"), "{out}");
+    f.ok(&["add", &f.url("/p/tokio?2")]);
+
+    // Names are normalized and capped at [ai] proposals (3 by default).
+    f.reply(json!({"new_tags": [
+        {"name": "Rust", "description": "the Rust language"},
+        {"name": "async runtime", "description": "executors\n for async code"},
+        {"name": "rust", "description": "again"},
+        {"name": "a", "description": ""},
+        {"name": "b", "description": ""},
+    ]}));
+    let out = f.ok(&["suggest", "1"]);
+    assert!(
+        out.contains("llm: 1 bookmark sent, 0 failed: 0 new suggestions, 3 new proposals"),
+        "{out}"
+    );
+    assert!(
+        out.contains("1  proposed  #a  #async-runtime  #rust  (shlv tag proposals)"),
+        "{out}"
+    );
+    // Only new names were asked for, and nothing landed on the bookmark.
+    let body = chat(&f, 0);
+    let props = &body["response_format"]["json_schema"]["schema"]["properties"];
+    assert_eq!(
+        props.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["new_tags"]
+    );
+    assert!(system(&body).contains("There is no tag list yet: propose up to 3 tags"));
+    assert!(f.pending().is_empty());
+    let v: Value = serde_json::from_str(&f.ok(&["show", "1", "--json"])).unwrap();
+    assert_eq!(v["tags"], json!([]));
+
+    // The next request lists the names already proposed, for the model to reuse.
+    f.reply(json!({"new_tags": [{"name": "rust", "description": "Rust"}]}));
+    f.ok(&["suggest", "2"]);
+    assert!(
+        system(&chat(&f, 1)).ends_with(
+            "Names already proposed for other pages; propose one of these rather than a \
+             synonym when it fits: a, async-runtime, rust"
+        ),
+        "{}",
+        system(&chat(&f, 1))
+    );
+
+    // Bookmarks it proposed names for count as handled: `--all` doesn't send them again.
+    let (code, _, err) = f.run(&["suggest", "--all"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("no bookmarks to send"), "{err}");
+
+    // Most proposed first; the first description is kept.
+    let out = f.ok(&["tag", "proposals"]);
+    assert_eq!(
+        out,
+        "2  rust  # the Rust language  (llm)\n1  a  (llm)\n\
+         1  async-runtime  # executors for async code  (llm)\n"
+    );
+    let json: Vec<Value> = f
+        .ok(&["tag", "proposals", "ls", "--json"])
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(json[0]["name"], "rust");
+    assert_eq!(json[0]["bookmarks"], json!([2, 1]));
+    assert_eq!(
+        (&json[0]["source"], &json[0]["state"]),
+        (&json!("llm"), &json!("pending"))
+    );
+
+    // Decisions build the list.
+    let out = f.ok(&["tag", "proposals", "reject", "a"]);
+    assert_eq!(
+        out,
+        "rejected a (it was proposed for 1 bookmark); it won't be proposed again\n"
+    );
+    let out = f.ok(&["tag", "proposals", "accept", "rust"]);
+    assert_eq!(
+        out,
+        "accepted rust: canonical, described, tagged 2 bookmarks\n"
+    );
+    let out = f.ok(&["tag", "proposals", "alias", "async-runtime", "rust"]);
+    assert_eq!(out, "aliased async-runtime to rust: tagged 0 bookmarks\n");
+    assert_eq!(
+        f.ok(&["tag", "canonical", "export"]),
+        "rust async-runtime # the Rust language\n"
+    );
+    assert_eq!(f.ok(&["tag", "proposals"]), "");
+    assert_eq!(
+        f.ok(&["tag", "proposals", "ls", "--rejected"]),
+        "0  a  (llm)\n"
+    );
+
+    // With a list, the provider chooses from it and proposes alongside. A rejected name is
+    // dropped; an alias of a list tag becomes a suggestion of that tag.
+    f.ok(&["add", &f.url("/p/tokio?3")]);
+    f.reply(json!({"tags": [], "new_tags": [
+        {"name": "A", "description": ""},
+        {"name": "async-runtime", "description": ""},
+        {"name": "tokio", "description": "the Tokio runtime"},
+    ]}));
+    let out = f.ok(&["suggest", "3"]);
+    assert!(out.contains("1 new suggestion, 1 new proposal"), "{out}");
+    let body = chat(&f, 2);
+    let props = &body["response_format"]["json_schema"]["schema"]["properties"];
+    assert_eq!(props["tags"]["items"]["enum"], json!(["rust"]));
+    assert!(props["new_tags"].is_object());
+    assert!(system(&body).contains("propose up to 3 new tags for the list"));
+    let p = f.pending();
+    assert_eq!((p.len(), &p[0]["tag"]), (1, &json!("rust")));
+    assert_eq!(
+        f.ok(&["tag", "proposals"]),
+        "1  tokio  # the Tokio runtime  (llm)\n"
+    );
+}
+
+#[test]
+fn proposals_can_be_turned_off() {
+    let f = Fixture::new(&format!(
+        "[ai]\ntag = \"local\"\nproposals = 0\n{CANONICAL}"
+    ));
+    f.ok(&["add", &f.url("/p/tokio")]);
+    f.reply(json!({"tags": ["rust"], "new_tags": [{"name": "tokio", "description": ""}]}));
+    f.ok(&["suggest", "1"]);
+    let body = chat(&f, 0);
+    let props = &body["response_format"]["json_schema"]["schema"]["properties"];
+    assert!(props.get("new_tags").is_none(), "{props}");
+    assert!(!system(&body).contains("new_tags"));
+    assert_eq!(f.ok(&["tag", "proposals"]), "");
 }
