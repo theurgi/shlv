@@ -295,6 +295,24 @@ impl Store {
         Ok(true)
     }
 
+    /// Sets (or with `None`, clears) a bookmark's summary in its own short transaction: the
+    /// summary, `updated_at`, and its search row. Returns false if there's no live bookmark with
+    /// that id.
+    pub fn set_summary(&mut self, id: i64, summary: Option<&str>) -> Result<bool> {
+        let summary = summary.map(str::trim).filter(|s| !s.is_empty());
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE bookmark SET summary = ?2, updated_at = ?3 WHERE id = ?1 AND deleted_at IS NULL",
+            params![id, summary, now_ms()],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        reindex(&tx, id)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Deletes a bookmark, leaving a tombstone for sync: content fields and tags are cleared and
     /// it leaves the search index. Returns false if there's no live bookmark with that id.
     pub fn delete(&mut self, id: i64) -> Result<bool> {

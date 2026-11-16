@@ -95,6 +95,7 @@ $ shlv search fts5
 | `suggest reject ID [TAG]...` | Reject suggestions; they aren't offered again for that bookmark      |
 | `config path\|show`          | Print the config file path, or the effective config                  |
 | `fetch ID...\|--all`         | Set titles from the pages (`--all`: bookmarks without one) (`fetch`) |
+| `summarize ID...\|--all`     | Summarize pages with the `[ai] summarize` provider (`ai`)            |
 
 `ls`, `search`, `tag ls`, and `suggest ls` take `--json` for one JSON object per line. `-n 0` shows
 every result.
@@ -199,6 +200,14 @@ title, note, and summary (when it has them), the page's extracted main text (up 
 the task fetches the page, and for tagging the canonical tag list with aliases and descriptions.
 Nothing else from the database, and nothing at all unless `[ai]` names a provider. The API key is
 read from the named environment variable only when a request is made.
+
+`shlv summarize ID...` (or `--all` for every bookmark without a summary; `--force` redoes them)
+fetches each page, extracts its main text, and stores the provider's two- or three-sentence summary,
+which `search` then finds. Pages that can't be fetched count as failures; pages with no text (an
+empty JavaScript app) are skipped. It runs two requests at a time (`-j`), commits each summary as it
+arrives (an interrupted run keeps them; rerun to continue), prints token use, and exits nonzero if
+any failed. It says how many bookmarks it will send where before it starts, and above 20 it needs
+`--yes`.
 
 Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped, and
 empty or overlong summaries are rejected. If a server doesn't support JSON-schema output, shlv falls

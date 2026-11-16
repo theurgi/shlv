@@ -14,6 +14,9 @@ use shlv::{
 };
 use shlv::{netscape, transfer};
 
+#[cfg(feature = "ai")]
+mod ai_cmd;
+
 /// A fast bookmark manager.
 #[derive(Parser)]
 #[command(version, about)]
@@ -153,6 +156,28 @@ enum Cmd {
         /// Requests at a time
         #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32))]
         jobs: u16,
+    },
+    /// Summarize bookmarks with the [ai] summarize provider: fetch each page, send its text
+    #[cfg(feature = "ai")]
+    Summarize {
+        #[arg(
+            value_name = "ID",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        ids: Vec<i64>,
+        /// Every bookmark without a summary
+        #[arg(long)]
+        all: bool,
+        /// Redo bookmarks that already have a summary
+        #[arg(long)]
+        force: bool,
+        /// Requests at a time
+        #[arg(short, long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=16))]
+        jobs: u16,
+        /// Go ahead when more than 20 bookmarks would be sent
+        #[arg(short, long)]
+        yes: bool,
     },
     /// Show where the config file is and what it sets
     Config {
@@ -544,6 +569,26 @@ fn run(cli: Cli) -> Result<ExitCode> {
             force,
             jobs,
         } => return run_fetch(&mut store, &ids, all, force, jobs.into(), &mut out, &style),
+        #[cfg(feature = "ai")]
+        Cmd::Summarize {
+            ids,
+            all,
+            force,
+            jobs,
+            yes,
+        } => {
+            return ai_cmd::run_summarize(
+                &mut store,
+                &config,
+                &ids,
+                all,
+                force,
+                jobs.into(),
+                yes,
+                &mut out,
+                &style,
+            );
+        }
         Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }
     out.flush()?;
