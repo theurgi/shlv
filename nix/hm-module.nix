@@ -31,6 +31,10 @@ in
           tags.canonical = {
             javascript = [ "js" "ecmascript" ];
             rust = [ ];
+            infra = {
+              aliases = [ "ops" ];
+              description = "servers, deployment, Nix, CI";
+            };
           };
         }
       '';
@@ -42,7 +46,9 @@ in
 
         - `strict_tags`: when true, `add`, `edit`, and `import` reject tags that aren't canonical
           or an alias of a canonical tag.
-        - `tags.canonical`: the declared canonical tag list, mapping each tag to its aliases.
+        - `tags.canonical`: the declared canonical tag list, mapping each tag to its aliases, or
+          to `{ aliases = [ ... ]; description = "..."; }`. A description (one line, at most 200
+          characters) says what belongs under the tag; the tag suggestion layers match against it.
           When set, even to `{ }`, this list is the source of truth: on startup the database
           mirrors it (declared tags become canonical, aliases point at them, other canonical tags
           are unmarked; bookmarks keep their tags), and `shlv tag canonical add|rm|import` and

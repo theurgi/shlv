@@ -23,6 +23,8 @@ pub struct TagInfo {
     pub canonical: bool,
     /// Sorted alias names.
     pub aliases: Vec<String>,
+    /// What belongs under this tag, for the tagging layers.
+    pub description: Option<String>,
     /// Unix milliseconds.
     pub updated_at: i64,
 }
@@ -52,6 +54,8 @@ pub struct CanonicalEntry {
     pub line: usize,
     pub tag: String,
     pub aliases: Vec<String>,
+    /// The text after `#`, if any.
+    pub description: Option<String>,
 }
 
 /// What [`Store::import_canonical`] changed.
@@ -63,26 +67,43 @@ pub struct ImportStats {
     pub marked: usize,
     /// Aliases newly added.
     pub aliases: usize,
+    /// Descriptions set or changed.
+    pub described: usize,
 }
 
 /// Parses a canonical list: one tag per line followed by its aliases, separated by whitespace
-/// (`javascript js ecmascript`). Blank lines are skipped, and a word starting with `#` starts a
-/// comment that runs to the end of the line. Names are normalized.
+/// (`javascript js ecmascript`). Blank lines are skipped. A word starting with `#` starts a
+/// comment that runs to the end of the line; on a tag's line, that comment is the tag's
+/// description (`infra ops # servers, deployment, CI`). Names are normalized.
 pub fn parse_canonical(text: &str) -> Vec<CanonicalEntry> {
     let mut entries = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        let mut words = line.split_whitespace().take_while(|w| !w.starts_with('#'));
+        // The comment starts at the first word that starts with `#`.
+        let mut cut = line.len();
+        let mut at = 0;
+        for w in line.split_whitespace() {
+            let pos = at + line[at..].find(w).unwrap_or(0);
+            if w.starts_with('#') {
+                cut = pos;
+                break;
+            }
+            at = pos + w.len();
+        }
+        let (words, comment) = line.split_at(cut);
+        let mut words = words.split_whitespace();
         let Some(tag) = words.next() else { continue };
+        let description = comment.strip_prefix('#').map(str::trim);
         entries.push(CanonicalEntry {
             line: i + 1,
             tag: normalize_tag(tag),
             aliases: words.map(normalize_tag).collect(),
+            description: description.filter(|d| !d.is_empty()).map(str::to_string),
         });
     }
     entries
 }
 
-/// Formats tags as a canonical list that [`parse_canonical`] reads back.
+/// Formats tags as a canonical list that [`parse_canonical`] reads back, descriptions included.
 pub fn format_canonical(tags: &[TagInfo]) -> String {
     let mut out = String::new();
     for t in tags {
@@ -90,6 +111,10 @@ pub fn format_canonical(tags: &[TagInfo]) -> String {
         for a in &t.aliases {
             out.push(' ');
             out.push_str(a);
+        }
+        if let Some(d) = &t.description {
+            out.push_str(" # ");
+            out.push_str(d);
         }
         out.push('\n');
     }
@@ -99,14 +124,105 @@ pub fn format_canonical(tags: &[TagInfo]) -> String {
 /// The `meta` key holding [`DeclaredTags::hash`] of the list last mirrored into the database.
 const DECLARED_HASH: &str = "canonical_hash";
 
-/// A canonical list declared in config: tag names mapped to their aliases. Built only through
-/// validation, so names are normalized, no alias belongs to two tags, and no alias is also a
-/// declared tag.
+/// Longest tag description, in characters.
+pub const MAX_DESCRIPTION: usize = 200;
+
+/// Checks a tag description: one line of at most [`MAX_DESCRIPTION`] characters. Returns it
+/// trimmed; blank means none.
+pub fn check_description(text: &str) -> Result<Option<String>, String> {
+    let t = text.trim();
+    if t.contains(['\n', '\r']) {
+        return Err("a tag description must be one line".into());
+    }
+    let n = t.chars().count();
+    if n > MAX_DESCRIPTION {
+        return Err(format!(
+            "a tag description can be at most {MAX_DESCRIPTION} characters; this one has {n}"
+        ));
+    }
+    Ok((!t.is_empty()).then(|| t.to_string()))
+}
+
+/// One declared tag: its aliases and an optional description. In config it is either a list of
+/// aliases (`rust = ["rs"]`) or a table (`infra = { aliases = ["ops"], description = "..." }`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredEntry {
+    pub aliases: Vec<String>,
+    pub description: Option<String>,
+}
+
+/// The table form; unknown keys are errors.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntryTable {
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for DeclaredEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
+
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = DeclaredEntry;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of aliases, or a table with `aliases` and `description`")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                a: A,
+            ) -> Result<Self::Value, A::Error> {
+                Ok(DeclaredEntry {
+                    aliases: Vec::deserialize(SeqAccessDeserializer::new(a))?,
+                    description: None,
+                })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                a: A,
+            ) -> Result<Self::Value, A::Error> {
+                let t = EntryTable::deserialize(MapAccessDeserializer::new(a))?;
+                let description = match t.description {
+                    Some(d) => check_description(&d).map_err(serde::de::Error::custom)?,
+                    None => None,
+                };
+                Ok(DeclaredEntry {
+                    aliases: t.aliases,
+                    description,
+                })
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl Serialize for DeclaredEntry {
+    /// The list form when there is no description, so `config show` prints what was written.
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        match &self.description {
+            None => self.aliases.serialize(s),
+            Some(d) => {
+                let mut t = s.serialize_struct("DeclaredEntry", 2)?;
+                t.serialize_field("aliases", &self.aliases)?;
+                t.serialize_field("description", d)?;
+                t.end()
+            }
+        }
+    }
+}
+
+/// A canonical list declared in config: tag names mapped to their aliases and descriptions. Built
+/// only through validation, so names are normalized, no alias belongs to two tags, and no alias is
+/// also a declared tag.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "BTreeMap<String, Vec<String>>")]
+#[serde(try_from = "BTreeMap<String, DeclaredEntry>")]
 pub struct DeclaredTags {
     /// Aliases are sorted, so the hash doesn't depend on their order in the file.
-    tags: BTreeMap<String, Vec<String>>,
+    tags: BTreeMap<String, DeclaredEntry>,
     /// Alias to tag.
     aliases: HashMap<String, String>,
 }
@@ -114,7 +230,7 @@ pub struct DeclaredTags {
 impl DeclaredTags {
     /// Validates a declared list. Names must already be normalized: config is a source of truth,
     /// so `"Web Dev"` is an error rather than quietly becoming `web-dev`.
-    pub fn new(tags: BTreeMap<String, Vec<String>>) -> Result<Self, String> {
+    pub fn new(tags: BTreeMap<String, DeclaredEntry>) -> Result<Self, String> {
         let check = |name: &str| {
             let n = normalize_tag(name);
             if n.is_empty() {
@@ -129,9 +245,9 @@ impl DeclaredTags {
         };
         let mut aliases: HashMap<String, String> = HashMap::new();
         let mut sorted = BTreeMap::new();
-        for (tag, list) in tags {
+        for (tag, mut entry) in tags {
             check(&tag)?;
-            for a in &list {
+            for a in &entry.aliases {
                 check(a)?;
                 if a == &tag {
                     return Err(format!("{tag:?} lists itself as an alias"));
@@ -144,9 +260,11 @@ impl DeclaredTags {
                     });
                 }
             }
-            let mut list = list;
-            list.sort_unstable();
-            sorted.insert(tag, list);
+            if let Some(d) = &entry.description {
+                entry.description = check_description(d).map_err(|e| format!("{tag:?}: {e}"))?;
+            }
+            entry.aliases.sort_unstable();
+            sorted.insert(tag, entry);
         }
         if let Some((a, tag)) = aliases.iter().find(|(a, _)| sorted.contains_key(*a)) {
             return Err(format!(
@@ -161,7 +279,14 @@ impl DeclaredTags {
 
     /// Declared tags by name, each with its sorted aliases.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
-        self.tags.iter().map(|(t, a)| (t.as_str(), a.as_slice()))
+        self.tags
+            .iter()
+            .map(|(t, e)| (t.as_str(), e.aliases.as_slice()))
+    }
+
+    /// A declared tag's description.
+    pub fn description(&self, tag: &str) -> Option<&str> {
+        self.tags.get(tag)?.description.as_deref()
     }
 
     pub fn len(&self) -> usize {
@@ -185,9 +310,9 @@ impl DeclaredTags {
         }
     }
 
-    /// A 64-bit FNV-1a hash of the list in canonical-list format, as 16 hex digits. It only
-    /// detects changes, so it needs no collision resistance; the leading version tag lets the
-    /// format change later at the cost of one resync.
+    /// A 64-bit FNV-1a hash of the list in canonical-list format, descriptions included, as 16
+    /// hex digits. It only detects changes, so it needs no collision resistance; the leading
+    /// version tag lets the format change at the cost of one resync (v2 added descriptions).
     pub fn hash(&self) -> String {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         let mut feed = |s: &str| {
@@ -196,12 +321,16 @@ impl DeclaredTags {
                 h = h.wrapping_mul(0x0000_0100_0000_01b3);
             }
         };
-        feed("v1\n");
-        for (tag, aliases) in &self.tags {
+        feed("v2\n");
+        for (tag, entry) in &self.tags {
             feed(tag);
-            for a in aliases {
+            for a in &entry.aliases {
                 feed(" ");
                 feed(a);
+            }
+            if let Some(d) = &entry.description {
+                feed(" # ");
+                feed(d);
             }
             feed("\n");
         }
@@ -209,13 +338,12 @@ impl DeclaredTags {
     }
 }
 
-impl TryFrom<BTreeMap<String, Vec<String>>> for DeclaredTags {
+impl TryFrom<BTreeMap<String, DeclaredEntry>> for DeclaredTags {
     type Error = String;
-    fn try_from(tags: BTreeMap<String, Vec<String>>) -> Result<Self, String> {
+    fn try_from(tags: BTreeMap<String, DeclaredEntry>) -> Result<Self, String> {
         DeclaredTags::new(tags)
     }
 }
-
 impl Serialize for DeclaredTags {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         self.tags.serialize(s)
@@ -234,6 +362,8 @@ pub struct SyncStats {
     /// Aliases removed: undeclared aliases of declared tags, and aliases whose name is now a
     /// declared tag.
     pub aliases_removed: usize,
+    /// Declared tags whose description was set, changed, or cleared.
+    pub described: usize,
     /// Live tags that the list declares as aliases, folded into their tag: (from, into, bookmarks
     /// retagged).
     pub merged: Vec<(String, String, usize)>,
@@ -294,7 +424,7 @@ impl Store {
             "SELECT t.name, t.uid, t.canonical, t.updated_at, \
              (SELECT count(*) FROM bookmark_tag bt WHERE bt.tag_id = t.id), \
              (SELECT group_concat(a.alias, ' ' ORDER BY a.alias) FROM tag_alias a \
-              WHERE a.tag_id = t.id) \
+              WHERE a.tag_id = t.id), t.description \
              FROM tag t WHERE t.deleted_at IS NULL{filter} ORDER BY {order}"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
@@ -309,6 +439,7 @@ impl Store {
                 aliases: aliases
                     .map(|a| a.split(' ').map(str::to_string).collect())
                     .unwrap_or_default(),
+                description: r.get(6)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -433,9 +564,22 @@ impl Store {
         Ok(changed)
     }
 
+    /// Sets (or with blank `text`, clears) the description of live tag `tag`. Returns the tag's
+    /// name and whether anything changed.
+    pub fn describe_tag(&mut self, tag: &str, text: &str) -> Result<(String, bool)> {
+        let name = tag_name(tag)?;
+        let text = check_description(text).map_err(anyhow::Error::msg)?;
+        let tx = self.conn.transaction()?;
+        let id = require_tag(&tx, &name)?;
+        let changed = set_description(&tx, id, text.as_deref(), now_ms())?;
+        tx.commit()?;
+        Ok((name, changed))
+    }
+
     /// Adds a canonical list (see [`parse_canonical`]): marks each tag canonical, creating it if
-    /// needed, and adds its aliases. Nothing is removed. All or nothing: on an error (such as an
-    /// alias that is a live tag) nothing changes.
+    /// needed, and adds its aliases and descriptions. Nothing is removed: a line without a
+    /// description keeps the tag's current one. All or nothing: on an error (such as an alias that
+    /// is a live tag) nothing changes.
     pub fn import_canonical(&mut self, entries: &[CanonicalEntry]) -> Result<ImportStats> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
@@ -448,6 +592,10 @@ impl Store {
             for a in &e.aliases {
                 stats.aliases +=
                     usize::from(add_alias(&tx, a, tag_id, &e.tag, now).with_context(at)?);
+            }
+            if let Some(d) = &e.description {
+                let d = check_description(d).map_err(|m| anyhow::anyhow!("{}: {m}", at()))?;
+                stats.described += usize::from(set_description(&tx, tag_id, d.as_deref(), now)?);
             }
         }
         forget_declared(&tx)?;
@@ -490,7 +638,10 @@ impl Store {
                 stats.aliases_removed += 1;
             }
             stats.marked += usize::from(mark_canonical(&tx, tag, now)?);
-            ids.insert(tag, require_tag(&tx, tag)?);
+            let id = require_tag(&tx, tag)?;
+            stats.described +=
+                usize::from(set_description(&tx, id, declared.description(tag), now)?);
+            ids.insert(tag, id);
         }
 
         for (tag, aliases) in declared.iter() {
@@ -710,4 +861,14 @@ fn free_name(tx: &Transaction, name: &str) -> Result<()> {
         [name],
     )?;
     Ok(())
+}
+
+/// Sets a tag's description; returns whether it changed.
+fn set_description(tx: &Transaction, id: i64, text: Option<&str>, now: i64) -> Result<bool> {
+    let n = tx.execute(
+        "UPDATE tag SET description = ?2, updated_at = ?3 WHERE id = ?1 \
+         AND description IS NOT ?2",
+        params![id, text, now],
+    )?;
+    Ok(n > 0)
 }

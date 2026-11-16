@@ -284,6 +284,33 @@ fn tag_ls() {
     assert_eq!(v[2]["name"], "zig");
     assert_eq!(v[2]["canonical"], true);
     assert_eq!(v[2]["count"], 0);
+    assert_eq!(v[2]["description"], serde_json::Value::Null);
+    assert_eq!(
+        db.ok(&["tag", "describe", "zig", "a systems language"]),
+        "described zig\n"
+    );
+    assert_eq!(
+        db.ok(&["tag", "describe", "zig", "a systems language"]),
+        "zig: unchanged\n"
+    );
+    let v = json_lines(&db.ok(&["tag", "ls", "--json"]));
+    assert_eq!(v[2]["description"], "a systems language");
+    assert!(
+        db.ok(&["tag", "ls"])
+            .ends_with(" 0 * zig  # a systems language\n")
+    );
+    assert_eq!(
+        db.ok(&["tag", "canonical", "export"]),
+        "web\nzig # a systems language\n"
+    );
+    assert!(
+        db.fail(&["tag", "describe", "rs", "x"])
+            .contains("alias of \"rust\"")
+    );
+    assert_eq!(
+        db.ok(&["tag", "describe", "zig", ""]),
+        "cleared the description of zig\n"
+    );
     assert!(
         db.fail(&["tag", "ls", "--sort", "bogus"])
             .contains("invalid value")
@@ -390,11 +417,11 @@ fn tag_canonical() {
     .unwrap();
     assert_eq!(
         db.ok(&["tag", "canonical", "import", file.to_str().unwrap()]),
-        "imported 2 tags: 1 newly canonical, 2 aliases added\n"
+        "imported 2 tags: 1 newly canonical, 2 aliases added, 1 description set\n"
     );
     assert_eq!(
         db.ok(&["tag", "canonical", "export"]),
-        "javascript ecmascript\nrust rs\n"
+        "javascript ecmascript # comment\nrust rs\n"
     );
 
     // From stdin; import only adds.
@@ -413,7 +440,7 @@ fn tag_canonical() {
     assert!(child.wait_with_output().unwrap().status.success());
     assert_eq!(
         db.ok(&["tag", "canonical", "export"]),
-        "go golang\njavascript ecmascript\nrust rs\n"
+        "go golang\njavascript ecmascript # comment\nrust rs\n"
     );
 
     // A conflicting line fails the whole import.
@@ -584,6 +611,10 @@ fn declared_canonical_tags() {
         "cannot change canonical tags",
     );
     refused(&["tag", "alias", "rs", "rust"], "cannot change aliases");
+    refused(
+        &["tag", "describe", "rust", "the language"],
+        "cannot change descriptions",
+    );
     refused(&["tag", "alias", "--rm", "js"], "cannot change aliases");
     refused(
         &["tag", "rename", "Rust", "rust-lang"],

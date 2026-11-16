@@ -217,6 +217,8 @@ enum TagCmd {
         #[arg(long)]
         rm: bool,
     },
+    /// Describe what belongs under a tag, for tag suggestions ("" clears it)
+    Describe { tag: String, text: String },
     /// Mark, unmark, list, import, or export canonical tags
     Canonical {
         #[command(subcommand)]
@@ -857,6 +859,7 @@ fn run_tag(
     if let Some(d) = declared {
         match &cmd {
             TagCmd::Alias { .. } => return Err(d.refuse("cannot change aliases")),
+            TagCmd::Describe { .. } => return Err(d.refuse("cannot change descriptions")),
             TagCmd::Canonical {
                 cmd:
                     CanonicalCmd::Add { .. } | CanonicalCmd::Rm { .. } | CanonicalCmd::Import { .. },
@@ -927,6 +930,14 @@ fn run_tag(
             }
         }
         TagCmd::Alias { .. } => unreachable!("clap requires TAG unless --rm, and not both"),
+        TagCmd::Describe { tag, text } => {
+            let (name, changed) = store.describe_tag(&tag, &text)?;
+            match (changed, text.trim().is_empty()) {
+                (false, _) => writeln!(out, "{name}: unchanged")?,
+                (true, true) => writeln!(out, "cleared the description of {name}")?,
+                (true, false) => writeln!(out, "described {name}")?,
+            }
+        }
         TagCmd::Canonical { cmd } => match cmd {
             CanonicalCmd::Add { tags } => {
                 let n = store.add_canonical(&tags)?;
@@ -946,13 +957,17 @@ fn run_tag(
                 let s = store
                     .import_canonical(&parse_canonical(&text))
                     .with_context(|| format!("cannot import {}", file.display()))?;
-                writeln!(
+                write!(
                     out,
                     "imported {}: {} newly canonical, {} added",
                     plural(s.tags, "tag"),
                     s.marked,
                     plural(s.aliases, "alias"),
                 )?;
+                if s.described > 0 {
+                    write!(out, ", {} set", plural(s.described, "description"))?;
+                }
+                writeln!(out)?;
             }
             CanonicalCmd::Export => {
                 out.write_all(format_canonical(&store.canonical_tags()?).as_bytes())?
@@ -972,6 +987,9 @@ fn print_tag(out: &mut impl Write, t: &TagInfo, width: usize, s: &Style) -> io::
     )?;
     if !t.aliases.is_empty() {
         write!(out, "  {}= {}{}", s.dim, t.aliases.join(" "), s.reset)?;
+    }
+    if let Some(d) = &t.description {
+        write!(out, "  {}# {d}{}", s.dim, s.reset)?;
     }
     writeln!(out)
 }

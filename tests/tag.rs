@@ -3,7 +3,9 @@
 use shlv::tag::{format_canonical, parse_canonical};
 use std::collections::BTreeMap;
 
-use shlv::{CanonicalEntry, DeclaredTags, NewBookmark, Store, SyncStats, TagInfo, TagSort};
+use shlv::{
+    CanonicalEntry, DeclaredEntry, DeclaredTags, NewBookmark, Store, SyncStats, TagInfo, TagSort,
+};
 
 fn store() -> Store {
     Store::open_in_memory().unwrap()
@@ -335,17 +337,18 @@ fn canonical_text_round_trip() {
                 c# csharp\n\
                 #go golang\n";
     let parsed = parse_canonical(text);
-    let entry = |line, tag: &str, aliases: &[&str]| CanonicalEntry {
+    let entry = |line, tag: &str, aliases: &[&str], description: Option<&str>| CanonicalEntry {
         line,
         tag: tag.into(),
         aliases: strings(aliases),
+        description: description.map(str::to_string),
     };
     assert_eq!(
         parsed,
         [
-            entry(2, "javascript", &["js", "ecmascript"]),
-            entry(5, "rust", &[]),
-            entry(6, "c#", &["csharp"]),
+            entry(2, "javascript", &["js", "ecmascript"], Some("the usual")),
+            entry(5, "rust", &[], None),
+            entry(6, "c#", &["csharp"], None),
         ]
     );
 
@@ -353,7 +356,10 @@ fn canonical_text_round_trip() {
     let stats = s.import_canonical(&parsed).unwrap();
     assert_eq!((stats.tags, stats.marked, stats.aliases), (3, 3, 3));
     let out = format_canonical(&s.canonical_tags().unwrap());
-    assert_eq!(out, "c# csharp\njavascript ecmascript js\nrust\n");
+    assert_eq!(
+        out,
+        "c# csharp\njavascript ecmascript js # the usual\nrust\n"
+    );
     assert_eq!(parse_canonical(&out).len(), 3);
 
     // Importing again changes nothing.
@@ -443,9 +449,17 @@ fn strict_mode_rejects_non_canonical_tags_before_writing() {
 }
 
 fn declared(list: &[(&str, &[&str])]) -> DeclaredTags {
-    let map: BTreeMap<String, Vec<String>> = list
+    let map: BTreeMap<String, DeclaredEntry> = list
         .iter()
-        .map(|(t, a)| (t.to_string(), strings(a)))
+        .map(|(t, a)| {
+            (
+                t.to_string(),
+                DeclaredEntry {
+                    aliases: strings(a),
+                    description: None,
+                },
+            )
+        })
         .collect();
     DeclaredTags::new(map).unwrap()
 }
@@ -477,6 +491,7 @@ fn sync_mirrors_declared_list() {
             unmarked: 1,
             aliases_added: 2,
             aliases_removed: 0,
+            described: 0,
             merged: vec![("js".into(), "javascript".into(), 1)],
         }
     );
@@ -576,9 +591,17 @@ fn manual_tag_edits_force_the_next_sync() {
 #[test]
 fn declared_list_validation() {
     let new = |list: &[(&str, &[&str])]| {
-        let map: BTreeMap<String, Vec<String>> = list
+        let map: BTreeMap<String, DeclaredEntry> = list
             .iter()
-            .map(|(t, a)| (t.to_string(), strings(a)))
+            .map(|(t, a)| {
+                (
+                    t.to_string(),
+                    DeclaredEntry {
+                        aliases: strings(a),
+                        description: None,
+                    },
+                )
+            })
             .collect();
         DeclaredTags::new(map).unwrap_err()
     };
@@ -611,4 +634,88 @@ fn declared_list_validation() {
     assert_eq!(d.resolve("rust"), None);
     assert_ne!(d.hash(), declared(&[("javascript", &[])]).hash());
     assert_ne!(d.hash(), declared(&[("javascript", &["j"])]).hash());
+}
+
+#[test]
+fn descriptions() {
+    let mut s = store();
+    add(&mut s, "https://a.com", &["infra"]);
+    s.add_alias("ops", "infra").unwrap();
+    assert_eq!(
+        s.describe_tag("Infra", "  servers, deployment, Nix, CI ")
+            .unwrap(),
+        ("infra".into(), true)
+    );
+    assert_eq!(
+        s.describe_tag("infra", "servers, deployment, Nix, CI")
+            .unwrap(),
+        ("infra".into(), false)
+    );
+    let t = &s.tags(TagSort::Name).unwrap()[0];
+    assert_eq!(
+        t.description.as_deref(),
+        Some("servers, deployment, Nix, CI")
+    );
+    let e = |r: anyhow::Result<(String, bool)>| r.unwrap_err().to_string();
+    assert!(e(s.describe_tag("ops", "x")).contains("alias of \"infra\""));
+    assert!(e(s.describe_tag("nope", "x")).contains("no tag \"nope\""));
+    assert!(e(s.describe_tag("infra", "a\nb")).contains("one line"));
+    assert!(e(s.describe_tag("infra", &"x".repeat(201))).contains("at most 200"));
+    // Blank clears.
+    assert!(s.describe_tag("infra", " ").unwrap().1);
+    assert_eq!(s.tags(TagSort::Name).unwrap()[0].description, None);
+
+    // Import sets descriptions and keeps them when a line has none.
+    s.import_canonical(&parse_canonical(
+        "infra ops # servers\nrust # the language\n",
+    ))
+    .unwrap();
+    assert_eq!(canonical(&s), "infra ops # servers\nrust # the language\n");
+    let st = s
+        .import_canonical(&parse_canonical("infra\nrust # Rust\n"))
+        .unwrap();
+    assert_eq!(st.described, 1);
+    assert_eq!(canonical(&s), "infra ops # servers\nrust # Rust\n");
+    let long = format!("rust # {}", "x".repeat(201));
+    let err = s.import_canonical(&parse_canonical(&long)).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("line 1: a tag description"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn declared_descriptions_sync() {
+    let entry = |aliases: &[&str], d: Option<&str>| DeclaredEntry {
+        aliases: strings(aliases),
+        description: d.map(str::to_string),
+    };
+    let list = |d: Option<&str>| {
+        DeclaredTags::new(BTreeMap::from([
+            ("infra".to_string(), entry(&["ops"], d)),
+            ("rust".to_string(), entry(&[], None)),
+        ]))
+        .unwrap()
+    };
+    let mut s = store();
+    let d1 = list(Some("servers, CI"));
+    let st = s.sync_declared(&d1).unwrap().unwrap();
+    assert_eq!(st.described, 1);
+    assert_eq!(canonical(&s), "infra ops # servers, CI\nrust\n");
+    // A changed description changes the hash, so it resyncs.
+    let d2 = list(Some("servers, deployment, CI"));
+    assert_ne!(d1.hash(), d2.hash());
+    assert_eq!(s.sync_declared(&d2).unwrap().unwrap().described, 1);
+    assert!(s.sync_declared(&d2).unwrap().is_none());
+    // Dropping it from config clears it.
+    assert_eq!(s.sync_declared(&list(None)).unwrap().unwrap().described, 1);
+    assert_eq!(canonical(&s), "infra ops\nrust\n");
+    assert!(
+        DeclaredTags::new(BTreeMap::from([(
+            "rust".to_string(),
+            entry(&[], Some("a\nb"))
+        )]))
+        .unwrap_err()
+        .contains("\"rust\": a tag description must be one line")
+    );
 }

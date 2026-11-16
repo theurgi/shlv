@@ -18,7 +18,7 @@ pub use config::Config;
 pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
 pub use suggest::{DomainRules, NonCanonicalRuleTags, RuleStats, Source, SuggestMode, Suggestion};
 pub use tag::{
-    CanonicalEntry, DeclaredTags, ImportStats, NonCanonicalTags, Retagged, SyncStats, TagInfo,
-    TagSort,
+    CanonicalEntry, DeclaredEntry, DeclaredTags, ImportStats, NonCanonicalTags, Retagged,
+    SyncStats, TagInfo, TagSort,
 };
 pub use transfer::{Format, ImportItem, ImportOptions, ImportSummary};

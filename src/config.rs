@@ -251,6 +251,50 @@ mod tests {
     }
 
     #[test]
+    fn declared_table_form_with_descriptions() {
+        let text = "[tags.canonical]\nrust = [\"rs\"]\n\
+                    infra = { aliases = [\"ops\"], description = \"servers, deployment, Nix, CI\" }\n\
+                    web = { description = \" browsers \" }\n";
+        let c = parse(text).unwrap();
+        let d = c.tags.canonical.as_ref().unwrap();
+        assert_eq!(
+            d.iter().collect::<Vec<_>>(),
+            [
+                ("infra", &["ops".to_string()][..]),
+                ("rust", &["rs".to_string()][..]),
+                ("web", &[][..])
+            ]
+        );
+        assert_eq!(d.description("infra"), Some("servers, deployment, Nix, CI"));
+        assert_eq!(d.description("web"), Some("browsers"));
+        assert_eq!(d.description("rust"), None);
+        // `config show` writes the table form only where there's a description, and reads back.
+        let shown = c.to_toml();
+        assert!(shown.contains("rust = [\"rs\"]"), "{shown}");
+        let again = parse(&shown).unwrap();
+        assert_eq!(again.tags.canonical.as_ref().unwrap(), d);
+
+        let e = parse("[tags.canonical]\ninfra = { alias = [\"ops\"] }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("/c.toml:2:11: unknown field `alias`"), "{e}");
+        let e = parse("[tags.canonical]\ninfra = { description = \"a\\nb\" }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("/c.toml:2:9: a tag description must be one line"),
+            "{e}"
+        );
+        let e = parse("[tags.canonical]\ninfra = 3\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.starts_with("/c.toml:2:9: invalid type: integer `3`, expected a list of aliases"),
+            "{e}"
+        );
+    }
+
+    #[test]
     fn declared_tag_errors_have_positions() {
         let e = parse("strict_tags = true\n[tags.canonical]\n\"Web Dev\" = []\n")
             .unwrap_err()

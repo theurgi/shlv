@@ -35,6 +35,10 @@ let
     settings = {
       strict_tags = true;
       tags.canonical = {
+        infra = {
+          aliases = [ "ops" ];
+          description = "servers, deployment, Nix, CI";
+        };
         javascript = [
           "js"
           "ecmascript"
@@ -86,6 +90,10 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
     javascript = ["js", "ecmascript"]
     rust = []
 
+    [tags.canonical.infra]
+    aliases = ["ops"]
+    description = "servers, deployment, Nix, CI"
+
     [tags.rules]
     "docs.rs" = ["rust"]''}' "$(cat ${configOf full})"
   check "rendered empty list" '[tags.canonical]' "$(cat ${configOf emptyList})"
@@ -102,7 +110,7 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
   # The rule's quoted host survives rendering.
   check "rule suggestion" "3  https://docs.rs/serde  #rust (rule)" \
     "$(shlv add https://docs.rs/serde >/dev/null && shlv suggest ls)"
-  check "mirrored list" "$(printf 'javascript ecmascript js\nrust')" "$(shlv tag canonical export)"
+  check "mirrored list" "$(printf 'infra ops # servers, deployment, Nix, CI\njavascript ecmascript js\nrust')" "$(shlv tag canonical export)"
   check "alias merged" "1  https://example.com/a  #javascript" "$(shlv ls -t javascript)"
   if shlv add https://example.com/c -t nope 2>/dev/null; then
     echo "hm-module: strict_tags not applied" >&2

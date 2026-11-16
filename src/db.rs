@@ -11,6 +11,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/001-init.sql"),
     include_str!("../migrations/002-meta.sql"),
     include_str!("../migrations/003-suggestions.sql"),
+    include_str!("../migrations/004-tag-description.sql"),
 ];
 
 /// Resolves the database path: `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
