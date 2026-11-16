@@ -93,7 +93,7 @@
           ] "cargo fmt --check";
           oxfmt = lint "oxfmt" [ pkgs.oxfmt ] "oxfmt --check .";
           hm-module = import ./nix/hm-module-test.nix {
-            inherit lib pkgs;
+            inherit lib pkgs shlv-full;
             module = self.homeManagerModules.default;
           };
           nixfmt = lint "nixfmt" [ pkgs.nixfmt ] "nixfmt --check flake.nix nix/*.nix";

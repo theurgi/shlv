@@ -4,6 +4,8 @@
   lib,
   pkgs,
   module,
+  # Built with every feature, so `ai` and `provider` settings are parsed, not ignored.
+  shlv-full,
 }:
 let
   stubs = {
@@ -54,6 +56,19 @@ let
     settings.tags.canonical = { };
   };
   noSettings = eval { enable = true; };
+  # A provider whose key comes from a secret file (agenix-style); only the path is rendered.
+  secrets = eval {
+    enable = true;
+    package = shlv-full;
+    settings = {
+      ai.tag = "claude";
+      provider.claude = {
+        kind = "anthropic";
+        model = "claude-test";
+        api_key_file = "/run/agenix/anthropic";
+      };
+    };
+  };
   disabled = eval {
     enable = false;
     settings.strict_tags = true;
@@ -68,6 +83,7 @@ let
     "no config file without settings" = noSettings.xdg.configFile == { };
     "installs the package without settings" = noSettings.home.packages == [ shlv ];
     "does nothing when disabled" = disabled.home.packages == [ ] && disabled.xdg.configFile == { };
+    "installs the chosen package" = secrets.home.packages == [ shlv-full ];
   };
   failed = lib.attrNames (lib.filterAttrs (_: ok: !ok) assertions);
 in
@@ -114,6 +130,16 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
   check "alias merged" "1  https://example.com/a  #javascript" "$(shlv ls -t javascript)"
   if shlv add https://example.com/c -t nope 2>/dev/null; then
     echo "hm-module: strict_tags not applied" >&2
+    exit 1
+  fi
+
+  # With every feature built, the provider section is parsed; `config show` prints the key
+  # file's path.
+  ln -sf ${configOf secrets} $HOME/.config/shlv/config.toml
+  check "key file path" 'api_key_file = "/run/agenix/anthropic"' \
+    "$(${lib.getExe shlv-full} config show | grep api_key_file)"
+  if ${lib.getExe shlv-full} config show | grep -q ignored; then
+    echo "hm-module: shlv-full ignored the provider section" >&2
     exit 1
   fi
 

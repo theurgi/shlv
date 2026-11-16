@@ -42,6 +42,8 @@ fn config(server: &Server) -> ProviderConfig {
         model: "test-model".into(),
         base_url: Some(server.url("/v1")),
         api_key_env: None,
+        api_key_file: None,
+        effort: None,
         timeout: Some(5),
     }
 }
@@ -300,6 +302,8 @@ fn live_openai_compatible() {
         model,
         base_url: Some(url),
         api_key_env: std::env::var("SHLV_TEST_OPENAI_KEY_ENV").ok(),
+        api_key_file: None,
+        effort: None,
         timeout: Some(300),
     };
     let p = Provider::new("live", &c).unwrap();
@@ -338,6 +342,50 @@ fn config_show_prints_providers() {
     assert!(
         !out.contains("sk-secret") && !out.contains("ignored"),
         "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn api_keys_from_a_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("shlv-keyfile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("anthropic");
+    std::fs::write(&key, "sk-from-file\n").unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let s = scripted(vec![chat(r#"{"tags": []}"#)]);
+    let mut c = config(&s);
+    c.api_key_file = Some(key.display().to_string());
+    Provider::new("secret", &c)
+        .unwrap()
+        .choose_tags(&item(), &list())
+        .unwrap();
+    assert_eq!(
+        s.requests()[0].header("authorization"),
+        Some("Bearer sk-from-file")
+    );
+
+    c.api_key_file = Some(dir.join("missing").display().to_string());
+    let e = format!("{:#}", Provider::new("secret", &c).err().unwrap());
+    assert!(
+        e.starts_with(&format!(
+            "provider secret: cannot read api_key_file {}",
+            dir.join("missing").display()
+        )),
+        "{e}"
+    );
+    std::fs::write(&key, "\n").unwrap();
+    c.api_key_file = Some(key.display().to_string());
+    let e = format!("{:#}", Provider::new("secret", &c).err().unwrap());
+    assert!(e.ends_with("is empty"), "{e}");
+
+    c.api_key_env = Some("X".into());
+    let e = format!("{:#}", Provider::new("secret", &c).err().unwrap());
+    assert!(
+        e.contains("set `api_key_env` or `api_key_file`, not both"),
+        "{e}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

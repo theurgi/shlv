@@ -334,6 +334,24 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ai")]
+    #[test]
+    fn api_key_file_is_exclusive_and_shown_as_a_path() {
+        let p = "[provider.c]\nkind = \"anthropic\"\nmodel = \"m\"\n";
+        let c = parse(&format!("{p}api_key_file = \"/run/agenix/anthropic\"\n")).unwrap();
+        assert!(
+            c.to_toml()
+                .contains("api_key_file = \"/run/agenix/anthropic\"")
+        );
+        let e = parse(&format!("{p}api_key_file = \"/k\"\napi_key_env = \"K\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            e,
+            "/c.toml:1:1: [provider.c]: set `api_key_env` or `api_key_file`, not both"
+        );
+    }
+
     #[test]
     fn errors_name_file_and_line() {
         let e = parse("\n\nstrict_tag = true\n").unwrap_err().to_string();

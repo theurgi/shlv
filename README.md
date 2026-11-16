@@ -178,6 +178,22 @@ model = "qwen2.5-3b-instruct"
 # timeout = 120                  # seconds per reply
 ```
 
+The Claude API is `kind = "anthropic"`. The key comes from an environment variable or from a file
+that shlv reads only when it sends a request (an agenix or sops-nix secret, say; shlv trims the
+trailing newline and warns if every user can read the file). Set one of the two:
+
+```toml
+[provider.claude]
+kind = "anthropic"
+model = "claude-opus-5-5"
+effort = "low" # low, medium, high, xhigh, max: less thinking, fewer tokens
+api_key_env = "ANTHROPIC_API_KEY"
+# api_key_file = "/run/agenix/anthropic" # instead of api_key_env
+```
+
+Requests to Anthropic cache the instructions and the canonical tag list, so a bulk run pays full
+price for that prefix once. 429 and 529 responses are retried (honoring `retry-after`).
+
 **What is sent.** For each bookmark, a request to the provider's `base_url` with the bookmark's URL,
 title, note, and summary (when it has them), the page's extracted main text (up to 3000 words) when
 the task fetches the page, and for tagging the canonical tag list with aliases and descriptions.

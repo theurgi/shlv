@@ -5,12 +5,13 @@
 //! Servers that reject that get JSON mode (`{"type": "json_object"}`) with the schema in the
 //! prompt instead; once one rejects it, this provider stops trying for the rest of the run.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::{Llm, ProviderConfig, Request, error_message};
+use super::{Llm, ProviderConfig, Request, Usage, error_message};
 
 pub struct OpenAi {
     agent: ureq::Agent,
@@ -19,6 +20,7 @@ pub struct OpenAi {
     key: Option<String>,
     /// Cleared when the server rejects `json_schema`.
     schema_ok: AtomicBool,
+    usage: Mutex<Usage>,
 }
 
 impl OpenAi {
@@ -30,6 +32,7 @@ impl OpenAi {
             model: config.model.clone(),
             key,
             schema_ok: AtomicBool::new(true),
+            usage: Mutex::new(Usage::default()),
         }
     }
 
@@ -108,6 +111,15 @@ impl Llm for OpenAi {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| anyhow!("{} returned a response that isn't JSON: {e}", self.url))?;
+        if let Some(u) = v.get("usage") {
+            let n = |p: &str| u.pointer(p).and_then(Value::as_u64).unwrap_or(0);
+            let cached = n("/prompt_tokens_details/cached_tokens");
+            let mut usage = self.usage.lock().unwrap();
+            usage.requests += 1;
+            usage.input += n("/prompt_tokens").saturating_sub(cached);
+            usage.cache_read += cached;
+            usage.output += n("/completion_tokens");
+        }
         let choice = v
             .pointer("/choices/0")
             .ok_or_else(|| anyhow!("{} returned no choices", self.url))?;
@@ -122,6 +134,10 @@ impl Llm for OpenAi {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| anyhow!("{} returned no message content", self.url))
+    }
+
+    fn usage(&self) -> Usage {
+        *self.usage.lock().unwrap()
     }
 }
 

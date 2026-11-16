@@ -13,9 +13,11 @@
 //!   name the same provider and a bookmark needs both. It is an optimization; results go through
 //!   the same checks.
 
+pub mod anthropic;
 pub mod openai;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,9 +56,17 @@ pub struct ProviderConfig {
     /// The environment variable holding the API key; read only when the provider is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    /// A file holding the API key (an agenix or sops-nix secret, say); read only when the
+    /// provider is used. Exclusive with `api_key_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_file: Option<String>,
     /// Seconds to wait for one response (default 120; local models can be slow).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// `anthropic` only: `output_config.effort` (`low`, `medium`, `high`, `xhigh`, `max`). Lower
+    /// effort means less thinking and fewer tokens; tagging and short summaries need little.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -82,6 +92,19 @@ impl ProviderConfig {
                 "`base_url` must be an http or https URL, not {u:?}"
             ));
         }
+        if self.api_key_env.is_some() && self.api_key_file.is_some() {
+            return Err("set `api_key_env` or `api_key_file`, not both".into());
+        }
+        if let Some(e) = &self.effort {
+            if self.kind != Kind::Anthropic {
+                return Err("`effort` applies only to kind \"anthropic\"".into());
+            }
+            if !["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()) {
+                return Err(format!(
+                    "`effort` must be low, medium, high, xhigh, or max, not {e:?}"
+                ));
+            }
+        }
         if self.timeout == Some(0) {
             return Err("`timeout` must be at least 1 (seconds)".into());
         }
@@ -94,6 +117,9 @@ impl ProviderConfig {
 
     /// The API key, read now. `None` when no key is configured (local servers).
     pub fn api_key(&self) -> Result<Option<String>> {
+        if let Some(path) = &self.api_key_file {
+            return read_key_file(Path::new(path)).map(Some);
+        }
         let Some(var) = &self.api_key_env else {
             return Ok(None);
         };
@@ -102,6 +128,32 @@ impl ProviderConfig {
             _ => bail!("environment variable {var} (api_key_env) is not set"),
         }
     }
+}
+
+/// Reads a key file: surrounding whitespace (the trailing newline) is trimmed. Warns when other
+/// users can read it, as ssh does for private keys.
+fn read_key_file(path: &Path) -> Result<String> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read api_key_file {}", path.display()))?;
+    let key = text.trim();
+    if key.is_empty() {
+        bail!("api_key_file {} is empty", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = std::fs::metadata(path)
+            && m.permissions().mode() & 0o004 != 0
+        {
+            eprintln!(
+                "shlv: warning: api_key_file {} is readable by every user (mode {:o}); \
+                 chmod o-r it",
+                path.display(),
+                m.permissions().mode() & 0o777
+            );
+        }
+    }
+    Ok(key.to_string())
 }
 
 /// A task a provider does, for error messages.
@@ -135,9 +187,25 @@ pub struct Request {
     pub retry: Option<(String, String)>,
 }
 
+/// Tokens used so far, as the API reports them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub requests: u64,
+    /// Input tokens not read from the cache.
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
 /// A provider kind: sends a request, returns the model's reply text (JSON, unchecked).
 pub trait Llm: Send + Sync {
     fn complete(&self, req: &Request) -> Result<String>;
+
+    /// Tokens used by this transport so far.
+    fn usage(&self) -> Usage {
+        Usage::default()
+    }
 }
 
 /// A configured provider.
@@ -154,9 +222,13 @@ impl Provider {
         let key = config.api_key().with_context(at)?;
         let llm: Box<dyn Llm> = match config.kind {
             Kind::OpenaiCompatible => Box::new(openai::OpenAi::new(config, key)),
-            Kind::Anthropic => bail!(
-                "provider {name}: kind \"anthropic\" isn't built yet; use \"openai-compatible\""
-            ),
+            Kind::Anthropic => match key {
+                Some(key) => Box::new(anthropic::Anthropic::new(config, key)),
+                None => bail!(
+                    "provider {name}: kind \"anthropic\" needs an API key: set api_key_env or \
+                     api_key_file"
+                ),
+            },
         };
         Ok(Provider::with_llm(name, llm))
     }
@@ -171,6 +243,11 @@ impl Provider {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Tokens used by this provider so far.
+    pub fn usage(&self) -> Usage {
+        self.llm.usage()
     }
 
     /// A short summary of the bookmark.
