@@ -479,6 +479,9 @@ fn config_path_and_show() {
     assert_eq!(output(c).1, "/home/u/.config/shlv/config.toml\n");
 
     // Sections for features this build lacks are accepted and reported.
+    if cfg!(feature = "ai") {
+        return;
+    }
     std::fs::create_dir_all(&db.0).unwrap();
     std::fs::write(
         db.config(),

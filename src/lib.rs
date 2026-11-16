@@ -1,6 +1,9 @@
 //! shlv: a fast, resource-efficient bookmark store.
 
+#[cfg(feature = "ai")]
+pub mod ai;
 pub mod bulk;
+pub mod choose;
 pub mod config;
 pub mod db;
 #[cfg(feature = "fetch")]

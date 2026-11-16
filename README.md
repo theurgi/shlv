@@ -49,12 +49,13 @@ cargo install --git https://github.com/theurgi/shlv
 
 The default build is offline. Network features are Cargo features, off by default:
 
-| Feature | Adds                                                     |
-| ------- | -------------------------------------------------------- |
-| `fetch` | `add --fetch` and `shlv fetch`: page titles from the web |
+| Feature | Adds                                                                                |
+| ------- | ----------------------------------------------------------------------------------- |
+| `fetch` | `add --fetch` and `shlv fetch`: page titles from the web                            |
+| `ai`    | AI summaries and tag suggestions through a provider you configure (implies `fetch`) |
 
 The flake's `shlv-full` package has every feature (`nix run github:theurgi/shlv#shlv-full`). With
-Cargo, pass `--features fetch` (or `--all-features`).
+Cargo, pass `--features fetch,ai` (or `--all-features`).
 
 ## Usage
 
@@ -157,6 +158,35 @@ suggestion isn't offered again for that bookmark, and neither is a rule's tag th
 `edit`. To apply suggestions without review, set `suggestions = "auto"` under `[tags]`. Rule hosts
 and tags must be normalized, like declared names (`github.com`, not `GitHub.com` or a URL). Later
 tagging layers (a local model and an LLM, both opt-in) will add their suggestions to the same list.
+
+### AI providers
+
+With the `ai` feature, an LLM can write summaries and suggest tags. AI is off until you configure
+it: there is no default provider or model. Each task names a provider, so tagging can stay local
+while summaries go elsewhere:
+
+```toml
+[ai]
+summarize = "local" # a [provider.*] name; leave a task out to turn it off
+tag = "local"
+
+[provider.local]
+kind = "openai-compatible" # llama.cpp, Ollama, vLLM, LM Studio, and hosted APIs that speak it
+base_url = "http://localhost:8080/v1"
+model = "qwen2.5-3b-instruct"
+# api_key_env = "OPENAI_API_KEY" # the variable holding the key; never the key itself
+# timeout = 120                  # seconds per reply
+```
+
+**What is sent.** For each bookmark, a request to the provider's `base_url` with the bookmark's URL,
+title, note, and summary (when it has them), the page's extracted main text (up to 3000 words) when
+the task fetches the page, and for tagging the canonical tag list with aliases and descriptions.
+Nothing else from the database, and nothing at all unless `[ai]` names a provider. The API key is
+read from the named environment variable only when a request is made.
+
+Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped, and
+empty or overlong summaries are rejected. If a server doesn't support JSON-schema output, shlv falls
+back to JSON mode with the schema in the prompt.
 
 ## Performance
 

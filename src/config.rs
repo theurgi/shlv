@@ -5,8 +5,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(feature = "ai")]
+use std::collections::BTreeMap;
+
+#[cfg(not(feature = "ai"))]
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "ai")]
+use toml::Spanned;
 
 use crate::suggest::{DomainRules, SuggestMode};
 use crate::tag::DeclaredTags;
@@ -21,10 +27,20 @@ pub struct Config {
     pub strict_tags: bool,
     #[serde(default, skip_serializing_if = "Tags::is_empty")]
     pub tags: Tags,
-    /// Sections for features this build doesn't have yet. They're accepted, unchecked, so one
-    /// config works across builds.
+    /// Which provider does which AI task.
+    #[cfg(feature = "ai")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai: Option<crate::ai::AiConfig>,
+    /// AI providers by name.
+    #[cfg(feature = "ai")]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider: BTreeMap<String, Spanned<crate::ai::ProviderConfig>>,
+    /// Without the `ai` feature, its sections are accepted unchecked, so one config works
+    /// across builds.
+    #[cfg(not(feature = "ai"))]
     #[serde(default, skip_serializing)]
     ai: Option<IgnoredAny>,
+    #[cfg(not(feature = "ai"))]
     #[serde(default, skip_serializing)]
     provider: Option<IgnoredAny>,
 }
@@ -83,6 +99,10 @@ impl Config {
         if let Some((host, msg)) = config.undeclared_rule_tag() {
             return Err(at(config.tags.rules.span(host).map(|s| s.start), &msg));
         }
+        #[cfg(feature = "ai")]
+        if let Some((pos, msg)) = config.bad_ai() {
+            return Err(at(Some(pos), &msg));
+        }
         Ok(config)
     }
 
@@ -116,14 +136,46 @@ impl Config {
 
     /// Sections present in the file that this build ignores.
     pub fn ignored_sections(&self) -> Vec<&'static str> {
-        let mut v = Vec::new();
-        if self.ai.is_some() {
-            v.push("ai");
+        #[cfg(not(feature = "ai"))]
+        {
+            let mut v = Vec::new();
+            if self.ai.is_some() {
+                v.push("ai");
+            }
+            if self.provider.is_some() {
+                v.push("provider");
+            }
+            v
         }
-        if self.provider.is_some() {
-            v.push("provider");
+        #[cfg(feature = "ai")]
+        Vec::new()
+    }
+
+    /// A provider section that breaks its kind's rules, or an `[ai]` task naming a provider
+    /// that doesn't exist: the byte offset to report and the message.
+    #[cfg(feature = "ai")]
+    fn bad_ai(&self) -> Option<(usize, String)> {
+        for (name, p) in &self.provider {
+            if let Err(e) = p.get_ref().check() {
+                return Some((p.span().start, format!("[provider.{name}]: {e}")));
+            }
         }
-        v
+        let ai = self.ai.as_ref()?;
+        [("summarize", &ai.summarize), ("tag", &ai.tag)]
+            .into_iter()
+            .find_map(|(task, name)| {
+                let name = name.as_ref()?;
+                (!self.provider.contains_key(name.get_ref())).then(|| {
+                    (
+                        name.span().start,
+                        format!(
+                            "[ai] {task} = {:?}: no such provider; define [provider.{}]",
+                            name.get_ref(),
+                            name.get_ref()
+                        ),
+                    )
+                })
+            })
     }
 }
 
@@ -200,6 +252,7 @@ mod tests {
         assert!(parse("strict_tags = true").unwrap().strict_tags);
     }
 
+    #[cfg(not(feature = "ai"))]
     #[test]
     fn ignores_unbuilt_sections() {
         let c = parse(
@@ -209,6 +262,76 @@ mod tests {
         assert!(c.strict_tags);
         assert_eq!(c.ignored_sections(), ["ai", "provider"]);
         assert_eq!(c.to_toml(), "strict_tags = true\n");
+    }
+
+    #[cfg(feature = "ai")]
+    #[test]
+    fn parses_ai_providers() {
+        let text = "[ai]\nsummarize = \"claude\"\ntag = \"local\"\n\n\
+                    [provider.local]\nkind = \"openai-compatible\"\n\
+                    base_url = \"http://localhost:11434/v1\"\nmodel = \"qwen\"\n\n\
+                    [provider.claude]\nkind = \"anthropic\"\nmodel = \"m\"\n\
+                    api_key_env = \"ANTHROPIC_API_KEY\"\ntimeout = 30\n";
+        let c = parse(text).unwrap();
+        assert!(c.ignored_sections().is_empty());
+        let ai = c.ai.as_ref().unwrap();
+        assert_eq!(ai.tag.as_ref().unwrap().get_ref(), "local");
+        let local = c.provider["local"].get_ref();
+        assert_eq!(local.kind, crate::ai::Kind::OpenaiCompatible);
+        assert_eq!(local.api_key_env, None);
+        assert_eq!(c.provider["claude"].get_ref().timeout().as_secs(), 30);
+        // `config show` prints providers (by name, sorted) and reads back.
+        let shown = c.to_toml();
+        assert!(
+            shown.contains("[provider.claude]\nkind = \"anthropic\""),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("api_key_env = \"ANTHROPIC_API_KEY\""),
+            "{shown}"
+        );
+        parse(&shown).unwrap();
+        // AI stays off until configured.
+        assert!(parse("").unwrap().ai.is_none());
+    }
+
+    #[cfg(feature = "ai")]
+    #[test]
+    fn ai_errors_have_positions() {
+        let local = "[provider.local]\nkind = \"openai-compatible\"\nbase_url = \"http://h/v1\"\n\
+                     model = \"m\"\n";
+        let e = |t: &str| parse(t).unwrap_err().to_string();
+        let err = e(&format!("[ai]\ntag = \"locl\"\n{local}"));
+        assert!(
+            err.starts_with(
+                "/c.toml:2:7: [ai] tag = \"locl\": no such provider; define [provider.locl]"
+            ),
+            "{err}"
+        );
+        let err = e(&format!("{local}api_key = \"sk-x\"\n"));
+        assert!(
+            err.starts_with("/c.toml:5:1: unknown field `api_key`"),
+            "{err}"
+        );
+        let err = e("[provider.x]\nkind = \"openai\"\nmodel = \"m\"\n");
+        assert!(
+            err.starts_with("/c.toml:2:8: unknown variant `openai`"),
+            "{err}"
+        );
+        let err = e("[provider.x]\nkind = \"anthropic\"\n");
+        assert!(err.contains("missing field `model`"), "{err}");
+        let err = e("[provider.x]\nkind = \"openai-compatible\"\nmodel = \"m\"\n");
+        assert!(
+            err.starts_with(
+                "/c.toml:1:1: [provider.x]: kind \"openai-compatible\" needs `base_url`"
+            ),
+            "{err}"
+        );
+        let err = e("[ai]\nmodel = \"x\"\n");
+        assert!(
+            err.starts_with("/c.toml:2:1: unknown field `model`"),
+            "{err}"
+        );
     }
 
     #[test]

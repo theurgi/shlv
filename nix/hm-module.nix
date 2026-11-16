@@ -60,10 +60,17 @@ in
         - `tags.suggestions`: `"confirm"` (the default) keeps suggestions for review with
           `shlv suggest ls|accept|reject`; `"auto"` applies them at once.
 
+        - `ai` and `provider` (builds with the `ai` feature, such as `shlv-full`): `ai.summarize`
+          and `ai.tag` name a `provider.<name>` with `kind` (`"openai-compatible"` or
+          `"anthropic"`), `model`, `base_url`, `api_key_env`, and `timeout`. AI is off until
+          `ai` names a provider. For each bookmark it processes, shlv sends the provider its URL,
+          title, note, summary, and extracted page text, and for tagging the canonical tag list.
+          Nothing is sent unless a provider is configured.
+
         Secrets must not go here: everything in `settings` ends up in the world-readable Nix
-        store. AI providers (a later feature) name the environment variable holding their key
-        instead, as in `provider.claude.api_key_env = "ANTHROPIC_API_KEY"`. A file-path option
-        for agenix or sops-nix secrets is planned.
+        store. Providers name the environment variable holding their key instead, as in
+        `provider.claude.api_key_env = "ANTHROPIC_API_KEY"`. A file-path option for agenix or
+        sops-nix secrets is planned.
       '';
     };
   };

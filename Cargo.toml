@@ -33,6 +33,9 @@ ureq = { version = "3.5.2", default-features = false, features = ["rustls"], opt
 [features]
 # Network access: `add --fetch` and `shlv fetch`. Off by default; the core stays offline.
 fetch = ["dep:ureq"]
+# AI summaries and tag suggestions through a configured provider. Implies fetch: summaries need
+# page text, and both use the same HTTP client.
+ai = ["fetch"]
 
 [profile.release]
 lto = true
