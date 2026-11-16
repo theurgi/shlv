@@ -125,6 +125,8 @@ pub(crate) fn non_empty(s: &Option<String>) -> Option<&str> {
 pub struct Store {
     pub(crate) conn: Connection,
     strict_tags: bool,
+    /// The declared list, once [`Store::pin`] has synced it.
+    pub(crate) pinned: Option<crate::tag::DeclaredTags>,
     pub(crate) rules: DomainRules,
     pub(crate) suggest_mode: SuggestMode,
 }
@@ -148,6 +150,7 @@ impl Store {
         Store {
             conn,
             strict_tags: false,
+            pinned: None,
             rules: DomainRules::default(),
             suggest_mode: SuggestMode::default(),
         }

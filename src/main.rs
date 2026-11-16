@@ -6,11 +6,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use shlv::config::{self, Config};
 use shlv::store::normalize_tag;
-use shlv::tag::{format_canonical, parse_canonical};
+use shlv::tag::{format_canonical, format_canonical_nix, format_canonical_toml, parse_canonical};
 use shlv::{
-    Bookmark, DeclaredTags, Edit, Format, ImportOptions, ListQuery, NewBookmark,
-    NonCanonicalRuleTags, NonCanonicalTags, RuleStats, Store, SuggestMode, Suggestion, TagInfo,
-    TagSort,
+    Bookmark, Edit, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalRuleTags,
+    NonCanonicalTags, Pinned, RuleStats, Store, SuggestMode, Suggestion, TagInfo, TagSort,
 };
 use shlv::{netscape, transfer};
 
@@ -294,8 +293,15 @@ enum CanonicalCmd {
     Ls,
     /// Add tags and aliases from a file ("-" for stdin): one tag per line, aliases after it
     Import { file: PathBuf },
-    /// Print the canonical list in the format import reads
-    Export,
+    /// Print the canonical list in the format import reads, or in the config's shape
+    Export {
+        /// As a [tags.canonical] TOML table; # pinned marks tags the config declares
+        #[arg(long, conflicts_with = "nix")]
+        toml: bool,
+        /// As the home-manager module's settings.tags.canonical; # pinned marks declared tags
+        #[arg(long)]
+        nix: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -338,25 +344,25 @@ fn run(cli: Cli) -> Result<ExitCode> {
     }
     let mut store = Store::open_default()?;
     // Every command that opens the database reads the config: a declared canonical list has to
-    // be mirrored before anything reads or writes tags.
+    // be synced and pinned before anything reads or writes tags.
     let config_path = config::default_path()?;
-    let config = Config::load(&config_path)?;
+    let mut config = Config::load(&config_path)?;
     store.set_strict_tags(config.strict_tags);
     store.set_suggest_mode(config.tags.suggestions);
     store.set_rules(config.tags.rules.clone());
-    let declared = config.tags.canonical.as_ref().map(|tags| Declared {
-        tags,
-        path: &config_path,
-    });
-    if let Some(d) = &declared {
-        let stats = store
-            .sync_declared(d.tags)
-            .with_context(|| format!("cannot apply [tags.canonical] from {}", d.path.display()))?;
+    // The store keeps the declared list; nothing else reads it from `config`.
+    if let Some(tags) = config.tags.canonical.take() {
+        let stats = store.pin(tags).with_context(|| {
+            format!(
+                "cannot apply [tags.canonical] from {}",
+                config_path.display()
+            )
+        })?;
         for (from, into, n) in stats.iter().flat_map(|s| &s.merged) {
             let n = plural(*n, "bookmark");
             eprintln!(
                 "shlv: merged tag {from} into {into} ({n}): {} declares it an alias",
-                d.path.display()
+                config_path.display()
             );
         }
     }
@@ -391,7 +397,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     note,
                     tags,
                 })
-                .map_err(|e| declared_hint(rules_hint(e, &config_path), declared.as_ref()))?;
+                .map_err(|e| rules_hint(e, &config_path))?;
             let b = store.get(added.id)?.context("bookmark vanished")?;
             let verb = if added.created { "added" } else { "updated" };
             write!(out, "{verb} ")?;
@@ -474,9 +480,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             {
                 bail!("nothing to change; pass --title, --note, or -t");
             }
-            let edited = store
-                .edit(id, &edit)
-                .map_err(|e| declared_hint(e, declared.as_ref()))?;
+            let edited = store.edit(id, &edit)?;
             if !edited {
                 bail!("no bookmark with id {id}");
             }
@@ -534,19 +538,14 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 skip_rules: no_rules,
             };
             let s = store.import(&items, opts).map_err(|e| {
-                match (e.downcast_ref::<NonCanonicalTags>(), &declared) {
-                    (Some(bad), d) => {
-                        let fix = match d {
-                            Some(d) => format!("declare them in {}", d.path.display()),
-                            None => "make them canonical (`shlv tag canonical add`)".into(),
-                        };
-                        anyhow!(
-                            "nothing imported: {name} has tags that aren't canonical \
-                             (strict_tags is on): {}\n\
-                             hint: pass --drop-unknown-tags to import without them, or {fix}",
-                            bad.0.join(" ")
-                        )
-                    }
+                match e.downcast_ref::<NonCanonicalTags>() {
+                    Some(bad) => anyhow!(
+                        "nothing imported: {name} has tags that aren't canonical \
+                         (strict_tags is on): {}\n\
+                         hint: pass --drop-unknown-tags to import without them, or make them \
+                         canonical (`shlv tag canonical add`)",
+                        bad.0.join(" ")
+                    ),
                     _ if let Some(bad) = e.downcast_ref::<NonCanonicalRuleTags>() => anyhow!(
                         "nothing imported: {}: {bad}\n\
                          hint: make the tags canonical, change the rules, or pass --no-rules",
@@ -582,7 +581,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 netscape::write_footer(&mut out)?;
             }
         },
-        Cmd::Tag { cmd } => run_tag(&mut store, cmd, declared.as_ref(), &mut out, &style)?,
+        Cmd::Tag { cmd } => {
+            run_tag(&mut store, cmd, &mut out, &style).map_err(|e| pinned_hint(e, &config_path))?
+        }
         Cmd::Suggest {
             cmd: None,
             ids,
@@ -664,9 +665,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             out.flush()?;
             return Ok(code);
         }
-        Cmd::Suggest { cmd: Some(cmd), .. } => {
-            run_suggest(&mut store, cmd, declared.as_ref(), &mut out, &style)?
-        }
+        Cmd::Suggest { cmd: Some(cmd), .. } => run_suggest(&mut store, cmd, &mut out, &style)?,
         #[cfg(feature = "fetch")]
         Cmd::Fetch {
             ids,
@@ -842,46 +841,12 @@ fn run_config(cmd: ConfigCmd, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-/// A canonical list declared in config, and the file that declares it.
-struct Declared<'a> {
-    tags: &'a DeclaredTags,
-    path: &'a Path,
-}
-
-impl Declared<'_> {
-    /// The error for a command that would edit the declared list.
-    fn refuse(&self, what: &str) -> anyhow::Error {
-        anyhow!(
-            "{what}: the canonical tag list is declared in {} ([tags.canonical]); edit it there",
-            self.path.display()
-        )
+/// Names the config file when an edit would undo the declared list.
+fn pinned_hint(e: anyhow::Error, config: &Path) -> anyhow::Error {
+    if e.downcast_ref::<Pinned>().is_none() {
+        return e;
     }
-
-    /// Refuses `rename`/`merge` when `name` is a declared tag or alias.
-    fn check(&self, cmd: &str, name: &str) -> Result<()> {
-        let name = normalize_tag(name);
-        match self.tags.resolve(&name) {
-            Some(t) if t == name => Err(self.refuse(&format!("cannot {cmd} declared tag {name}"))),
-            Some(t) => Err(self.refuse(&format!(
-                "cannot {cmd} {name}, an alias of declared tag {t}"
-            ))),
-            None => Ok(()),
-        }
-    }
-}
-
-/// Replaces strict mode's hint (which suggests `tag canonical add`) when the list is declared.
-fn declared_hint(e: anyhow::Error, declared: Option<&Declared>) -> anyhow::Error {
-    match (e.downcast_ref::<NonCanonicalTags>(), declared) {
-        (Some(bad), Some(d)) => anyhow!(
-            "not canonical (strict_tags is on): {}\n\
-             hint: use a canonical tag (`shlv tag canonical ls`), or declare these in {} \
-             ([tags.canonical])",
-            bad.0.join(" "),
-            d.path.display()
-        ),
-        _ => e,
-    }
+    anyhow!("{e:#}\nhint: change it in {}", config.display())
 }
 
 /// One line on what the domain rules did, for `suggest` and `import`.
@@ -934,7 +899,6 @@ fn rules_hint(e: anyhow::Error, config: &Path) -> anyhow::Error {
 fn run_suggest(
     store: &mut Store,
     cmd: SuggestCmd,
-    declared: Option<&Declared>,
     out: &mut impl Write,
     style: &Style,
 ) -> Result<()> {
@@ -964,7 +928,7 @@ fn run_suggest(
             }
         }
         SuggestCmd::Accept { all: true, .. } => {
-            let (bookmarks, tags) = store.accept_all().map_err(|e| declared_hint(e, declared))?;
+            let (bookmarks, tags) = store.accept_all()?;
             writeln!(
                 out,
                 "accepted {} on {}",
@@ -976,9 +940,7 @@ fn run_suggest(
             id: Some(id), tags, ..
         } => {
             get(store, id)?;
-            let accepted = store
-                .accept(id, &tags)
-                .map_err(|e| declared_hint(e, declared))?;
+            let accepted = store.accept(id, &tags)?;
             write!(out, "accepted {}; now ", accepted.join(" "))?;
             print_line(out, &get(store, id)?, 0, style)?;
         }
@@ -1032,30 +994,7 @@ fn print_suggested(out: &mut impl Write, group: &[Suggestion], s: &Style) -> io:
     Ok(())
 }
 
-fn run_tag(
-    store: &mut Store,
-    cmd: TagCmd,
-    declared: Option<&Declared>,
-    out: &mut impl Write,
-    style: &Style,
-) -> Result<()> {
-    if let Some(d) = declared {
-        match &cmd {
-            TagCmd::Alias { .. } => return Err(d.refuse("cannot change aliases")),
-            TagCmd::Describe { .. } => return Err(d.refuse("cannot change descriptions")),
-            TagCmd::Canonical {
-                cmd:
-                    CanonicalCmd::Add { .. } | CanonicalCmd::Rm { .. } | CanonicalCmd::Import { .. },
-            } => return Err(d.refuse("cannot change canonical tags")),
-            TagCmd::Rename { old, .. } => d.check("rename", old)?,
-            // Merging into a declared tag would give it an alias the config doesn't list.
-            TagCmd::Merge { from, into } => {
-                d.check("merge", from)?;
-                d.check("merge into", into)?;
-            }
-            _ => {}
-        }
-    }
+fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) -> Result<()> {
     match cmd {
         TagCmd::Ls { sort, json } => {
             let sort = match sort {
@@ -1152,8 +1091,16 @@ fn run_tag(
                 }
                 writeln!(out)?;
             }
-            CanonicalCmd::Export => {
-                out.write_all(format_canonical(&store.canonical_tags()?).as_bytes())?
+            CanonicalCmd::Export { toml, nix } => {
+                let tags = store.canonical_tags()?;
+                let text = if toml {
+                    format_canonical_toml(&tags, store.pinned())
+                } else if nix {
+                    format_canonical_nix(&tags, store.pinned())
+                } else {
+                    format_canonical(&tags)
+                };
+                out.write_all(text.as_bytes())?
             }
         },
     }

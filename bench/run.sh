@@ -81,9 +81,9 @@ bench_add https://bench.example/a "" "$data/add-$count.md"
 SHLV_CONFIG=$config bench_add https://bench.example/b ", strict config" "$data/add-strict-$count.md"
 
 # A declared canonical list: the database's tags plus synthetic ones, two aliases each (200 tags,
-# 400 aliases). The first run mirrors it into the database; later runs only compare its hash. A
-# manual tag edit clears the stored hash, which forces a resync that has little to do. Compare with
-# `ls` in the read benchmarks.
+# 400 aliases). The first run syncs it into the database; later runs only compare its hash. A
+# tag edit made without the list in config clears the stored hash, which forces a resync that has
+# little to do. Compare with `ls` in the read benchmarks.
 declared=$work/declared.toml
 {
   echo "[tags.canonical]"

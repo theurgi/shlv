@@ -8,11 +8,9 @@ errors.
 # Reject tags in add and edit that aren't canonical or an alias of a canonical tag.
 strict_tags = true
 
-# Declare the canonical list: each tag with its aliases, or a table that adds a one-line
-# description of what belongs under the tag (tag suggestions match against it). When this table is
-# present, even empty, the config is the source of truth: the database mirrors it on startup, and
-# `tag canonical add|rm|import`, `tag alias`, `tag describe`, and renaming or merging declared tags
-# are refused.
+# Pin a base for the canonical list: each tag with its aliases, or a table that adds a one-line
+# description of what belongs under the tag (tag suggestions match against it). The list itself
+# lives in the database; shlv adds these to it on startup and keeps them there.
 [tags.canonical]
 javascript = ["js", "ecmascript"]
 rust = []
@@ -25,14 +23,28 @@ infra = { aliases = ["ops"], description = "servers, deployment, Nix, CI" }
 "docs.rs" = ["rust"]
 ```
 
-Declared names must already be normalized (`web-dev`, not `Web Dev`). Mirroring marks declared tags
-canonical, points their aliases at them, and unmarks canonical tags that aren't listed; bookmarks
-keep their tags. A declared alias that is a tag in the database is merged into its declared tag.
-Mirroring is skipped while the list is unchanged.
+The canonical list lives in the database, so `tag canonical add|rm|import`, `tag alias`,
+`tag describe`, `tag rename`, and `tag merge` edit it without touching the config. A declared list
+is a pinned base on top:
 
-Without a declared list, `tag describe TAG TEXT` sets a description (`""` clears it). `tag ls` shows
-descriptions after `#`, and `tag canonical export` writes them the same way
-(`infra ops # servers, deployment, Nix, CI`), so `tag canonical import` reads them back.
+- On startup, declared tags become canonical, their aliases point at them, and declared descriptions
+  are set. A declared alias that is a tag in the database is merged into its declared tag. This is
+  skipped while the list is unchanged.
+- Syncing only adds. Tags, aliases, and descriptions added in shlv stay, including new aliases of
+  pinned tags and tags merged into them. A tag, alias, or description dropped from the config stays
+  in the database, no longer pinned; remove it with `tag canonical rm` or `tag alias --rm` if you
+  want it gone.
+- What the config pins can't be undone in shlv: renaming, merging away, or unmarking a pinned tag,
+  removing a declared alias, and changing a declared description are refused with a pointer to the
+  config file. A pinned tag declared without a description can be described in shlv.
+
+Declared names must already be normalized (`web-dev`, not `Web Dev`).
+
+`tag describe TAG TEXT` sets a description (`""` clears it). `tag ls` shows descriptions after `#`,
+and `tag canonical export` writes them the same way (`infra ops # servers, deployment, Nix, CI`), so
+`tag canonical import` reads them back. To move tags added in shlv into the config,
+`tag canonical export --toml` (or `--nix`, for the home-manager module) prints the list in the
+config's shape, with `# pinned` after the tags the config already declares.
 
 `add` and `import` record the tags of matching rules as pending suggestions, and
 `suggest ID...|--all` runs the rules on bookmarks you already have. Review them with `suggest ls`,

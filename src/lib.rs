@@ -28,7 +28,7 @@ pub use suggest::{
     DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source, SuggestMode, Suggestion,
 };
 pub use tag::{
-    CanonicalEntry, DeclaredEntry, DeclaredTags, ImportStats, NonCanonicalTags, Retagged,
+    CanonicalEntry, DeclaredEntry, DeclaredTags, ImportStats, NonCanonicalTags, Pinned, Retagged,
     SyncStats, TagInfo, TagSort,
 };
 pub use transfer::{Format, ImportItem, ImportOptions, ImportSummary};

@@ -1,10 +1,11 @@
 //! Tag management through the library: list, rename, merge, aliases, canonical list.
 
-use shlv::tag::{format_canonical, parse_canonical};
+use shlv::tag::{format_canonical, format_canonical_nix, format_canonical_toml, parse_canonical};
 use std::collections::BTreeMap;
 
 use shlv::{
-    CanonicalEntry, DeclaredEntry, DeclaredTags, NewBookmark, Store, SyncStats, TagInfo, TagSort,
+    CanonicalEntry, DeclaredEntry, DeclaredTags, NewBookmark, Pinned, Store, SyncStats, TagInfo,
+    TagSort,
 };
 
 fn store() -> Store {
@@ -470,12 +471,14 @@ fn canonical(s: &Store) -> String {
 }
 
 #[test]
-fn sync_mirrors_declared_list() {
+fn sync_adds_declared_list() {
     let mut s = store();
     let a = add(&mut s, "a.com", &["rust", "js", "misc"]);
     s.add_canonical(&strings(&["misc"])).unwrap();
-    // An alias of an undeclared tag, as `tag merge` leaves; it must survive.
+    // An alias of an undeclared tag, as `tag merge` leaves, and one of a declared tag added in
+    // shlv; both survive.
     s.add_alias("miscellaneous", "misc").unwrap();
+    s.add_alias("rust-lang", "rust").unwrap();
 
     let d = declared(&[
         ("javascript", &["js", "ecmascript"]),
@@ -488,7 +491,6 @@ fn sync_mirrors_declared_list() {
         stats,
         SyncStats {
             marked: 3,
-            unmarked: 1,
             aliases_added: 2,
             aliases_removed: 0,
             described: 0,
@@ -497,11 +499,11 @@ fn sync_mirrors_declared_list() {
     );
     assert_eq!(
         canonical(&s),
-        "javascript ecmascript js\nrust\nzig ziglang\n"
+        "javascript ecmascript js\nmisc miscellaneous\nrust rust-lang\nzig ziglang\n"
     );
-    // `misc` is unmarked but keeps its bookmark and its alias.
+    // `misc` stays canonical, with its bookmark and its alias.
     let misc = tag(&s, "misc");
-    assert!(!misc.canonical && misc.count == 1);
+    assert!(misc.canonical && misc.count == 1);
     assert_eq!(misc.aliases, ["miscellaneous"]);
     // The live tag `js` was declared an alias, so it was merged.
     assert_eq!(tags_of(&s, a), ["javascript", "misc", "rust"]);
@@ -529,14 +531,16 @@ fn sync_skips_unchanged_list_without_writing() {
     );
     assert_eq!(s.conn().total_changes(), before);
 
-    // An empty list is still a declared list: it unmarks everything.
-    let stats = s.sync_declared(&declared(&[])).unwrap().unwrap();
-    assert_eq!(stats.unmarked, 2);
-    assert_eq!(canonical(&s), "");
+    // An empty list pins nothing and removes nothing.
+    assert_eq!(
+        s.sync_declared(&declared(&[])).unwrap(),
+        Some(SyncStats::default())
+    );
+    assert_eq!(canonical(&s), "go golang\nrust rs\n");
 }
 
 #[test]
-fn sync_removing_a_tag_unmarks_it_and_drops_undeclared_aliases() {
+fn sync_dropping_a_tag_or_alias_keeps_it() {
     let mut s = store();
     let a = add(&mut s, "a.com", &["rust", "go"]);
     s.sync_declared(&declared(&[
@@ -549,13 +553,14 @@ fn sync_removing_a_tag_unmarks_it_and_drops_undeclared_aliases() {
         .sync_declared(&declared(&[("rust", &["rs"])]))
         .unwrap()
         .unwrap();
-    assert_eq!((stats.unmarked, stats.aliases_removed), (1, 1));
-    assert_eq!(canonical(&s), "rust rs\n");
-    let go = tag(&s, "go");
-    assert!(!go.canonical);
-    // Aliases of a tag that's no longer declared are its own business now.
-    assert_eq!(go.aliases, ["golang"]);
+    assert_eq!(stats, SyncStats::default());
+    // `go` and `rust-lang` are no longer pinned, but stay; removing them is a manual edit now.
+    assert_eq!(canonical(&s), "go golang\nrust rs rust-lang\n");
     assert_eq!(tags_of(&s, a), ["go", "rust"]);
+    s.pin(declared(&[("rust", &["rs"])])).unwrap();
+    s.remove_canonical(&strings(&["go"])).unwrap();
+    s.remove_alias("rust-lang").unwrap();
+    assert_eq!(canonical(&s), "rust rs\n");
 }
 
 #[test]
@@ -707,9 +712,9 @@ fn declared_descriptions_sync() {
     assert_ne!(d1.hash(), d2.hash());
     assert_eq!(s.sync_declared(&d2).unwrap().unwrap().described, 1);
     assert!(s.sync_declared(&d2).unwrap().is_none());
-    // Dropping it from config clears it.
-    assert_eq!(s.sync_declared(&list(None)).unwrap().unwrap().described, 1);
-    assert_eq!(canonical(&s), "infra ops\nrust\n");
+    // Dropping it from config keeps it, unpinned.
+    assert_eq!(s.sync_declared(&list(None)).unwrap().unwrap().described, 0);
+    assert_eq!(canonical(&s), "infra ops # servers, deployment, CI\nrust\n");
     assert!(
         DeclaredTags::new(BTreeMap::from([(
             "rust".to_string(),
@@ -718,4 +723,149 @@ fn declared_descriptions_sync() {
         .unwrap_err()
         .contains("\"rust\": a tag description must be one line")
     );
+}
+
+fn pinned(r: anyhow::Result<impl std::fmt::Debug>) -> String {
+    let e = r.unwrap_err();
+    e.downcast_ref::<Pinned>()
+        .unwrap_or_else(|| panic!("not a Pinned error: {e:#}"))
+        .0
+        .clone()
+}
+
+#[test]
+fn pinned_list_refuses_undoing_it_and_allows_the_rest() {
+    let entry = |aliases: &[&str], d: Option<&str>| DeclaredEntry {
+        aliases: strings(aliases),
+        description: d.map(str::to_string),
+    };
+    let d = DeclaredTags::new(BTreeMap::from([
+        ("infra".to_string(), entry(&["ops"], Some("servers, CI"))),
+        ("rust".to_string(), entry(&["rs"], None)),
+    ]))
+    .unwrap();
+    let mut s = store();
+    let a = add(&mut s, "a.com", &["rust", "oxide", "old"]);
+    assert!(s.pin(d.clone()).unwrap().is_some());
+    assert_eq!(s.pinned(), Some(&d));
+
+    assert_eq!(
+        pinned(s.rename_tag("Rust", "rust-lang")),
+        "cannot rename pinned tag rust"
+    );
+    assert_eq!(
+        pinned(s.merge_tags("rust", "old")),
+        "cannot merge away pinned tag rust"
+    );
+    assert_eq!(
+        pinned(s.remove_canonical(&strings(&["old", "infra"]))),
+        "cannot unmark pinned tag infra"
+    );
+    assert_eq!(
+        pinned(s.remove_alias("ops")),
+        "cannot remove alias ops of pinned tag infra"
+    );
+    assert_eq!(
+        pinned(s.describe_tag("infra", "servers")),
+        "cannot change the description of pinned tag infra"
+    );
+    assert_eq!(
+        pinned(s.describe_tag("infra", "")),
+        "cannot change the description of pinned tag infra"
+    );
+    let e = s
+        .import_canonical(&parse_canonical("go\ninfra # servers\n"))
+        .unwrap_err();
+    assert_eq!(
+        format!("{e:#}"),
+        "line 2: cannot change the description of pinned tag infra: it is pinned by \
+         [tags.canonical] in the config"
+    );
+    assert!(e.downcast_ref::<Pinned>().is_some());
+    // Refused edits change nothing.
+    assert_eq!(canonical(&s), "infra ops # servers, CI\nrust rs\n");
+
+    // Everything else works: other tags, new aliases of pinned tags, merges into pinned tags,
+    // and a description for a pinned tag declared without one.
+    s.add_canonical(&strings(&["go"])).unwrap();
+    s.add_alias("golang", "go").unwrap();
+    s.add_alias("rust-lang", "rust").unwrap();
+    assert_eq!(
+        s.describe_tag("infra", "servers, CI").unwrap(),
+        ("infra".into(), false)
+    );
+    s.describe_tag("rust", "the language").unwrap();
+    s.merge_tags("oxide", "rs").unwrap();
+    s.rename_tag("old", "older").unwrap();
+    s.import_canonical(&parse_canonical(
+        "zig ziglang # the other one\ninfra devops # servers, CI\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        canonical(&s),
+        "go golang\ninfra devops ops # servers, CI\n\
+         rust oxide rs rust-lang # the language\nzig ziglang # the other one\n"
+    );
+    assert_eq!(tags_of(&s, a), ["older", "rust"]);
+    s.remove_alias("rust-lang").unwrap();
+    s.remove_canonical(&strings(&["go"])).unwrap();
+
+    // None of that invalidates the pinned list, so the next start skips the sync.
+    assert_eq!(s.sync_declared(&d).unwrap(), None);
+    // And none of it is undone by a resync.
+    s.conn()
+        .execute("DELETE FROM meta WHERE key = 'canonical_hash'", [])
+        .unwrap();
+    s.sync_declared(&d).unwrap().unwrap();
+    assert_eq!(
+        canonical(&s),
+        "infra devops ops # servers, CI\nrust oxide rs # the language\nzig ziglang # the other one\n"
+    );
+}
+
+#[test]
+fn databases_synced_before_pinning_keep_working() {
+    // A database mirrored by the earlier declarative mode has the same stored hash: pinning the
+    // same list skips the sync, and the list can be added to.
+    let mut s = store();
+    add(&mut s, "a.com", &["rust"]);
+    let d = declared(&[("rust", &["rs"])]);
+    s.sync_declared(&d).unwrap().unwrap();
+    let before = s.conn().total_changes();
+    assert_eq!(s.pin(d).unwrap(), None);
+    assert_eq!(s.conn().total_changes(), before);
+    s.add_canonical(&strings(&["go"])).unwrap();
+    assert_eq!(canonical(&s), "go\nrust rs\n");
+}
+
+#[test]
+fn export_in_config_shape() {
+    let mut s = store();
+    s.import_canonical(&parse_canonical(
+        "infra ops # servers, \"deploy\", ${CI}\nrust rs\nc++\nif\n",
+    ))
+    .unwrap();
+    s.pin(declared(&[("rust", &["rs"])])).unwrap();
+    let tags = s.canonical_tags().unwrap();
+    assert_eq!(
+        format_canonical_toml(&tags, s.pinned()),
+        "[tags.canonical]\n\
+         \"c++\" = []\n\
+         if = []\n\
+         infra = { aliases = [\"ops\"], description = \"servers, \\\"deploy\\\", ${CI}\" }\n\
+         rust = [\"rs\"] # pinned\n"
+    );
+    assert_eq!(
+        format_canonical_nix(&tags, s.pinned()),
+        "programs.shlv.settings.tags.canonical = {\n  \
+         \"c++\" = [ ];\n  \
+         \"if\" = [ ];\n  \
+         infra = { aliases = [ \"ops\" ]; description = \"servers, \\\"deploy\\\", \\${CI}\"; };\n  \
+         rust = [ \"rs\" ]; # pinned\n\
+         };\n"
+    );
+    // The TOML reads back as the same list.
+    let text = format_canonical_toml(&tags, None);
+    let c = shlv::Config::parse(&text, std::path::Path::new("x")).unwrap();
+    assert_eq!(c.tags.canonical.unwrap().len(), 4);
 }

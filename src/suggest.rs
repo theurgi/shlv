@@ -10,12 +10,10 @@
 //! doesn't put it back on the next run.
 
 use std::collections::{BTreeMap, HashSet};
-use std::ops::Range;
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use toml::Spanned;
 
 use crate::store::{Store, ensure_tag, normalize_tag, now_ms, resolve_tag, touch_many};
 use crate::url;
@@ -77,25 +75,17 @@ impl SuggestMode {
 /// `site:`), mapped to tags. Built only through validation, so hosts and tags are normalized,
 /// every rule has a tag, and no rule lists a tag twice.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(try_from = "BTreeMap<String, Spanned<Vec<String>>>")]
+#[serde(try_from = "BTreeMap<String, Vec<String>>")]
 pub struct DomainRules {
     rules: BTreeMap<String, Vec<String>>,
-    /// Byte range of each rule's value in the config file, for error messages.
-    spans: BTreeMap<String, Range<usize>>,
 }
 
 impl DomainRules {
     /// Validates rules. Like the declared canonical list, hosts and tags must already be in
     /// normalized form: `"GitHub.com"` is an error that suggests `"github.com"`.
     pub fn new(rules: BTreeMap<String, Vec<String>>) -> Result<Self, String> {
-        Self::with_spans(rules.into_iter().map(|(h, t)| (h, t, 0..0)))
-    }
-
-    fn with_spans(
-        rules: impl IntoIterator<Item = (String, Vec<String>, Range<usize>)>,
-    ) -> Result<Self, String> {
         let mut out = DomainRules::default();
-        for (host, tags, span) in rules {
+        for (host, tags) in rules {
             let norm = normalize_host(&host);
             match norm {
                 None => return Err(format!("rule {host:?}: not a host name")),
@@ -121,7 +111,6 @@ impl DomainRules {
                     return Err(format!("rule {host:?}: tag {tag:?} is listed twice"));
                 }
             }
-            out.spans.insert(host.clone(), span);
             out.rules.insert(host, tags);
         }
         Ok(out)
@@ -138,11 +127,6 @@ impl DomainRules {
     /// Rules by host, each with its tags.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[String])> {
         self.rules.iter().map(|(h, t)| (h.as_str(), t.as_slice()))
-    }
-
-    /// Where a rule's value sits in the config text (empty if not parsed from text).
-    pub fn span(&self, host: &str) -> Option<Range<usize>> {
-        self.spans.get(host).cloned()
     }
 
     /// Tags of every rule matching the normalized URL's host, deduplicated: the rule for the host
@@ -179,13 +163,10 @@ impl DomainRules {
     }
 }
 
-impl TryFrom<BTreeMap<String, Spanned<Vec<String>>>> for DomainRules {
+impl TryFrom<BTreeMap<String, Vec<String>>> for DomainRules {
     type Error = String;
-    fn try_from(rules: BTreeMap<String, Spanned<Vec<String>>>) -> Result<Self, String> {
-        DomainRules::with_spans(rules.into_iter().map(|(h, t)| {
-            let span = t.span();
-            (h, t.into_inner(), span)
-        }))
+    fn try_from(rules: BTreeMap<String, Vec<String>>) -> Result<Self, String> {
+        DomainRules::new(rules)
     }
 }
 

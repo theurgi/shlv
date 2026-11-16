@@ -1,10 +1,14 @@
 //! Tag management: listing, rename, merge, aliases, and the canonical list.
 //!
+//! The database holds the canonical list. A list declared in config is a pinned base on top of
+//! it ([`Store::pin`]): pinned tags always exist and are canonical, with their declared aliases
+//! and descriptions, and edits that would undo that fail with [`Pinned`].
+//!
 //! Invariants kept here: a name is never both a live tag and an alias, and aliases point at live
 //! tags. Every change to a bookmark's tags bumps that bookmark's `updated_at` and reindexes it in
 //! the same transaction; every change to a tag or its aliases bumps the tag's `updated_at`.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -121,7 +125,120 @@ pub fn format_canonical(tags: &[TagInfo]) -> String {
     out
 }
 
-/// The `meta` key holding [`DeclaredTags::hash`] of the list last mirrored into the database.
+/// Formats canonical tags as a `[tags.canonical]` TOML table, the config's shape. Tags in
+/// `pinned` get a `# pinned` comment.
+pub fn format_canonical_toml(tags: &[TagInfo], pinned: Option<&DeclaredTags>) -> String {
+    let key = |s: &str| {
+        let bare = !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        if bare { s.to_string() } else { toml_string(s) }
+    };
+    let list = |v: &[String]| {
+        let items: Vec<String> = v.iter().map(|a| toml_string(a)).collect();
+        format!("[{}]", items.join(", "))
+    };
+    let mut out = String::from("[tags.canonical]\n");
+    for t in tags {
+        out.push_str(&key(&t.name));
+        out.push_str(" = ");
+        match &t.description {
+            None => out.push_str(&list(&t.aliases)),
+            Some(d) => {
+                let (a, d) = (list(&t.aliases), toml_string(d));
+                out.push_str(&format!("{{ aliases = {a}, description = {d} }}"));
+            }
+        }
+        if pinned.is_some_and(|p| p.is_tag(&t.name)) {
+            out.push_str(" # pinned");
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Formats canonical tags as the home-manager module's `settings.tags.canonical` attrset. Tags in
+/// `pinned` get a `# pinned` comment.
+pub fn format_canonical_nix(tags: &[TagInfo], pinned: Option<&DeclaredTags>) -> String {
+    const KEYWORDS: &[&str] = &[
+        "assert", "else", "if", "in", "inherit", "let", "or", "rec", "then", "with",
+    ];
+    let key = |s: &str| {
+        let mut bytes = s.bytes();
+        let bare = bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b"_'-".contains(&b))
+            && !KEYWORDS.contains(&s);
+        if bare { s.to_string() } else { nix_string(s) }
+    };
+    let list = |v: &[String]| {
+        let mut s = String::from("[ ");
+        for a in v {
+            s.push_str(&nix_string(a));
+            s.push(' ');
+        }
+        s.push(']');
+        s
+    };
+    let mut out = String::from("programs.shlv.settings.tags.canonical = {\n");
+    for t in tags {
+        out.push_str("  ");
+        out.push_str(&key(&t.name));
+        out.push_str(" = ");
+        match &t.description {
+            None => out.push_str(&list(&t.aliases)),
+            Some(d) => {
+                let (a, d) = (list(&t.aliases), nix_string(d));
+                out.push_str(&format!("{{ aliases = {a}; description = {d}; }}"));
+            }
+        }
+        out.push(';');
+        if pinned.is_some_and(|p| p.is_tag(&t.name)) {
+            out.push_str(" # pinned");
+        }
+        out.push('\n');
+    }
+    out.push_str("};\n");
+    out
+}
+
+/// A TOML basic string.
+fn toml_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A Nix double-quoted string; `${` is escaped so nothing is interpolated.
+fn nix_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `meta` key holding [`DeclaredTags::hash`] of the list last synced into the database.
 const DECLARED_HASH: &str = "canonical_hash";
 
 /// Longest tag description, in characters.
@@ -302,6 +419,11 @@ impl DeclaredTags {
         self.tags.contains_key(name)
     }
 
+    /// The declared tag that `name` (normalized) is a declared alias of.
+    pub fn alias_of(&self, name: &str) -> Option<&str> {
+        self.aliases.get(name).map(String::as_str)
+    }
+
     /// The declared tag that `name` (normalized) names or is an alias of.
     pub fn resolve(&self, name: &str) -> Option<&str> {
         match self.tags.get_key_value(name) {
@@ -355,14 +477,11 @@ impl Serialize for DeclaredTags {
 pub struct SyncStats {
     /// Tags newly marked canonical (created if needed).
     pub marked: usize,
-    /// Canonical tags not in the list, now unmarked.
-    pub unmarked: usize,
     /// Aliases added or repointed.
     pub aliases_added: usize,
-    /// Aliases removed: undeclared aliases of declared tags, and aliases whose name is now a
-    /// declared tag.
+    /// Aliases removed because their name is now a declared tag.
     pub aliases_removed: usize,
-    /// Declared tags whose description was set, changed, or cleared.
+    /// Declared tags whose description was set or changed.
     pub described: usize,
     /// Live tags that the list declares as aliases, folded into their tag: (from, into, bookmarks
     /// retagged).
@@ -387,6 +506,28 @@ impl std::fmt::Display for NonCanonicalTags {
 }
 
 impl std::error::Error for NonCanonicalTags {}
+
+/// An edit refused because the declared list pins the tag, alias, or description it would change
+/// (see [`Store::pin`]). The message says what was refused; callers add where the list is
+/// declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pinned(pub String);
+
+impl std::fmt::Display for Pinned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: it is pinned by [tags.canonical] in the config",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Pinned {}
+
+fn pinned(what: String) -> anyhow::Error {
+    Pinned(what).into()
+}
 
 impl Store {
     /// Of `tags` (already normalized), those that aren't canonical or an alias of a canonical
@@ -449,7 +590,11 @@ impl Store {
     /// instead) or an alias of another tag. If `new` is an alias of this tag, the alias goes away.
     pub fn rename_tag(&mut self, old: &str, new: &str) -> Result<Retagged> {
         let (old, new) = (tag_name(old)?, tag_name(new)?);
+        if self.pinned.as_ref().is_some_and(|p| p.is_tag(&old)) {
+            return Err(pinned(format!("cannot rename pinned tag {old}")));
+        }
         let now = now_ms();
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let id = require_tag(&tx, &old)?;
         if old == new {
@@ -476,7 +621,7 @@ impl Store {
         )?;
         let bookmarks = tagged(&tx, id)?;
         touch_many(&tx, &bookmarks, now)?;
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(Retagged {
             tag: new,
@@ -486,10 +631,15 @@ impl Store {
 
     /// Moves every bookmark from tag `from` to tag `into` (a name or alias), tombstones `from`,
     /// and leaves `from` as an alias of `into`. Aliases of `from` move to `into`, and `into`
-    /// becomes canonical if `from` was.
+    /// becomes canonical if `from` was. A pinned tag can't be merged away, but other tags can be
+    /// merged into it.
     pub fn merge_tags(&mut self, from: &str, into: &str) -> Result<Retagged> {
         let (from, into) = (tag_name(from)?, tag_name(into)?);
+        if self.pinned.as_ref().is_some_and(|p| p.is_tag(&from)) {
+            return Err(pinned(format!("cannot merge away pinned tag {from}")));
+        }
         let now = now_ms();
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let from_id = require_tag(&tx, &from)?;
         let Some(into_id) = resolve_tag(&tx, &into)? else {
@@ -502,7 +652,7 @@ impl Store {
         let tag = tx.query_row("SELECT name FROM tag WHERE id = ?1", [into_id], |r| {
             r.get(0)
         })?;
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(Retagged { tag, bookmarks })
     }
@@ -511,10 +661,11 @@ impl Store {
     /// `alias` is a live tag or already an alias of another tag.
     pub fn add_alias(&mut self, alias: &str, tag: &str) -> Result<bool> {
         let (alias, tag) = (tag_name(alias)?, tag_name(tag)?);
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let tag_id = require_tag(&tx, &tag)?;
         let added = add_alias(&tx, &alias, tag_id, &tag, now_ms())?;
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(added)
     }
@@ -523,13 +674,19 @@ impl Store {
     /// such alias.
     pub fn remove_alias(&mut self, alias: &str) -> Result<Option<String>> {
         let alias = tag_name(alias)?;
+        if let Some(tag) = self.pinned.as_ref().and_then(|p| p.alias_of(&alias)) {
+            return Err(pinned(format!(
+                "cannot remove alias {alias} of pinned tag {tag}"
+            )));
+        }
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let Some((tag_id, tag)) = alias_target(&tx, &alias)? else {
             return Ok(None);
         };
         tx.execute("DELETE FROM tag_alias WHERE alias = ?1", [&alias])?;
         touch_tag(&tx, tag_id, now_ms())?;
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(Some(tag))
     }
@@ -537,38 +694,53 @@ impl Store {
     /// Marks tags canonical, creating them if needed. Returns how many changed.
     pub fn add_canonical(&mut self, tags: &[String]) -> Result<usize> {
         let now = now_ms();
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let mut changed = 0;
         for t in tags {
             changed += usize::from(mark_canonical(&tx, &tag_name(t)?, now)?);
         }
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(changed)
     }
 
     /// Unmarks canonical tags; the tags and their bookmarks stay. Returns how many changed.
+    /// Pinned tags can't be unmarked.
     pub fn remove_canonical(&mut self, tags: &[String]) -> Result<usize> {
+        let tags = tags
+            .iter()
+            .map(|t| tag_name(t))
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(t) = tags
+            .iter()
+            .find(|t| self.pinned.as_ref().is_some_and(|p| p.is_tag(t)))
+        {
+            return Err(pinned(format!("cannot unmark pinned tag {t}")));
+        }
         let now = now_ms();
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let mut changed = 0;
-        for t in tags {
-            let id = require_tag(&tx, &tag_name(t)?)?;
+        for t in &tags {
+            let id = require_tag(&tx, t)?;
             changed += tx.execute(
                 "UPDATE tag SET canonical = 0, updated_at = ?2 WHERE id = ?1 AND canonical",
                 params![id, now],
             )?;
         }
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(changed)
     }
 
     /// Sets (or with blank `text`, clears) the description of live tag `tag`. Returns the tag's
-    /// name and whether anything changed.
+    /// name and whether anything changed. A description declared for a pinned tag can't be
+    /// changed; a pinned tag declared without one can be described here.
     pub fn describe_tag(&mut self, tag: &str, text: &str) -> Result<(String, bool)> {
         let name = tag_name(tag)?;
         let text = check_description(text).map_err(anyhow::Error::msg)?;
+        self.check_pinned_description(&name, text.as_deref())?;
         let tx = self.conn.transaction()?;
         let id = require_tag(&tx, &name)?;
         let changed = set_description(&tx, id, text.as_deref(), now_ms())?;
@@ -579,9 +751,17 @@ impl Store {
     /// Adds a canonical list (see [`parse_canonical`]): marks each tag canonical, creating it if
     /// needed, and adds its aliases and descriptions. Nothing is removed: a line without a
     /// description keeps the tag's current one. All or nothing: on an error (such as an alias that
-    /// is a live tag) nothing changes.
+    /// is a live tag, or a description that differs from a pinned one) nothing changes.
     pub fn import_canonical(&mut self, entries: &[CanonicalEntry]) -> Result<ImportStats> {
+        for e in entries {
+            if let Some(d) = &e.description {
+                let d = check_description(d).map_err(anyhow::Error::msg);
+                d.and_then(|d| self.check_pinned_description(&e.tag, d.as_deref()))
+                    .with_context(|| format!("line {}", e.line))?;
+            }
+        }
         let now = now_ms();
+        let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let mut stats = ImportStats::default();
         for e in entries {
@@ -598,22 +778,51 @@ impl Store {
                 stats.described += usize::from(set_description(&tx, tag_id, d.as_deref(), now)?);
             }
         }
-        forget_declared(&tx)?;
+        forget_declared(&tx, forget)?;
         tx.commit()?;
         Ok(stats)
     }
 
-    /// Makes the database mirror a declared canonical list, unless the list's hash matches the
-    /// one stored by the last sync; then it costs one indexed read and returns `None`. Otherwise,
-    /// in one transaction:
+    /// Syncs a declared list into the database (see [`Store::sync_declared`]) and pins it: until
+    /// the store is dropped, edits that would undo the declared list fail with [`Pinned`].
+    /// Renaming, merging away, or unmarking a pinned tag, removing a declared alias, and changing
+    /// a declared description are refused. Everything else works as without a declared list:
+    /// other tags can be added, aliased, described, and merged (into pinned tags, too), and
+    /// pinned tags can get more aliases.
+    pub fn pin(&mut self, declared: DeclaredTags) -> Result<Option<SyncStats>> {
+        let stats = self.sync_declared(&declared)?;
+        self.pinned = Some(declared);
+        Ok(stats)
+    }
+
+    /// The declared list pinned by [`Store::pin`], if any.
+    pub fn pinned(&self) -> Option<&DeclaredTags> {
+        self.pinned.as_ref()
+    }
+
+    /// Fails with [`Pinned`] if `tag` is pinned with a declared description other than `text`.
+    fn check_pinned_description(&self, tag: &str, text: Option<&str>) -> Result<()> {
+        match self.pinned.as_ref().and_then(|p| p.description(tag)) {
+            Some(d) if Some(d) != text => Err(pinned(format!(
+                "cannot change the description of pinned tag {tag}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    /// Adds a declared canonical list to the database, unless the list's hash matches the one
+    /// stored by the last sync; then it costs one indexed read and returns `None`. Otherwise, in
+    /// one transaction:
     ///
     /// - declared tags exist and are canonical (a declared name that was an alias stops being
     ///   one; its old tag keeps its bookmarks);
     /// - declared aliases point at their tags (a declared alias that is a live tag is merged into
     ///   its declared tag, as `tag merge` would);
-    /// - canonical tags not in the list are unmarked (their bookmarks keep them);
-    /// - aliases of declared tags that aren't in the list are removed; aliases of undeclared tags
-    ///   (left by `tag merge`, say) stay.
+    /// - declared descriptions are set.
+    ///
+    /// Nothing else is removed: other canonical tags, other aliases (of declared tags, too), and
+    /// descriptions of tags declared without one stay. So a tag, alias, or description dropped
+    /// from the list stays in the database, no longer pinned.
     pub fn sync_declared(&mut self, declared: &DeclaredTags) -> Result<Option<SyncStats>> {
         let hash = declared.hash();
         if meta_get(&self.conn, DECLARED_HASH)?.as_deref() == Some(hash.as_str()) {
@@ -639,8 +848,9 @@ impl Store {
             }
             stats.marked += usize::from(mark_canonical(&tx, tag, now)?);
             let id = require_tag(&tx, tag)?;
-            stats.described +=
-                usize::from(set_description(&tx, id, declared.description(tag), now)?);
+            if let Some(d) = declared.description(tag) {
+                stats.described += usize::from(set_description(&tx, id, Some(d), now)?);
+            }
             ids.insert(tag, id);
         }
 
@@ -671,42 +881,6 @@ impl Store {
                 }
                 touch_tag(&tx, id, now)?;
                 stats.aliases_added += 1;
-            }
-        }
-
-        // Only after every declared alias is in place, so one moving between declared tags is
-        // repointed rather than deleted and re-added.
-        for (tag, aliases) in declared.iter() {
-            let id = ids[tag];
-            let keep: HashSet<&str> = aliases.iter().map(String::as_str).collect();
-            let stale: Vec<String> = tx
-                .prepare_cached("SELECT alias FROM tag_alias WHERE tag_id = ?1")?
-                .query_map([id], |r| r.get(0))?
-                .filter(|a| {
-                    a.as_ref()
-                        .map_or(true, |a: &String| !keep.contains(a.as_str()))
-                })
-                .collect::<rusqlite::Result<_>>()?;
-            for a in &stale {
-                tx.execute("DELETE FROM tag_alias WHERE alias = ?1", [a])?;
-            }
-            if !stale.is_empty() {
-                touch_tag(&tx, id, now)?;
-                stats.aliases_removed += stale.len();
-            }
-        }
-
-        let canonical: Vec<(i64, String)> = tx
-            .prepare("SELECT id, name FROM tag WHERE canonical AND deleted_at IS NULL")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        for (id, name) in canonical {
-            if !declared.is_tag(&name) {
-                tx.execute(
-                    "UPDATE tag SET canonical = 0, updated_at = ?2 WHERE id = ?1",
-                    params![id, now],
-                )?;
-                stats.unmarked += 1;
             }
         }
 
@@ -755,12 +929,16 @@ fn merge_into(tx: &Transaction, from_id: i64, from: &str, into_id: i64, now: i64
     Ok(bookmarks.len())
 }
 
-/// Drops the stored hash of the declared list. Every manual change to tags, aliases, or the
-/// canonical marks calls this, so the next run with a declared list re-mirrors it even if the
-/// list itself is unchanged (say, after declarative mode was turned off, the database edited, and
-/// the same list declared again).
-fn forget_declared(tx: &Transaction) -> Result<()> {
-    meta_delete(tx, DECLARED_HASH)
+/// Drops the stored hash of the declared list when `forget` is set. Every manual change to tags,
+/// aliases, or the canonical marks made without a pinned list calls this, so the next run with a
+/// declared list syncs it even if the list itself is unchanged (say, after the list was removed
+/// from config, a declared tag unmarked, and the same list declared again). With a pinned list,
+/// edits that would undo it are refused, so the stored hash stays valid.
+fn forget_declared(tx: &Transaction, forget: bool) -> Result<()> {
+    if forget {
+        meta_delete(tx, DECLARED_HASH)?;
+    }
+    Ok(())
 }
 
 /// Normalizes a single tag name, rejecting empty ones.

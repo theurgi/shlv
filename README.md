@@ -43,7 +43,7 @@ $ shlv search fts5
 | `tag alias ALIAS TAG`        | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)         |
 | `tag canonical add\|rm\|ls`  | Mark, unmark, or list canonical tags                                 |
 | `tag canonical import FILE`  | Add a canonical list: one tag per line, aliases after it             |
-| `tag canonical export`       | Print the canonical list in that format                              |
+| `tag canonical export`       | Print the canonical list in that format (`--toml`/`--nix`: config)   |
 | `import FILE`                | Import Netscape HTML, JSON lines, or Karakeep JSON; `-` is stdin     |
 | `export [--format html]`     | Print every bookmark as JSON lines, or HTML that browsers import     |
 | `suggest ID...\|--all`       | Suggest tags: domain rules, then the `[ai] tag` provider (`ai`)      |

@@ -107,8 +107,8 @@ pub enum ProviderUse {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tags {
-    /// The declared canonical list, `tag = [aliases]`. When present (even empty), config is the
-    /// source of truth and the database mirrors it; see [`crate::Store::sync_declared`].
+    /// The declared canonical list, `tag = [aliases]`: a pinned base that the database's list is
+    /// built on; see [`crate::Store::pin`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canonical: Option<DeclaredTags>,
     /// Whether tag suggestions (from domain rules, and later the model and LLM) are applied at
@@ -154,9 +154,6 @@ impl Config {
         };
         let config: Config = toml::from_str(text)
             .map_err(|e| at(e.span().map(|s| s.start), e.message().trim_end()))?;
-        if let Some((host, msg)) = config.undeclared_rule_tag() {
-            return Err(at(config.tags.rules.span(host).map(|s| s.start), &msg));
-        }
         if let Err(msg) = config.model.check() {
             return Err(at(None, &msg));
         }
@@ -165,29 +162,6 @@ impl Config {
             return Err(at(Some(pos), &msg));
         }
         Ok(config)
-    }
-
-    /// With strict tags and a declared canonical list, rule tags must be declared tags or
-    /// aliases. Returns the first offending rule's host and an error message. Without a declared
-    /// list the canonical list lives in the database; see [`crate::Store::check_rules`].
-    fn undeclared_rule_tag(&self) -> Option<(&str, String)> {
-        let declared = self.tags.canonical.as_ref().filter(|_| self.strict_tags)?;
-        self.tags.rules.iter().find_map(|(host, tags)| {
-            let bad: Vec<&str> = tags
-                .iter()
-                .map(String::as_str)
-                .filter(|t| declared.resolve(t).is_none())
-                .collect();
-            (!bad.is_empty()).then(|| {
-                (
-                    host,
-                    format!(
-                        "rule {host:?}: not in [tags.canonical] (strict_tags is on): {}",
-                        bad.join(" ")
-                    ),
-                )
-            })
-        })
     }
 
     /// The effective config as TOML, defaults included.
@@ -429,7 +403,7 @@ mod tests {
     #[test]
     fn parses_declared_canonical_tags() {
         assert!(parse("").unwrap().tags.canonical.is_none());
-        // Present but empty is still declarative.
+        // Present but empty is a declared (empty) list.
         let c = parse("[tags.canonical]\n").unwrap();
         assert!(c.tags.canonical.unwrap().is_empty());
 
@@ -561,21 +535,6 @@ mod tests {
             e.contains("rule \"GitHub.com\": not a normalized host; write \"github.com\""),
             "{e}"
         );
-    }
-
-    #[test]
-    fn strict_rules_must_use_declared_tags() {
-        let text = "strict_tags = true\n[tags.canonical]\njavascript = [\"js\"]\ncode = []\n\
-                    [tags.rules]\n\"github.com\" = [\"code\"]\n\"nodejs.org\" = [\"js\", \"node\"]\n";
-        let e = parse(text).unwrap_err().to_string();
-        assert_eq!(
-            e,
-            "/c.toml:7:16: rule \"nodejs.org\": not in [tags.canonical] (strict_tags is on): node"
-        );
-        // Aliases count; without strict mode, or without a declared list, nothing is checked here.
-        assert!(parse(&text.replace(", \"node\"", "")).is_ok());
-        assert!(parse(&text.replace("strict_tags = true", "")).is_ok());
-        assert!(parse("strict_tags = true\n[tags.rules]\n\"a.com\" = [\"x\"]\n").is_ok());
     }
 
     #[test]

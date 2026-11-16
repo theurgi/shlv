@@ -49,11 +49,13 @@ in
         - `tags.canonical`: the declared canonical tag list, mapping each tag to its aliases, or
           to `{ aliases = [ ... ]; description = "..."; }`. A description (one line, at most 200
           characters) says what belongs under the tag; the tag suggestion layers match against it.
-          When set, even to `{ }`, this list is the source of truth: on startup the database
-          mirrors it (declared tags become canonical, aliases point at them, other canonical tags
-          are unmarked; bookmarks keep their tags), and `shlv tag canonical add|rm|import` and
-          `shlv tag alias` are refused. Names must be normalized tags (`"web-dev"`, not
-          `"Web Dev"`).
+          The database holds the canonical list; this is a pinned base under it. On startup,
+          declared tags become canonical and their aliases point at them. Tags, aliases, and
+          descriptions added with `shlv tag ...` stay, so adding a tag needs no rebuild, and a tag
+          removed from this list stays canonical (no longer pinned). shlv refuses to rename, merge
+          away, or unmark a declared tag, remove a declared alias, or change a declared
+          description. `shlv tag canonical export --nix` prints the whole list in this shape to
+          copy back here. Names must be normalized tags (`"web-dev"`, not `"Web Dev"`).
         - `tags.rules`: domain rules mapping a host (which also matches its subdomains) to tags,
           as in `tags.rules."github.com" = [ "code" ]`. `shlv add` and `shlv suggest` turn them
           into tag suggestions. With `strict_tags`, rule tags must be canonical.

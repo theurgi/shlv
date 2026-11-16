@@ -1,5 +1,5 @@
 # Flake check for the home-manager module. Evaluates it with `lib.evalModules` and stubs for the two
-# home-manager options it sets, then has shlv load the rendered config and mirror the tag list.
+# home-manager options it sets, then has shlv load the rendered config, pin the tag list, and add to it.
 {
   lib,
   pkgs,
@@ -50,7 +50,7 @@ let
       tags.rules."docs.rs" = [ "rust" ];
     };
   };
-  # `{ }` still declares the list (and unmarks every canonical tag), so it must render.
+  # `{ }` declares an empty list (it pins nothing); it must still render.
   emptyList = eval {
     enable = true;
     settings.tags.canonical = { };
@@ -126,12 +126,27 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
   # The rule's quoted host survives rendering.
   check "rule suggestion" "3  https://docs.rs/serde  #rust (rule)" \
     "$(shlv add https://docs.rs/serde >/dev/null && shlv suggest ls)"
-  check "mirrored list" "$(printf 'infra ops # servers, deployment, Nix, CI\njavascript ecmascript js\nrust')" "$(shlv tag canonical export)"
+  check "synced list" "$(printf 'infra ops # servers, deployment, Nix, CI\njavascript ecmascript js\nrust')" "$(shlv tag canonical export)"
   check "alias merged" "1  https://example.com/a  #javascript" "$(shlv ls -t javascript)"
   if shlv add https://example.com/c -t nope 2>/dev/null; then
     echo "hm-module: strict_tags not applied" >&2
     exit 1
   fi
+
+  # The declared list is a pinned base: tags, aliases, and descriptions can be added in shlv
+  # without touching the read-only config, and strict mode accepts them.
+  shlv tag canonical add nope >/dev/null
+  shlv tag alias rs rust >/dev/null
+  shlv tag describe nope "placeholders" >/dev/null
+  shlv add https://example.com/c -t nope >/dev/null
+  check "added in shlv" "$(printf 'infra ops # servers, deployment, Nix, CI\njavascript ecmascript js\nnope # placeholders\nrust rs')" "$(shlv tag canonical export)"
+  check "export marks pinned tags" '  rust = [ "rs" ]; # pinned' "$(shlv tag canonical export --nix | grep rust)"
+  # Undoing what the config declares is refused, naming the file.
+  if err=$(shlv tag canonical rm rust 2>&1); then
+    echo "hm-module: unmarking a pinned tag worked" >&2
+    exit 1
+  fi
+  check "refusal names the config" "hint: change it in $HOME/.config/shlv/config.toml" "$(echo "$err" | tail -n 1)"
 
   # With every feature built, the provider section is parsed; `config show` prints the key
   # file's path.
@@ -143,9 +158,12 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
     exit 1
   fi
 
-  # The empty list unmarks everything.
+  # Switching to the empty list unpins everything but removes nothing; unpinned tags can be
+  # unmarked.
   ln -sf ${configOf emptyList} $HOME/.config/shlv/config.toml
-  check "empty list" "" "$(shlv tag canonical export)"
+  check "empty list keeps tags" "4" "$(shlv tag canonical ls | wc -l)"
+  shlv tag canonical rm rust >/dev/null
+  check "unpinned tag unmarked" "infra javascript nope" "$(shlv tag canonical ls | tr '\n' ' ' | sed 's/ $//')"
 
   touch $out
 ''

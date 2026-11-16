@@ -37,6 +37,29 @@ impl Db {
         output(self.cmd(args))
     }
 
+    /// Runs shlv with `input` on stdin; returns (success, stdout, stderr).
+    fn run_stdin(&self, args: &[&str], input: &str) -> (bool, String, String) {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut c = self.cmd(args);
+        c.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let o = child.wait_with_output().unwrap();
+        (
+            o.status.success(),
+            String::from_utf8(o.stdout).unwrap(),
+            String::from_utf8(o.stderr).unwrap(),
+        )
+    }
+
     /// Runs shlv, asserting success; returns stdout.
     fn ok(&self, args: &[&str]) -> String {
         let (ok, out, err) = self.run(args);
@@ -425,19 +448,8 @@ fn tag_canonical() {
     );
 
     // From stdin; import only adds.
-    let mut c = db.cmd(&["tag", "canonical", "import", "-"]);
-    c.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = c.spawn().unwrap();
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"go golang\n")
-        .unwrap();
-    assert!(child.wait_with_output().unwrap().status.success());
+    let (ok, _, err) = db.run_stdin(&["tag", "canonical", "import", "-"], "go golang\n");
+    assert!(ok, "{err}");
     assert_eq!(
         db.ok(&["tag", "canonical", "export"]),
         "go golang\njavascript ecmascript # comment\nrust rs\n"
@@ -573,12 +585,14 @@ fn declared_canonical_tags() {
     db.ok(&["tag", "canonical", "add", "misc"]);
     std::fs::write(
         db.config(),
-        "strict_tags = true\n\n[tags.canonical]\njavascript = [\"js\", \"ecmascript\"]\nrust = []\n",
+        "strict_tags = true\n\n[tags.canonical]\njavascript = [\"js\", \"ecmascript\"]\n\
+         rust = []\ninfra = { aliases = [\"ops\"], description = \"servers\" }\n",
     )
     .unwrap();
     let path = db.config().display().to_string();
 
-    // First run mirrors the list; the live tag `js` is folded into `javascript`, and says so.
+    // First run syncs the list; the live tag `js` is folded into `javascript`, and says so.
+    // `misc`, canonical in the database only, stays.
     let (ok, out, err) = db.run(&["ls"]);
     assert!(ok, "{err}");
     assert!(out.contains("#javascript  #misc  #old"), "{out}");
@@ -588,72 +602,111 @@ fn declared_canonical_tags() {
     );
     assert_eq!(
         db.ok(&["tag", "canonical", "export"]),
-        "javascript ecmascript js\nrust\n"
+        "infra ops # servers\njavascript ecmascript js\nmisc\nrust\n"
     );
     // Unchanged list: nothing to report.
     assert_eq!(db.run(&["tag", "canonical", "ls"]).2, "");
 
-    // Edits to the declared list are refused, naming the config file.
+    // Edits that would undo the declared list are refused, naming the config file.
     let refused = |args: &[&str], what: &str| {
         let err = db.fail(args);
-        assert!(
-            err.contains(what) && err.contains(&format!("declared in {path} ([tags.canonical])")),
-            "{args:?}: {err}"
+        assert_eq!(
+            err,
+            format!(
+                "shlv: {what}: it is pinned by [tags.canonical] in the config\n\
+                 hint: change it in {path}\n"
+            ),
+            "{args:?}"
         );
     };
     refused(
-        &["tag", "canonical", "add", "go"],
-        "cannot change canonical tags",
+        &["tag", "canonical", "rm", "misc", "rust"],
+        "cannot unmark pinned tag rust",
     );
     refused(
-        &["tag", "canonical", "rm", "rust"],
-        "cannot change canonical tags",
+        &["tag", "alias", "--rm", "js"],
+        "cannot remove alias js of pinned tag javascript",
     );
     refused(
-        &["tag", "canonical", "import", "-"],
-        "cannot change canonical tags",
+        &["tag", "describe", "infra", "servers and CI"],
+        "cannot change the description of pinned tag infra",
     );
-    refused(&["tag", "alias", "rs", "rust"], "cannot change aliases");
-    refused(
-        &["tag", "describe", "rust", "the language"],
-        "cannot change descriptions",
-    );
-    refused(&["tag", "alias", "--rm", "js"], "cannot change aliases");
     refused(
         &["tag", "rename", "Rust", "rust-lang"],
-        "cannot rename declared tag rust",
+        "cannot rename pinned tag rust",
     );
     refused(
         &["tag", "merge", "rust", "misc"],
-        "cannot merge declared tag rust",
+        "cannot merge away pinned tag rust",
     );
-    refused(
-        &["tag", "merge", "old", "js"],
-        "cannot merge into js, an alias of declared tag javascript",
-    );
-
-    // Undeclared tags can still be renamed and merged; merge leaves an alias that sync keeps.
-    db.ok(&["tag", "rename", "old", "older"]);
-    db.ok(&["tag", "merge", "older", "misc"]);
-    assert!(db.ok(&["tag", "ls"]).contains("misc  = older"));
-
-    // Strict mode points at the config file, not at `tag canonical add`.
-    let err = db.fail(&["add", "b.com", "-t", "go"]);
+    let (ok, _, err) = db.run_stdin(&["tag", "canonical", "import", "-"], "infra # other\n");
+    assert!(!ok);
     assert!(
-        err.contains("not canonical (strict_tags is on): go"),
+        err.contains("line 1: cannot change the description of pinned tag infra: it is pinned")
+            && err.contains(&format!("hint: change it in {path}")),
         "{err}"
     );
-    assert!(err.contains(&format!("declare these in {path}")), "{err}");
-    assert!(!err.contains("tag canonical add"), "{err}");
+
+    // The rest works, pinned tags included: add, alias, describe, merge into, rename others.
+    db.ok(&["tag", "canonical", "add", "go"]);
+    db.ok(&["tag", "alias", "golang", "go"]);
+    db.ok(&["tag", "alias", "rs", "rust"]);
+    db.ok(&["tag", "describe", "rust", "the language"]);
+    db.ok(&["tag", "rename", "old", "older"]);
+    db.ok(&["tag", "merge", "older", "js"]);
+    db.ok(&["tag", "canonical", "rm", "misc"]);
+    let (ok, _, err) = db.run_stdin(
+        &["tag", "canonical", "import", "-"],
+        "zig # a language\ninfra devops # servers\n",
+    );
+    assert!(ok, "{err}");
+    // Strict mode's hint suggests `tag canonical add`, which works now.
+    let err = db.fail(&["add", "b.com", "-t", "nim"]);
+    assert!(err.contains("shlv tag canonical add nim"), "{err}");
     assert!(
-        db.ok(&["add", "b.com", "-t", "ecmascript"])
-            .contains("#javascript")
+        db.ok(&["add", "b.com", "-t", "golang", "-t", "ecmascript"])
+            .contains("#go  #javascript")
+    );
+    let list = "go golang\ninfra devops ops # servers\njavascript ecmascript js older\n\
+                rust rs # the language\nzig # a language\n";
+    assert_eq!(db.ok(&["tag", "canonical", "export"]), list);
+    // A changed list resyncs and keeps all of that: pinning `zig` keeps its description.
+    std::fs::write(
+        db.config(),
+        std::fs::read_to_string(db.config()).unwrap() + "zig = []\n",
+    )
+    .unwrap();
+    assert_eq!(db.ok(&["tag", "canonical", "export"]), list);
+
+    // In the config's shape, marking what the config pins.
+    assert_eq!(
+        db.ok(&["tag", "canonical", "export", "--toml"]),
+        "[tags.canonical]\ngo = [\"golang\"]\n\
+         infra = { aliases = [\"devops\", \"ops\"], description = \"servers\" } # pinned\n\
+         javascript = [\"ecmascript\", \"js\", \"older\"] # pinned\n\
+         rust = { aliases = [\"rs\"], description = \"the language\" } # pinned\n\
+         zig = { aliases = [], description = \"a language\" } # pinned\n"
+    );
+    assert_eq!(
+        db.ok(&["tag", "canonical", "export", "--nix"]),
+        "programs.shlv.settings.tags.canonical = {\n  go = [ \"golang\" ];\n  \
+         infra = { aliases = [ \"devops\" \"ops\" ]; description = \"servers\"; }; # pinned\n  \
+         javascript = [ \"ecmascript\" \"js\" \"older\" ]; # pinned\n  \
+         rust = { aliases = [ \"rs\" ]; description = \"the language\"; }; # pinned\n  \
+         zig = { aliases = [ ]; description = \"a language\"; }; # pinned\n};\n"
+    );
+    assert!(
+        db.fail(&["tag", "canonical", "export", "--toml", "--nix"])
+            .contains("cannot be used with")
     );
 
-    // Dropping a tag from the list unmarks it; a conflict is an error at load time.
+    // Dropping a tag from the list unpins it; it stays canonical and can be unmarked now.
     std::fs::write(db.config(), "[tags.canonical]\njavascript = [\"js\"]\n").unwrap();
-    assert_eq!(db.ok(&["tag", "canonical", "export"]), "javascript js\n");
-    assert!(db.ok(&["tag", "ls"]).contains("misc  = older"));
+    assert_eq!(db.ok(&["tag", "canonical", "export"]), list);
+    db.ok(&["tag", "canonical", "rm", "rust"]);
+    db.ok(&["tag", "alias", "--rm", "ops"]);
+    db.ok(&["tag", "describe", "infra", ""]);
+    // A conflict is an error at load time.
     std::fs::write(
         db.config(),
         "[tags.canonical]\njs = []\njavascript = [\"js\"]\n",
@@ -666,10 +719,14 @@ fn declared_canonical_tags() {
         "{err}"
     );
 
-    // Without the section, the database is editable again.
+    // Without the section, nothing is pinned.
     std::fs::write(db.config(), "").unwrap();
-    db.ok(&["tag", "canonical", "add", "go"]);
-    db.ok(&["tag", "alias", "golang", "go"]);
+    db.ok(&["tag", "alias", "--rm", "js"]);
+    db.ok(&["tag", "canonical", "rm", "javascript"]);
+    assert!(
+        !db.ok(&["tag", "canonical", "export", "--toml"])
+            .contains("pinned")
+    );
 }
 
 fn fixture(name: &str) -> String {
@@ -1112,20 +1169,20 @@ fn suggest_strict_rules() {
         "accepted rust; now 1  https://docs.rs/x  #rust\n"
     );
 
-    // A declared list is checked when the config loads, with a position.
+    // With a declared list, rule tags may be canonical in the database only.
     std::fs::write(
         db.config(),
         "strict_tags = true\n[tags.canonical]\ncode = []\n\
-         [tags.rules]\n\"github.com\" = [\"code\"]\n\"docs.rs\" = [\"rust\"]\n",
+         [tags.rules]\n\"github.com\" = [\"code\"]\n\"docs.rs\" = [\"rust\"]\n\
+         \"go.dev\" = [\"go\"]\n",
     )
     .unwrap();
-    assert_eq!(
-        db.fail(&["ls"]),
-        format!(
-            "shlv: {path}:6:13: rule \"docs.rs\": not in [tags.canonical] (strict_tags is on): \
-             rust\n"
-        )
+    assert!(
+        db.fail(&["add", "go.dev/x"])
+            .contains("aren't canonical (strict_tags is on): go (go.dev)")
     );
+    db.ok(&["tag", "canonical", "add", "go"]);
+    db.ok(&["add", "go.dev/x"]);
 }
 
 #[test]
