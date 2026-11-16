@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 
 use crate::store::{Put, check_url, non_empty, normalize_tag, now_ms, put, reindex_many};
+use crate::suggest::{RuleStats, offer_rules_many};
 use crate::tag::NonCanonicalTags;
 use crate::{Store, netscape};
 
@@ -86,6 +87,8 @@ pub struct ImportOptions {
     /// Drop tags that aren't canonical or an alias of a canonical tag, instead of failing in
     /// strict mode. Applies with strict mode off too.
     pub drop_non_canonical: bool,
+    /// Don't run the domain rules (see [`Store::set_rules`]) on the imported bookmarks.
+    pub skip_rules: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -97,6 +100,8 @@ pub struct ImportSummary {
     pub skipped: Vec<(String, String)>,
     /// Tags dropped by [`ImportOptions::drop_non_canonical`], in first-seen order.
     pub dropped_tags: Vec<String>,
+    /// What the domain rules did; `checked` counts distinct bookmarks.
+    pub rules: RuleStats,
 }
 
 /// URL schemes that only mean something inside a browser.
@@ -122,8 +127,13 @@ impl Store {
     /// (see [`Store::add`]; the earlier `created_at` also wins). `javascript:` and `place:` URLs
     /// and invalid ones are skipped and reported.
     ///
-    /// In strict mode, fails with [`NonCanonicalTags`] listing every offending tag before
-    /// anything is written, unless `opts` drops them.
+    /// Matching domain rules are recorded as suggestions or applied in the same transaction, as
+    /// in [`Store::add`], unless `opts` skips them. Tags they apply don't bump `updated_at`: like
+    /// the import's own tags, they're part of the write that brings the bookmark in.
+    ///
+    /// In strict mode, fails with [`NonCanonicalTags`] listing every offending tag, or with
+    /// [`NonCanonicalRuleTags`](crate::NonCanonicalRuleTags) for the rules, before anything is written, unless `opts` drops
+    /// the tags or skips the rules.
     pub fn import(&mut self, items: &[ImportItem], opts: ImportOptions) -> Result<ImportSummary> {
         let mut summary = ImportSummary::default();
         let mut ready = Vec::with_capacity(items.len());
@@ -174,14 +184,23 @@ impl Store {
                 return Err(NonCanonicalTags(bad).into());
             }
         }
+        let rules = !opts.skip_rules && !self.rules.is_empty();
+        if rules {
+            self.check_rules()?;
+        }
 
         // At 100k bookmarks on the VM's virtiofs: 13.3 s with the default cache, 5.0 s with the
         // bulk cache (and 4.7 s with 128 MiB).
-        self.with_bulk_cache(|s| s.write_import(&ready, &mut summary))?;
+        self.with_bulk_cache(|s| s.write_import(&ready, rules, &mut summary))?;
         Ok(summary)
     }
 
-    fn write_import(&mut self, ready: &[Ready], summary: &mut ImportSummary) -> Result<()> {
+    fn write_import(
+        &mut self,
+        ready: &[Ready],
+        rules: bool,
+        summary: &mut ImportSummary,
+    ) -> Result<()> {
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let mut ids = Vec::with_capacity(ready.len());
@@ -209,6 +228,17 @@ impl Store {
             } else {
                 summary.updated += 1;
             }
+        }
+        if rules {
+            // Before reindexing, so applied tags are searchable; the reindex covers every id.
+            let mut seen = HashSet::new();
+            let targets = ids
+                .iter()
+                .zip(ready)
+                .filter(|(id, _)| seen.insert(**id))
+                .map(|(id, r)| (*id, r.norm.as_str()));
+            (summary.rules, _) =
+                offer_rules_many(&tx, &self.rules, self.suggest_mode, targets, now)?;
         }
         // Set-based, once: per-row reindexing made a 100k import 2.5× slower, and a re-import
         // (every row an update) 8× slower.

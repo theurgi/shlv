@@ -1092,3 +1092,43 @@ fn suggest_strict_rules() {
         )
     );
 }
+
+#[test]
+fn import_runs_domain_rules() {
+    let db = Db::new();
+    let path = db.config().display().to_string();
+    std::fs::create_dir_all(&db.0).unwrap();
+    std::fs::write(db.config(), "[tags.rules]\n\"github.com\" = [\"code\"]\n").unwrap();
+    let file = db.0.join("in.jsonl");
+    std::fs::write(
+        &file,
+        "{\"url\":\"https://github.com/a\"}\n{\"url\":\"https://example.com/\"}\n",
+    )
+    .unwrap();
+    let file = file.to_str().unwrap();
+    assert_eq!(
+        db.ok(&["import", file]),
+        format!(
+            "imported {file}: 2 added, 0 updated, 0 skipped\n\
+             rules matched 1 of 2 bookmarks: 1 new suggestion\n"
+        )
+    );
+    assert_eq!(
+        db.ok(&["import", "--no-rules", file]),
+        format!("imported {file}: 0 added, 2 updated, 0 skipped\n")
+    );
+
+    std::fs::write(
+        db.config(),
+        "strict_tags = true\n[tags.rules]\n\"github.com\" = [\"code\"]\n",
+    )
+    .unwrap();
+    assert_eq!(
+        db.fail(&["import", file]),
+        format!(
+            "shlv: nothing imported: {path}: [tags.rules] uses tags that aren't canonical \
+             (strict_tags is on): code (github.com)\n\
+             hint: make the tags canonical, change the rules, or pass --no-rules\n"
+        )
+    );
+}

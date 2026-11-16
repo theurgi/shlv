@@ -9,7 +9,8 @@ use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, parse_canonical};
 use shlv::{
     Bookmark, DeclaredTags, Edit, Format, ImportOptions, ListQuery, NewBookmark,
-    NonCanonicalRuleTags, NonCanonicalTags, Store, SuggestMode, Suggestion, TagInfo, TagSort,
+    NonCanonicalRuleTags, NonCanonicalTags, RuleStats, Store, SuggestMode, Suggestion, TagInfo,
+    TagSort,
 };
 use shlv::{netscape, transfer};
 
@@ -125,6 +126,9 @@ enum Cmd {
         /// Drop tags that aren't canonical instead of failing (strict_tags)
         #[arg(long)]
         drop_unknown_tags: bool,
+        /// Don't run the domain rules ([tags.rules]) on the imported bookmarks
+        #[arg(long)]
+        no_rules: bool,
     },
     /// Print every bookmark: JSON lines (like `ls --json`) or Netscape HTML for browsers
     Export {
@@ -415,6 +419,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             format,
             folders_as_tags,
             drop_unknown_tags,
+            no_rules,
         } => {
             let text = read_input(&file)?;
             let format = match format {
@@ -427,6 +432,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 .with_context(|| format!("cannot read {name}"))?;
             let opts = ImportOptions {
                 drop_non_canonical: drop_unknown_tags,
+                skip_rules: no_rules,
             };
             let s = store.import(&items, opts).map_err(|e| {
                 match (e.downcast_ref::<NonCanonicalTags>(), &declared) {
@@ -442,6 +448,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
                             bad.0.join(" ")
                         )
                     }
+                    _ if let Some(bad) = e.downcast_ref::<NonCanonicalRuleTags>() => anyhow!(
+                        "nothing imported: {}: {bad}\n\
+                         hint: make the tags canonical, change the rules, or pass --no-rules",
+                        config_path.display()
+                    ),
                     _ => e.context(format!("cannot import {name}")),
                 }
             })?;
@@ -458,6 +469,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 s.updated,
                 s.skipped.len()
             )?;
+            if !no_rules && !store.rules().is_empty() {
+                print_rule_stats(&mut out, &s.rules, store.suggest_mode())?;
+            }
         }
         Cmd::Export { format } => match format {
             FormatArg::Json => {
@@ -484,27 +498,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let s = store
                 .apply_rules((!all).then_some(ids.as_slice()))
                 .map_err(|e| rules_hint(e, &config_path))?;
-            let matched = format!(
-                "rules matched {} of {}",
-                s.matched,
-                plural(s.checked, "bookmark")
-            );
-            match store.suggest_mode() {
-                SuggestMode::Confirm => {
-                    writeln!(out, "{matched}: {}", plural(s.pending, "new suggestion"))?;
-                    if !all {
-                        let width = id_width(&store)?;
-                        for id in ids {
-                            print_pending(&mut out, &store.pending(Some(id))?, width, &style)?;
-                        }
-                    }
+            print_rule_stats(&mut out, &s, store.suggest_mode())?;
+            if store.suggest_mode() == SuggestMode::Confirm && !all {
+                let width = id_width(&store)?;
+                for id in ids {
+                    print_pending(&mut out, &store.pending(Some(id))?, width, &style)?;
                 }
-                SuggestMode::Auto => writeln!(
-                    out,
-                    "{matched}: {} applied to {}",
-                    plural(s.applied, "tag"),
-                    plural(s.tagged, "bookmark")
-                )?,
             }
         }
         Cmd::Suggest { cmd: Some(cmd), .. } => {
@@ -576,6 +575,24 @@ fn declared_hint(e: anyhow::Error, declared: Option<&Declared>) -> anyhow::Error
             d.path.display()
         ),
         _ => e,
+    }
+}
+
+/// One line on what the domain rules did, for `suggest` and `import`.
+fn print_rule_stats(out: &mut impl Write, s: &RuleStats, mode: SuggestMode) -> io::Result<()> {
+    let matched = format!(
+        "rules matched {} of {}",
+        s.matched,
+        plural(s.checked, "bookmark")
+    );
+    match mode {
+        SuggestMode::Confirm => writeln!(out, "{matched}: {}", plural(s.pending, "new suggestion")),
+        SuggestMode::Auto => writeln!(
+            out,
+            "{matched}: {} applied to {}",
+            plural(s.applied, "tag"),
+            plural(s.tagged, "bookmark")
+        ),
     }
 }
 

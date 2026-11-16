@@ -1,10 +1,11 @@
-//! Tag suggestions through the library: domain rules, confirm and auto modes, reject memory.
+//! Tag suggestions through the library: domain rules (on add, import, and in bulk), confirm and
+//! auto modes, reject memory.
 
 use std::collections::BTreeMap;
 
 use shlv::{
-    DomainRules, Edit, NewBookmark, NonCanonicalRuleTags, NonCanonicalTags, Source, Store,
-    SuggestMode,
+    DomainRules, Edit, ImportItem, ImportOptions, NewBookmark, NonCanonicalRuleTags,
+    NonCanonicalTags, RuleStats, Source, Store, SuggestMode,
 };
 
 fn rules(pairs: &[(&str, &[&str])]) -> DomainRules {
@@ -383,4 +384,96 @@ fn schema_takes_model_and_llm_suggestions() {
             ("web".into(), "user".into(), None),
         ]
     );
+}
+
+fn item(url: &str, tags: &[&str]) -> ImportItem {
+    ImportItem {
+        url: url.into(),
+        tags: strings(tags),
+        created_at: Some(1_000),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn import_runs_the_rules() {
+    let mut s = store(SuggestMode::Confirm);
+    let old = add(&mut s, "https://github.com/old", &["code"]);
+    let items = [
+        item("https://github.com/old", &[]), // already has the rule's tag
+        item("https://docs.rs/a", &["docs"]), // an imported tag is never also suggested
+        item("https://docs.rs/a#frag", &[]), // a duplicate counts once
+        item("https://example.com/", &[]),
+    ];
+    let sum = s.import(&items, ImportOptions::default()).unwrap();
+    assert_eq!((sum.added, sum.updated), (2, 2));
+    let r = sum.rules;
+    assert_eq!((r.checked, r.matched, r.pending), (3, 2, 1));
+    let a = s.find_by_url("https://docs.rs/a").unwrap().unwrap().id;
+    assert_eq!(pending(&s), [(a, "rust".into())]);
+    assert_eq!(tags(&s, old), ["code"]);
+
+    // Rejections hold on re-import.
+    s.reject(a, &[]).unwrap();
+    let r = s.import(&items, ImportOptions::default()).unwrap().rules;
+    assert_eq!((r.matched, r.pending), (2, 0));
+    assert!(pending(&s).is_empty());
+
+    // Skipped on request.
+    let skip = ImportOptions {
+        skip_rules: true,
+        ..Default::default()
+    };
+    let sum = s.import(&[item("https://docs.rs/b", &[])], skip).unwrap();
+    assert_eq!(sum.rules, RuleStats::default());
+    assert!(pending(&s).is_empty());
+}
+
+#[test]
+fn import_applies_rules_in_auto_mode() {
+    let mut s = store(SuggestMode::Auto);
+    let sum = s
+        .import(
+            &[
+                item("https://docs.rs/a", &[]),
+                item("https://github.com/b", &["mine"]),
+            ],
+            ImportOptions::default(),
+        )
+        .unwrap();
+    let r = sum.rules;
+    assert_eq!((r.matched, r.applied, r.tagged, r.pending), (2, 3, 2, 0));
+    let a = s.find_by_url("https://docs.rs/a").unwrap().unwrap();
+    assert_eq!(a.tags, ["docs", "rust"]);
+    // Part of the import's write: the imported time stays.
+    assert_eq!(a.updated_at, 1_000);
+    assert_eq!(s.search("#rust", 10).unwrap()[0].id, a.id);
+    let b = s.find_by_url("https://github.com/b").unwrap().unwrap().id;
+    assert_eq!(
+        sources(&s, b),
+        [
+            ("code".into(), "rule".into(), Some(1.0)),
+            ("mine".into(), "user".into(), None),
+        ]
+    );
+}
+
+#[test]
+fn import_checks_rule_tags_in_strict_mode() {
+    let mut s = Store::open_in_memory().unwrap();
+    s.add_canonical(&strings(&["code"])).unwrap();
+    s.set_strict_tags(true);
+    s.set_rules(rules(&[("github.com", &["code"]), ("docs.rs", &["rust"])]));
+    let items = [item("https://example.com/", &["code"])];
+
+    let before = changes(&s);
+    let e = s.import(&items, ImportOptions::default()).unwrap_err();
+    assert!(e.downcast_ref::<NonCanonicalRuleTags>().is_some());
+    assert_eq!(changes(&s), before);
+
+    let skip = ImportOptions {
+        skip_rules: true,
+        ..Default::default()
+    };
+    assert_eq!(s.import(&items, skip).unwrap().added, 1);
 }

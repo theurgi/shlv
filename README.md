@@ -90,7 +90,8 @@ every result.
 bookmark and merges tags. It keeps creation times, titles, tags, and notes, and skips `javascript:`
 and `place:` URLs. Browser folders become tags only with `--folders-as-tags`. With `strict_tags`, an
 import with non-canonical tags writes nothing unless you pass `--drop-unknown-tags`. `export` then
-`import` (JSON) reproduces a database, uids included.
+`import` (JSON) reproduces a database, uids included. Domain rules run on imported bookmarks as they
+do on `add`; `--no-rules` skips them.
 
 The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 `~/.local/share/shlv/shlv.db`.
@@ -124,13 +125,13 @@ canonical, points their aliases at them, and unmarks canonical tags that aren't 
 keep their tags. A declared alias that is a tag in the database is merged into its declared tag.
 Mirroring is skipped while the list is unchanged.
 
-`add` records the tags of matching rules as pending suggestions, and `suggest ID...|--all` runs the
-rules on bookmarks you already have. Review them with `suggest ls`, then `suggest accept` or
-`suggest reject`. Accepted tags remember that a rule added them. A rejected suggestion isn't offered
-again for that bookmark, and neither is a rule's tag that you removed with `edit`. To apply
-suggestions without review, set `suggestions = "auto"` under `[tags]`. Rule hosts and tags must be
-normalized, like declared names (`github.com`, not `GitHub.com` or a URL). Later tagging layers (a
-local model and an LLM, both opt-in) will add their suggestions to the same list.
+`add` and `import` record the tags of matching rules as pending suggestions, and
+`suggest ID...|--all` runs the rules on bookmarks you already have. Review them with `suggest ls`,
+then `suggest accept` or `suggest reject`. Accepted tags remember that a rule added them. A rejected
+suggestion isn't offered again for that bookmark, and neither is a rule's tag that you removed with
+`edit`. To apply suggestions without review, set `suggestions = "auto"` under `[tags]`. Rule hosts
+and tags must be normalized, like declared names (`github.com`, not `GitHub.com` or a URL). Later
+tagging layers (a local model and an LLM, both opt-in) will add their suggestions to the same list.
 
 ## Performance
 

@@ -249,7 +249,7 @@ pub enum Offered {
     Skipped,
 }
 
-/// What [`Store::apply_rules`] did.
+/// What [`Store::apply_rules`], or the rules in [`Store::import`], did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RuleStats {
     /// Bookmarks checked.
@@ -352,6 +352,38 @@ pub(crate) fn offer_rules(
     Ok(n)
 }
 
+/// Runs [`offer_rules`] over `(bookmark id, url_norm)` pairs. Returns the stats and the ids that
+/// got new tags (auto mode), which the caller reindexes.
+pub(crate) fn offer_rules_many<'a>(
+    tx: &Transaction,
+    rules: &DomainRules,
+    mode: SuggestMode,
+    targets: impl IntoIterator<Item = (i64, &'a str)>,
+    now: i64,
+) -> Result<(RuleStats, Vec<i64>)> {
+    let mut stats = RuleStats::default();
+    let mut tagged = Vec::new();
+    for (id, norm) in targets {
+        stats.checked += 1;
+        if rules.matching(norm).is_empty() {
+            continue;
+        }
+        stats.matched += 1;
+        let n = offer_rules(tx, rules, mode, id, norm, now)?;
+        match mode {
+            SuggestMode::Confirm => stats.pending += n,
+            SuggestMode::Auto => {
+                stats.applied += n;
+                if n > 0 {
+                    tagged.push(id);
+                }
+            }
+        }
+    }
+    stats.tagged = tagged.len();
+    Ok((stats, tagged))
+}
+
 /// Before a tag a layer applied is removed from a bookmark, remembers it as rejected so it isn't
 /// offered again. User tags (`source = 'user'`) aren't remembered.
 pub(crate) fn reject_applied(
@@ -428,7 +460,6 @@ impl Store {
     }
 
     fn run_rules(&mut self, ids: Option<&[i64]>) -> Result<RuleStats> {
-        let mut stats = RuleStats::default();
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let targets: Vec<(i64, String)> = match ids {
@@ -450,25 +481,13 @@ impl Store {
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?,
         };
-        let mut tagged = Vec::new();
-        for (id, norm) in &targets {
-            stats.checked += 1;
-            if self.rules.matching(norm).is_empty() {
-                continue;
-            }
-            stats.matched += 1;
-            let n = offer_rules(&tx, &self.rules, self.suggest_mode, *id, norm, now)?;
-            match self.suggest_mode {
-                SuggestMode::Confirm => stats.pending += n,
-                SuggestMode::Auto => {
-                    stats.applied += n;
-                    if n > 0 {
-                        tagged.push(*id);
-                    }
-                }
-            }
-        }
-        stats.tagged = tagged.len();
+        let (stats, tagged) = offer_rules_many(
+            &tx,
+            &self.rules,
+            self.suggest_mode,
+            targets.iter().map(|(id, norm)| (*id, norm.as_str())),
+            now,
+        )?;
         touch_many(&tx, &tagged, now)?;
         tx.commit()?;
         Ok(stats)

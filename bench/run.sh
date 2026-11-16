@@ -155,8 +155,18 @@ fresh
 export SHLV_CONFIG=$auto
 TIMEFORMAT="suggest --all (auto): %3R s"
 time "$bin" suggest --all
+# Import with the rules, into an empty database, against the plain imports above.
+SHLV_DB=$db SHLV_CONFIG=/nonexistent "$bin" export >"$work/export.json"
+for config in "$rules" "$auto"; do
+  export SHLV_CONFIG=$config
+  rm -f "$scratch" "$scratch"-wal "$scratch"-shm
+  TIMEFORMAT="import json (new), rules $(basename "$config" .toml): %3R s"
+  time "$bin" import "$work/export.json"
+  TIMEFORMAT="import json (again), rules $(basename "$config" .toml): %3R s"
+  time "$bin" import "$work/export.json"
+done
 export SHLV_CONFIG=/nonexistent
-rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$rules" "$auto"
+rm -f "$scratch" "$scratch"-wal "$scratch"-shm "$rules" "$auto" "$work/export.json"
 
 echo
 echo "binary: $(stat -c %s "$bin") bytes"
