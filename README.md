@@ -251,6 +251,20 @@ $ shlv model eval       # train on your oldest 80%, test on the newest 20%
 90%), and with `--provider` the same for the `[ai] tag` provider on a few test bookmarks, so you can
 choose layers by measurement. Nothing leaves your machine unless you pass `--provider`.
 
+With the classifier built, `suggest` runs the layers in order: domain rules, then the classifier
+(suggestions with source `model` and its probability), then the `[ai] tag` provider where the
+classifier is unsure. `add` runs the classifier too, with the stored model. Tune it in `[model]`:
+
+```toml
+[model]
+threshold = 0.5 # offer classifier tags with at least this probability
+auto_threshold = 0.9 # with suggestions = "auto", apply only from here up; the rest wait
+provider = "fallback" # ask [ai] tag: "fallback" (when the classifier is unsure), "always", "never"
+```
+
+"Unsure" means nothing reached `threshold`, or a tag that did has fewer than 50 examples. Every
+accepted or rejected suggestion is a training example the next time the model trains.
+
 ## Performance
 
 Measured with [`bench/run.sh`](bench/run.sh) on 100k synthetic bookmarks (release build, warm cache,

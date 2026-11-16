@@ -464,13 +464,25 @@ pub struct Stored {
     pub stale: bool,
 }
 
-/// The canonical list as the classifier sees it.
+/// The canonical list as the classifier sees it: names, aliases, descriptions. Unlike
+/// [`crate::Store::canonical_tags`] it doesn't count bookmarks, which costs milliseconds at 100k.
 pub fn canonical_list(store: &crate::Store) -> Result<Vec<TagOption>> {
-    Ok(store
-        .canonical_tags()?
-        .iter()
-        .map(TagOption::from)
-        .collect())
+    let mut stmt = store.conn().prepare_cached(
+        "SELECT t.name, t.description, (SELECT group_concat(a.alias, ' ' ORDER BY a.alias) \
+         FROM tag_alias a WHERE a.tag_id = t.id) FROM tag t \
+         WHERE t.canonical AND t.deleted_at IS NULL ORDER BY t.name",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let aliases: Option<String> = r.get(2)?;
+        Ok(TagOption {
+            name: r.get(0)?,
+            description: r.get(1)?,
+            aliases: aliases
+                .map(|a| a.split(' ').map(str::to_string).collect())
+                .unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 impl crate::Store {
@@ -602,6 +614,12 @@ impl crate::Store {
 
     /// The stored model, if there is one.
     pub fn stored_model(&self) -> Result<Option<Stored>> {
+        self.load_model(true)
+    }
+
+    /// Loads the stored model; `check_stale` compares its fingerprint with the data now, which
+    /// scans the tag tables (milliseconds at 100k bookmarks), so `add` skips it.
+    fn load_model(&self, check_stale: bool) -> Result<Option<Stored>> {
         use rusqlite::OptionalExtension;
         let row: Option<(Vec<u8>, String, i64)> = self
             .conn()
@@ -618,29 +636,128 @@ impl crate::Store {
             bytes: data.len(),
             model: Model::from_bytes(&data)?,
             trained_at,
-            stale: fp != self.model_fingerprint()?,
+            stale: check_stale && fp != self.model_fingerprint()?,
         }))
     }
 
     /// The classifier for the current canonical list: the stored model, retrained first if
-    /// `retrain_stale` and the tags changed since. `None` model means lexical only.
+    /// `retrain_stale` and the tags changed since (or there is none). `None` model means
+    /// lexical only.
     pub fn classifier(&mut self, retrain_stale: bool) -> Result<Classifier> {
-        let stored = self.stored_model()?;
+        let stored = self.load_model(retrain_stale)?;
         let model = match stored {
-            Some(s) if s.stale && retrain_stale => {
+            Some(s) if !s.stale => Some(s.model),
+            Some(s) if !retrain_stale => Some(s.model),
+            None if !retrain_stale => None,
+            _ => {
                 self.train_model()?;
-                self.stored_model()?.map(|s| s.model)
+                self.load_model(false)?.map(|s| s.model)
             }
-            None if retrain_stale => {
-                self.train_model()?;
-                self.stored_model()?.map(|s| s.model)
-            }
-            s => s.map(|s| s.model),
         };
         Ok(Classifier::new(&canonical_list(self)?, model.as_ref()))
     }
 }
 
+/// What [`crate::Store::apply_model`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelStats {
+    pub checked: usize,
+    /// New pending suggestions.
+    pub pending: usize,
+    /// Tags applied (auto mode, at or above `auto_threshold`).
+    pub applied: usize,
+    /// Bookmarks the classifier was sure about: a tag at or above the threshold, and every such
+    /// tag trained on enough examples. The provider fallback skips these.
+    pub sure: HashSet<i64>,
+}
+
+impl crate::Store {
+    /// Runs the classifier on the given bookmarks (or all) and offers its tags at or above
+    /// `config.threshold` as source `model`, with their probability, in one transaction. In auto
+    /// mode only tags at or above `config.auto_threshold` are applied; the others wait.
+    pub fn apply_model(
+        &mut self,
+        ids: Option<&[i64]>,
+        classifier: &Classifier,
+        config: &crate::config::ModelConfig,
+    ) -> Result<ModelStats> {
+        use crate::suggest::{Offered, Source, SuggestMode, offer};
+
+        let mode = self.suggest_mode();
+        let now = crate::store::now_ms();
+        let tx = self.conn.transaction()?;
+        let rows: Vec<(i64, Item)> = {
+            let sql = "SELECT id, url, title, note, summary FROM bookmark WHERE deleted_at IS NULL";
+            let read = |r: &rusqlite::Row| -> rusqlite::Result<(i64, Item)> {
+                Ok((
+                    r.get(0)?,
+                    Item {
+                        url: r.get(1)?,
+                        title: r.get(2)?,
+                        note: r.get(3)?,
+                        summary: r.get(4)?,
+                        text: None,
+                    },
+                ))
+            };
+            match ids {
+                None => tx
+                    .prepare(sql)?
+                    .query_map([], read)?
+                    .collect::<rusqlite::Result<_>>()?,
+                Some(ids) => {
+                    let mut stmt = tx.prepare(&format!("{sql} AND id = ?1"))?;
+                    let mut v = Vec::with_capacity(ids.len());
+                    for &id in ids {
+                        match rusqlite::OptionalExtension::optional(stmt.query_row([id], read))? {
+                            Some(row) => v.push(row),
+                            None => bail!("no bookmark with id {id}"),
+                        }
+                    }
+                    v
+                }
+            }
+        };
+        let mut stats = ModelStats::default();
+        let mut tagged = Vec::new();
+        for (id, item) in rows {
+            stats.checked += 1;
+            let likely: Vec<(String, f64)> = classifier
+                .probabilities(&item)
+                .into_iter()
+                .filter(|(_, p)| *p >= config.threshold)
+                .collect();
+            if !likely.is_empty() && likely.iter().all(|(t, _)| !classifier.is_cold(t)) {
+                stats.sure.insert(id);
+            }
+            let mut applied = false;
+            for (tag, p) in likely {
+                let Some(tag_id) = crate::store::resolve_tag(&tx, &tag)? else {
+                    continue;
+                };
+                let m = if mode == SuggestMode::Auto && p >= config.auto_threshold {
+                    SuggestMode::Auto
+                } else {
+                    SuggestMode::Confirm
+                };
+                match offer(&tx, id, tag_id, Source::Model, Some(p), m, now)? {
+                    Offered::Pending => stats.pending += 1,
+                    Offered::Applied => {
+                        stats.applied += 1;
+                        applied = true;
+                    }
+                    Offered::Skipped => {}
+                }
+            }
+            if applied {
+                tagged.push(id);
+            }
+        }
+        crate::store::touch_many(&tx, &tagged, now)?;
+        tx.commit()?;
+        Ok(stats)
+    }
+}
 /// Ranking and calibration metrics for a tagging layer, as 025 measured them.
 #[derive(Debug, Clone, Default)]
 pub struct Metrics {

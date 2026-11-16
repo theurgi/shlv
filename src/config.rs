@@ -27,6 +27,10 @@ pub struct Config {
     pub strict_tags: bool,
     #[serde(default, skip_serializing_if = "Tags::is_empty")]
     pub tags: Tags,
+    /// The tag classifier (feature `model`): thresholds and when to ask the provider. Parsed in
+    /// every build so one config works across builds.
+    #[serde(default, skip_serializing_if = "ModelConfig::is_default")]
+    pub model: ModelConfig,
     /// Which provider does which AI task.
     #[cfg(feature = "ai")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,6 +49,60 @@ pub struct Config {
     provider: Option<IgnoredAny>,
 }
 
+/// The `[model]` section: how the tag classifier's suggestions are used (feature `model`).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ModelConfig {
+    /// Offer classifier tags with at least this probability (025 measured 67% precision at 0.5).
+    pub threshold: f64,
+    /// With `[tags] suggestions = "auto"`, apply classifier tags only from this probability up
+    /// (84% precision at 0.9 in 025 and 022); the rest wait for review.
+    pub auto_threshold: f64,
+    /// When `suggest` also asks the `[ai] tag` provider.
+    pub provider: ProviderUse,
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        ModelConfig {
+            threshold: 0.5,
+            auto_threshold: 0.9,
+            provider: ProviderUse::Fallback,
+        }
+    }
+}
+
+impl ModelConfig {
+    fn is_default(&self) -> bool {
+        *self == ModelConfig::default()
+    }
+
+    fn check(&self) -> Result<(), String> {
+        for (name, v) in [
+            ("threshold", self.threshold),
+            ("auto_threshold", self.auto_threshold),
+        ] {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("[model] {name} must be between 0 and 1, not {v}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// When the `[ai] tag` provider runs, with the classifier built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderUse {
+    /// For every bookmark `suggest` handles.
+    Always,
+    /// Only where the classifier is unsure: nothing at or above `threshold`, or its likeliest
+    /// tags have too few examples to trust.
+    #[default]
+    Fallback,
+    /// Never; the classifier and rules only.
+    Never,
+}
 /// The `[tags]` section.
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +156,9 @@ impl Config {
             .map_err(|e| at(e.span().map(|s| s.start), e.message().trim_end()))?;
         if let Some((host, msg)) = config.undeclared_rule_tag() {
             return Err(at(config.tags.rules.span(host).map(|s| s.start), &msg));
+        }
+        if let Err(msg) = config.model.check() {
+            return Err(at(None, &msg));
         }
         #[cfg(feature = "ai")]
         if let Some((pos, msg)) = config.bad_ai() {

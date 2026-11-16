@@ -389,7 +389,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let verb = if added.created { "added" } else { "updated" };
             write!(out, "{verb} ")?;
             print_line(&mut out, &b, 0, &style)?;
-            if !store.rules().is_empty() {
+            // The classifier runs on new bookmarks too: offline and fast, with the stored model
+            // (`suggest` retrains it; `add` doesn't wait for that).
+            #[cfg(feature = "model")]
+            let model_ran = if shlv::model::canonical_list(&store)?.is_empty() {
+                false
+            } else {
+                let classifier = store.classifier(false)?;
+                store.apply_model(Some(&[added.id]), &classifier, &config.model)?;
+                true
+            };
+            #[cfg(not(feature = "model"))]
+            let model_ran = false;
+            if !store.rules().is_empty() || model_ran {
                 let pending = store.pending(Some(added.id))?;
                 if !pending.is_empty() {
                     write!(out, "suggested")?;
@@ -564,11 +576,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             #[cfg(feature = "ai")]
             llm,
         } => {
+            // The classifier runs whenever it's built and there's a canonical list to choose from.
+            #[cfg(feature = "model")]
+            let model_on = !shlv::model::canonical_list(&store)?.is_empty();
+            #[cfg(not(feature = "model"))]
+            let model_on = false;
             #[cfg(feature = "ai")]
-            let provider = ai_cmd::tag_provider(&config)?;
+            let provider = match config.model.provider {
+                config::ProviderUse::Never if model_on => None,
+                _ => ai_cmd::tag_provider(&config)?,
+            };
             #[cfg(not(feature = "ai"))]
             let provider: Option<()> = None;
-            if store.rules().is_empty() && provider.is_none() {
+            if store.rules().is_empty() && provider.is_none() && !model_on {
                 let llm = if cfg!(feature = "ai") {
                     ", and no [ai] tag provider"
                 } else {
@@ -585,16 +605,42 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     .map_err(|e| rules_hint(e, &config_path))?;
                 print_rule_stats(&mut out, &s, store.suggest_mode())?;
             }
+            // Bookmarks the classifier is sure about; with `provider = "fallback"` the provider
+            // skips them.
+            #[cfg(feature = "model")]
+            let sure = if model_on {
+                let classifier = store.classifier(true)?;
+                let s = store.apply_model(
+                    (!all).then_some(ids.as_slice()),
+                    &classifier,
+                    &config.model,
+                )?;
+                print_model_stats(&mut out, &s, store.suggest_mode())?;
+                (config.model.provider == config::ProviderUse::Fallback).then_some(s.sure)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "model"))]
+            let sure: Option<std::collections::HashSet<i64>> = None;
             #[cfg(feature = "ai")]
             let code = match provider {
                 Some(p) => {
                     out.flush()?;
-                    ai_cmd::run_suggest_llm(&mut store, &config, &p, &ids, all, &llm, &mut out)?
+                    ai_cmd::run_suggest_llm(
+                        &mut store,
+                        &config,
+                        &p,
+                        &ids,
+                        all,
+                        &llm,
+                        sure.as_ref(),
+                        &mut out,
+                    )?
                 }
                 None => ExitCode::SUCCESS,
             };
             #[cfg(not(feature = "ai"))]
-            let code = ExitCode::SUCCESS;
+            let (code, _) = (ExitCode::SUCCESS, sure);
             if store.suggest_mode() == SuggestMode::Confirm && !all {
                 let width = id_width(&store)?;
                 for id in ids {
@@ -842,6 +888,24 @@ fn print_rule_stats(out: &mut impl Write, s: &RuleStats, mode: SuggestMode) -> i
     }
 }
 
+/// One line on what the classifier did, for `suggest`.
+#[cfg(feature = "model")]
+fn print_model_stats(
+    out: &mut impl Write,
+    s: &shlv::model::ModelStats,
+    mode: SuggestMode,
+) -> io::Result<()> {
+    let checked = format!("model checked {}", plural(s.checked, "bookmark"));
+    match mode {
+        SuggestMode::Confirm => writeln!(out, "{checked}: {}", plural(s.pending, "new suggestion")),
+        SuggestMode::Auto => writeln!(
+            out,
+            "{checked}: {} applied, {} to review",
+            plural(s.applied, "tag"),
+            s.pending
+        ),
+    }
+}
 /// Names the config file when domain rules break strict mode.
 fn rules_hint(e: anyhow::Error, config: &Path) -> anyhow::Error {
     match e.downcast_ref::<NonCanonicalRuleTags>() {

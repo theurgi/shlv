@@ -247,9 +247,15 @@ fn needs_a_canonical_list_and_reports_failures() {
         "{err}"
     );
 
-    // Without [ai] tag and rules, there's nothing to suggest with.
+    // Without [ai] tag and rules, there's nothing to suggest with, unless the classifier is
+    // built: the database still has canonical tags for it to choose from.
     f.config("");
-    let (code, _, err) = f.run(&["suggest", "1"]);
+    let (code, out, err) = f.run(&["suggest", "1"]);
+    if cfg!(feature = "model") {
+        assert_eq!(code, 0, "{err}");
+        assert!(out.starts_with("model checked 1 bookmark"), "{out}");
+        return;
+    }
     assert_eq!(code, 1);
     assert!(
         err.contains("no domain rules") && err.contains("no [ai] tag provider"),

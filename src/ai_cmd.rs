@@ -283,6 +283,7 @@ struct Tagged {
 
 /// The LLM layer of `suggest`: asks the `[ai] tag` provider to choose from the canonical list,
 /// and offers its choices like the other layers (source `llm`, no confidence).
+#[allow(clippy::too_many_arguments)]
 pub fn run_suggest_llm(
     store: &mut Store,
     config: &Config,
@@ -290,6 +291,7 @@ pub fn run_suggest_llm(
     ids: &[i64],
     all: bool,
     args: &LlmArgs,
+    skip: Option<&std::collections::HashSet<i64>>,
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     use shlv::Source;
@@ -311,6 +313,10 @@ pub fn run_suggest_llm(
     let mut work = Vec::with_capacity(targets.len());
     for b in targets {
         if all && !args.force && store.suggested_by(b.id, Source::Llm)? {
+            continue;
+        }
+        // The classifier was sure about it (`[model] provider = "fallback"`).
+        if skip.is_some_and(|s| s.contains(&b.id)) {
             continue;
         }
         // Tags the bookmark has or rejected aren't offered to the model at all.
