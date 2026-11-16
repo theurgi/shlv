@@ -30,6 +30,19 @@ pub struct ImportItem {
     pub uid: Option<String>,
 }
 
+impl ImportItem {
+    /// Keeps only the URL, the add date, and, with `keep_title`, the title: for moving from
+    /// another app without its tags, notes, and summaries (`import --urls-only`).
+    pub fn urls_only(&mut self, keep_title: bool) {
+        *self = ImportItem {
+            url: std::mem::take(&mut self.url),
+            title: self.title.take().filter(|_| keep_title),
+            created_at: self.created_at,
+            ..Default::default()
+        };
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Format {
     #[default]
@@ -49,12 +62,69 @@ impl Format {
     }
 }
 
+/// Karakeep's JSON export: `{"bookmarks": [...], "lists": [...]}`.
+#[derive(serde::Deserialize)]
+struct KarakeepExport {
+    bookmarks: Vec<KarakeepBookmark>,
+}
+
+#[derive(serde::Deserialize)]
+struct KarakeepBookmark {
+    /// Unix seconds (Karakeep's last save of the bookmark, not its first).
+    #[serde(rename = "createdAt")]
+    created_at: Option<i64>,
+    title: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    content: Option<KarakeepContent>,
+    note: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct KarakeepContent {
+    #[serde(rename = "type")]
+    kind: String,
+    url: Option<String>,
+}
+
+impl KarakeepExport {
+    /// Link bookmarks only: text notes have no URL.
+    fn into_items(self) -> Vec<ImportItem> {
+        self.bookmarks
+            .into_iter()
+            .filter_map(|b| {
+                let url = b.content.filter(|c| c.kind == "link")?.url?;
+                Some(ImportItem {
+                    url,
+                    title: b.title,
+                    note: b.note,
+                    tags: b.tags,
+                    created_at: b.created_at.filter(|&s| s > 0).map(|s| s * 1000),
+                    ..Default::default()
+                })
+            })
+            .collect()
+    }
+}
+
 /// Parses JSON lines: one object per line; blank lines are skipped. A whole-file JSON array of
-/// objects is accepted too.
+/// objects is accepted too, and so is Karakeep's JSON export (its link bookmarks).
 pub fn parse_json(text: &str) -> Result<Vec<ImportItem>> {
     let text = text.trim_start_matches('\u{feff}');
     if text.trim_start().starts_with('[') {
         return serde_json::from_str(text).context("invalid JSON array");
+    }
+    // A JSON lines file fails the probe on its first line: no `bookmarks`, or text after the
+    // object. The probe skips values without building them; the real parse then reports errors.
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[allow(dead_code)]
+        bookmarks: serde::de::IgnoredAny,
+    }
+    if text.trim_start().starts_with('{') && serde_json::from_str::<Probe>(text).is_ok() {
+        let export: KarakeepExport =
+            serde_json::from_str(text).context("not a Karakeep JSON export")?;
+        return Ok(export.into_items());
     }
     let mut items = Vec::new();
     for (i, line) in text.lines().enumerate() {
@@ -114,11 +184,19 @@ fn browser_only(url: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether `title` is just the bookmark's URL, as exporters write for untitled bookmarks (Karakeep
+/// does). Such a title says nothing and would keep `fetch --all` from finding a real one.
+fn is_url_of(title: &str, norm: &str) -> bool {
+    !title.contains(char::is_whitespace) && crate::url::normalize(title) == norm
+}
+
 /// An item that passed checks, ready to write.
 struct Ready<'a> {
     item: &'a ImportItem,
     url: String,
     norm: String,
+    /// The item's title, unless it's empty or only the URL.
+    title: Option<&'a str>,
     tags: Vec<String>,
 }
 
@@ -150,8 +228,10 @@ impl Store {
                         .map(|t| normalize_tag(t))
                         .filter(|t| !t.is_empty())
                         .collect();
+                    let title = non_empty(&item.title).filter(|t| !is_url_of(t, &norm));
                     ready.push(Ready {
                         item,
+                        title,
                         url,
                         norm,
                         tags,
@@ -211,7 +291,7 @@ impl Store {
                 &Put {
                     url: &r.url,
                     norm: &r.norm,
-                    title: non_empty(&r.item.title),
+                    title: r.title,
                     note: non_empty(&r.item.note),
                     summary: non_empty(&r.item.summary),
                     tags: &r.tags,
@@ -245,5 +325,60 @@ impl Store {
         reindex_many(&tx, &ids)?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urls_only_keeps_url_date_and_maybe_title() {
+        let full = ImportItem {
+            url: "https://a.example/".into(),
+            title: Some("A".into()),
+            note: Some("n".into()),
+            summary: Some("s".into()),
+            tags: vec!["x".into()],
+            created_at: Some(1),
+            updated_at: Some(2),
+            uid: Some("u".into()),
+        };
+        let mut item = full.clone();
+        item.urls_only(true);
+        assert_eq!(
+            item,
+            ImportItem {
+                url: full.url.clone(),
+                title: full.title.clone(),
+                created_at: Some(1),
+                ..Default::default()
+            }
+        );
+        item.urls_only(false);
+        assert_eq!(item.title, None);
+    }
+
+    #[test]
+    fn karakeep_json_errors_and_json_lines() {
+        let err = parse_json("{\"bookmarks\": [{\"createdAt\": \"soon\"}]}").unwrap_err();
+        assert_eq!(err.to_string(), "not a Karakeep JSON export");
+        // A one-line JSON lines file isn't mistaken for it.
+        let items = parse_json("{\"url\": \"https://a.example/\"}\n").unwrap();
+        assert_eq!(items[0].url, "https://a.example/");
+        let items = parse_json("{\"url\": \"https://a.example/\"}\n{\"url\": \"b\"}").unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn titles_that_are_the_url() {
+        let norm = crate::url::normalize("https://lwn.net/");
+        assert!(is_url_of("https://lwn.net/", &norm));
+        assert!(is_url_of("lwn.net", &norm));
+        assert!(!is_url_of(
+            "LWN.net",
+            &crate::url::normalize("https://lwn.net/a")
+        ));
+        assert!(!is_url_of("lwn net", &norm));
     }
 }

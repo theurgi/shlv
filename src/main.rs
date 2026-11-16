@@ -137,6 +137,13 @@ enum Cmd {
         /// Don't run the domain rules ([tags.rules]) on the imported bookmarks
         #[arg(long)]
         no_rules: bool,
+        /// Keep only URLs, add dates, and titles: no tags, notes, or summaries (for moving from
+        /// another app and tagging afresh)
+        #[arg(long, conflicts_with_all = ["folders_as_tags", "drop_unknown_tags"])]
+        urls_only: bool,
+        /// With --urls-only, drop titles too (`shlv fetch --all` gets them again)
+        #[arg(long, requires = "urls_only")]
+        no_titles: bool,
     },
     /// Print every bookmark: JSON lines (like `ls --json`) or Netscape HTML for browsers
     Export {
@@ -505,6 +512,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             folders_as_tags,
             drop_unknown_tags,
             no_rules,
+            urls_only,
+            no_titles,
         } => {
             let text = read_input(&file)?;
             let format = match format {
@@ -513,8 +522,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 None => Format::detect(&text),
             };
             let name = file.display();
-            let items = transfer::parse(&text, format, folders_as_tags)
+            let mut items = transfer::parse(&text, format, folders_as_tags)
                 .with_context(|| format!("cannot read {name}"))?;
+            if urls_only {
+                for item in &mut items {
+                    item.urls_only(!no_titles);
+                }
+            }
             let opts = ImportOptions {
                 drop_non_canonical: drop_unknown_tags,
                 skip_rules: no_rules,

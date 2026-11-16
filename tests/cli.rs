@@ -1167,3 +1167,128 @@ fn import_runs_domain_rules() {
         )
     );
 }
+
+#[test]
+fn import_urls_only_karakeep_html() {
+    let db = Db::new();
+    std::fs::create_dir_all(&db.0).unwrap();
+    std::fs::write(
+        db.config(),
+        "[tags.rules]\n\"rust-lang.org\" = [\"rust\"]\n",
+    )
+    .unwrap();
+    // Already saved, with a tag and a note of its own: merged as today, keeping both.
+    db.ok(&["add", "https://lwn.net", "-t", "linux", "--note", "mine"]);
+    let file = fixture("karakeep.html");
+    assert_eq!(
+        db.ok(&["import", "--urls-only", &file]),
+        format!(
+            "imported {file}: 2 added, 2 updated, 0 skipped\n\
+             rules matched 1 of 3 bookmarks: 1 new suggestion\n"
+        )
+    );
+    let v = json_lines(&db.ok(&["export"]));
+    assert_eq!(v.len(), 3);
+    // No Karakeep tags; a later duplicate's title wins and the earlier date stays.
+    let rust = find(&v, "https://www.rust-lang.org/");
+    assert_eq!(rust["tags"], serde_json::json!([]));
+    assert_eq!(rust["title"], "Rust (older copy)");
+    assert_eq!(rust["created_at"], 1_690_000_000_000i64);
+    let tom = find(&v, "https://example.com/a?x=1&y=2");
+    assert_eq!(tom["title"], "Tom & Jerry: \"A History\"");
+    assert_eq!(tom["tags"], serde_json::json!([]));
+    assert_eq!(tom["created_at"], 1_700_000_200_000i64);
+    // Karakeep writes the URL as the title of an untitled bookmark; that isn't a title.
+    let lwn = find(&v, "https://lwn.net");
+    assert!(lwn["title"].is_null(), "{lwn}");
+    assert_eq!(lwn["tags"], serde_json::json!(["linux"]));
+    assert_eq!(lwn["note"], "mine");
+    assert_eq!(lwn["created_at"], 1_700_000_100_000i64);
+    assert_eq!(db.ok(&["suggest", "ls"]).lines().count(), 1);
+}
+
+#[test]
+fn import_urls_only_without_titles() {
+    let db = Db::new();
+    let file = fixture("karakeep.html");
+    db.ok(&["import", "--urls-only", "--no-titles", "--no-rules", &file]);
+    for b in json_lines(&db.ok(&["export"])) {
+        assert!(
+            b["title"].is_null() && b["tags"] == serde_json::json!([]),
+            "{b}"
+        );
+    }
+}
+
+#[test]
+fn import_karakeep_json() {
+    let file = fixture("karakeep.json");
+    // In full: tags and notes come in; the text note (no URL) doesn't.
+    let db = Db::new();
+    assert!(
+        db.ok(&["import", &file])
+            .ends_with(": 2 added, 0 updated, 0 skipped\n")
+    );
+    let v = json_lines(&db.ok(&["export"]));
+    let rust = find(&v, "https://www.rust-lang.org/");
+    assert_eq!(rust["note"], "my note");
+    assert_eq!(
+        rust["tags"],
+        serde_json::json!(["programming", "rust", "systems-programming"])
+    );
+    assert_eq!(rust["created_at"], 1_700_000_000_000i64);
+    // Karakeep's JSON keeps percent-escapes as they are (its HTML export doesn't).
+    let cafe = find(&v, "https://example.org/caf%C3%A9");
+    assert!(cafe["title"].is_null());
+    assert_eq!(cafe["created_at"], 1_700_000_100_000i64);
+
+    let db = Db::new();
+    db.ok(&["import", "--urls-only", &file]);
+    let v = json_lines(&db.ok(&["export"]));
+    assert_eq!(v.len(), 2);
+    let rust = find(&v, "https://www.rust-lang.org/");
+    assert!(rust["note"].is_null());
+    assert_eq!(rust["tags"], serde_json::json!([]));
+    assert_eq!(rust["title"], "Rust Programming Language");
+    assert_eq!(rust["created_at"], 1_700_000_000_000i64);
+}
+
+#[test]
+fn import_urls_only_json_lines() {
+    let db = Db::new();
+    std::fs::create_dir_all(&db.0).unwrap();
+    let file = db.0.join("in.jsonl");
+    std::fs::write(
+        &file,
+        "{\"url\":\"https://a.example/\",\"title\":\"A\",\"note\":\"n\",\"summary\":\"s\",\
+         \"tags\":[\"x\"],\"created_at\":1000,\"updated_at\":5000,\
+         \"uid\":\"0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b\"}\n",
+    )
+    .unwrap();
+    db.ok(&["import", "--urls-only", file.to_str().unwrap()]);
+    let v = json_lines(&db.ok(&["export"]));
+    let a = find(&v, "https://a.example/");
+    assert_eq!(a["title"], "A");
+    assert_eq!(
+        (a["created_at"].as_i64(), a["updated_at"].as_i64()),
+        (Some(1000), Some(1000))
+    );
+    assert!(a["note"].is_null() && a["summary"].is_null(), "{a}");
+    assert_eq!(a["tags"], serde_json::json!([]));
+    assert_ne!(a["uid"], "0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b");
+}
+
+#[test]
+fn import_urls_only_refuses_tag_options() {
+    let db = Db::new();
+    let file = fixture("chromium.html");
+    for flag in ["--folders-as-tags", "--drop-unknown-tags"] {
+        let err = db.fail(&["import", "--urls-only", flag, &file]);
+        assert!(
+            err.contains(&format!("'--urls-only' cannot be used with '{flag}'")),
+            "{err}"
+        );
+    }
+    let err = db.fail(&["import", "--no-titles", &file]);
+    assert!(err.contains("--urls-only"), "{err}");
+}
