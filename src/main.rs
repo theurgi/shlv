@@ -34,7 +34,7 @@ enum Cmd {
         title: Option<String>,
         #[arg(long)]
         note: Option<String>,
-        /// Fetch the page title (not built yet)
+        /// Fetch the page and use its title (unless --title is given)
         #[arg(long)]
         fetch: bool,
     },
@@ -134,6 +134,25 @@ enum Cmd {
     Export {
         #[arg(long, value_enum, default_value_t = FormatArg::Json)]
         format: FormatArg,
+    },
+    /// Fetch page titles: for the IDs given, or with --all for every bookmark without one
+    #[cfg(feature = "fetch")]
+    Fetch {
+        #[arg(
+            value_name = "ID",
+            required_unless_present = "all",
+            conflicts_with = "all"
+        )]
+        ids: Vec<i64>,
+        /// Every bookmark without a title
+        #[arg(long)]
+        all: bool,
+        /// With --all, refetch titles that are already set
+        #[arg(long, requires = "all")]
+        force: bool,
+        /// Requests at a time
+        #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=32))]
+        jobs: u16,
     },
     /// Show where the config file is and what it sets
     Config {
@@ -301,9 +320,16 @@ fn run(cli: Cli) -> Result<ExitCode> {
             note,
             fetch,
         } => {
+            #[cfg(not(feature = "fetch"))]
             if fetch {
-                bail!("--fetch isn't available yet; this build has no fetch support");
+                bail!("--fetch isn't available: this build has no fetch support (feature `fetch`)");
             }
+            // The request runs before the write transaction, so no lock is held while waiting.
+            #[cfg(feature = "fetch")]
+            let title = match title {
+                None if fetch => fetch_title(&url),
+                t => t,
+            };
             let added = store
                 .add(&NewBookmark {
                     url,
@@ -509,10 +535,123 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Cmd::Suggest { cmd: Some(cmd), .. } => {
             run_suggest(&mut store, cmd, declared.as_ref(), &mut out, &style)?
         }
+        #[cfg(feature = "fetch")]
+        Cmd::Fetch {
+            ids,
+            all,
+            force,
+            jobs,
+        } => return run_fetch(&mut store, &ids, all, force, jobs.into(), &mut out, &style),
         Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }
     out.flush()?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// `add --fetch`: the page title, or `None` with a warning. A failed fetch doesn't fail `add`;
+/// see task 016.
+#[cfg(feature = "fetch")]
+fn fetch_title(url: &str) -> Option<String> {
+    let full = shlv::store::check_url(url).ok()?.0;
+    match shlv::fetch::Fetcher::default().get(&full) {
+        Ok(page) => {
+            let title = shlv::fetch::title(&page.html);
+            if title.is_none() {
+                eprintln!("shlv: warning: {full} has no title");
+            }
+            title
+        }
+        Err(e) => {
+            eprintln!("shlv: warning: cannot fetch {full}: {e}; adding it without a title");
+            None
+        }
+    }
+}
+
+/// `shlv fetch`: sets titles from the pages, a few requests at a time, one commit per bookmark.
+#[cfg(feature = "fetch")]
+fn run_fetch(
+    store: &mut Store,
+    ids: &[i64],
+    all: bool,
+    force: bool,
+    jobs: usize,
+    out: &mut impl Write,
+    style: &Style,
+) -> Result<ExitCode> {
+    use shlv::bulk::{self, Progress};
+    use shlv::fetch::{self, Fetcher};
+
+    let targets: Vec<(i64, String)> = if all {
+        let mut v = Vec::new();
+        store.list_each(
+            &ListQuery {
+                tags: Vec::new(),
+                limit: usize::MAX,
+            },
+            |b| {
+                if force || b.title.is_none() {
+                    v.push((b.id, b.url));
+                }
+                Ok(())
+            },
+        )?;
+        v
+    } else {
+        ids.iter()
+            .map(|&id| Ok((id, get(store, id)?.url)))
+            .collect::<Result<_>>()?
+    };
+    let fetcher = Fetcher::default();
+    let mut progress = Progress::new("fetching", targets.len());
+    let (mut set, mut untitled, mut failed) = (0, 0, 0);
+    let width = id_width(store)?;
+    bulk::run(
+        &targets,
+        jobs,
+        |(_, url)| fetcher.get(url).map(|p| fetch::title(&p.html)),
+        |i, r| -> Result<()> {
+            let (id, url) = &targets[i];
+            progress.clear();
+            match r {
+                Ok(Some(title)) => {
+                    let edit = Edit {
+                        title: Some(title),
+                        ..Default::default()
+                    };
+                    // The bookmark may have been deleted meanwhile; then there's nothing to set.
+                    if store.edit(*id, &edit)? {
+                        set += 1;
+                        print_line(out, &get(store, *id)?, width, style)?;
+                        out.flush()?;
+                    }
+                }
+                Ok(None) => {
+                    untitled += 1;
+                    eprintln!("shlv: {id}: {url} has no title");
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("shlv: {id}: cannot fetch {url}: {e}");
+                }
+            }
+            progress.tick();
+            Ok(())
+        },
+    )?;
+    drop(progress);
+    if targets.len() > 1 || all {
+        eprintln!(
+            "shlv: fetched {} of {}: {untitled} without a title, {failed} failed",
+            plural(set, "title"),
+            plural(targets.len(), "bookmark"),
+        );
+    }
+    Ok(if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn run_config(cmd: ConfigCmd, out: &mut impl Write) -> Result<()> {

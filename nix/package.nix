@@ -1,12 +1,15 @@
 {
   lib,
   rustPlatform,
+  # Cargo features to build with; `shlv-full` passes all of them.
+  features ? [ ],
+  pname ? "shlv",
 }:
 let
   fs = lib.fileset;
 in
 rustPlatform.buildRustPackage {
-  pname = "shlv";
+  inherit pname;
   inherit ((lib.importTOML ../Cargo.toml).package) version;
 
   src = fs.toSource {
@@ -22,6 +25,10 @@ rustPlatform.buildRustPackage {
   };
 
   cargoLock.lockFile = ../Cargo.lock;
+  buildFeatures = features;
+
+  # The fetch tests run a local HTTP server on 127.0.0.1.
+  __darwinAllowLocalNetworking = true;
 
   # nixpkgs' cargo setup hook exports LIBSQLITE3_SYS_USE_PKG_CONFIG=1, which overrides rusqlite's
   # `bundled` feature. Keep the bundled SQLite so the package matches what `cargo test` and

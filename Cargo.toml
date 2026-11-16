@@ -27,6 +27,12 @@ toml = { version = "1.2.1", default-features = false, features = [
   "display",
 ] }
 uuid = { version = "1.29.2", features = ["v7"] }
+# HTTPS with rustls and bundled webpki roots; no gzip, no charset (see task 016).
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
+
+[features]
+# Network access: `add --fetch` and `shlv fetch`. Off by default; the core stays offline.
+fetch = ["dep:ureq"]
 
 [profile.release]
 lto = true

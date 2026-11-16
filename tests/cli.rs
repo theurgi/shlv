@@ -212,9 +212,10 @@ fn open_uses_browser() {
 #[test]
 fn errors_and_usage() {
     let db = Db::new();
+    #[cfg(not(feature = "fetch"))]
     assert!(
         db.fail(&["add", "https://a.com", "--fetch"])
-            .contains("--fetch")
+            .contains("no fetch support")
     );
     assert!(
         db.fail(&["add", "https://a.com", "-t", " "])

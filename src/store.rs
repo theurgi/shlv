@@ -441,7 +441,7 @@ impl Store {
 }
 
 /// Completes and checks a URL; returns it and its normalized form.
-pub(crate) fn check_url(input: &str) -> Result<(String, String)> {
+pub fn check_url(input: &str) -> Result<(String, String)> {
     let full = url::complete(input);
     if full.trim() == "https://" || full.chars().any(char::is_whitespace) {
         bail!("invalid URL: {input:?}");

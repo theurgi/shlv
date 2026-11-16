@@ -13,6 +13,9 @@
         "aarch64-darwin"
       ];
       forAll = f: lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
+      allFeatures = lib.remove "default" (
+        builtins.attrNames ((lib.importTOML ./Cargo.toml).features or { })
+      );
 
       # Everything tracked, minus build output and local data. Used by the lint checks.
       lintSrc = lib.fileset.toSource {
@@ -36,6 +39,11 @@
 
       packages = forAll (pkgs: rec {
         shlv = pkgs.callPackage ./nix/package.nix { };
+        # Every optional Cargo feature (fetch, and later ai and model).
+        shlv-full = shlv.override {
+          pname = "shlv-full";
+          features = allFeatures;
+        };
         default = shlv;
       });
 
@@ -50,7 +58,21 @@
       checks = forAll (
         pkgs:
         let
-          shlv = self.packages.${pkgs.stdenv.hostPlatform.system}.shlv;
+          inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) shlv shlv-full;
+          # cargo clippy over every target, reusing a package's vendored dependencies.
+          clippyCheck =
+            pkg: flags:
+            pkg.overrideAttrs (old: {
+              pname = "${old.pname}-clippy";
+              nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
+              buildPhase = ''
+                runHook preBuild
+                cargo clippy --offline --all-targets ${flags} -- -D warnings
+                runHook postBuild
+              '';
+              doCheck = false;
+              installPhase = "touch $out";
+            });
           # A check that runs `script` over the lint source and succeeds if it exits 0.
           lint =
             name: inputs: script:
@@ -61,19 +83,10 @@
             '';
         in
         {
-          inherit shlv;
-          # Reuses the package's vendored dependencies, so nothing is fetched twice.
-          clippy = shlv.overrideAttrs (old: {
-            pname = "shlv-clippy";
-            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
-            buildPhase = ''
-              runHook preBuild
-              cargo clippy --offline --all-targets -- -D warnings
-              runHook postBuild
-            '';
-            doCheck = false;
-            installPhase = "touch $out";
-          });
+          # Both build and run the tests: the default features, and all of them.
+          inherit shlv shlv-full;
+          clippy = clippyCheck shlv "";
+          clippy-full = clippyCheck shlv-full "--all-features";
           rustfmt = lint "rustfmt" [
             pkgs.cargo
             pkgs.rustfmt

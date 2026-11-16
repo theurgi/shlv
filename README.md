@@ -45,6 +45,17 @@ With Cargo:
 cargo install --git https://github.com/theurgi/shlv
 ```
 
+### Optional features
+
+The default build is offline. Network features are Cargo features, off by default:
+
+| Feature | Adds                                                     |
+| ------- | -------------------------------------------------------- |
+| `fetch` | `add --fetch` and `shlv fetch`: page titles from the web |
+
+The flake's `shlv-full` package has every feature (`nix run github:theurgi/shlv#shlv-full`). With
+Cargo, pass `--features fetch` (or `--all-features`).
+
 ## Usage
 
 ```console
@@ -59,29 +70,30 @@ $ shlv search fts5
 1  SQLite FTS5  https://www.sqlite.org/fts5.html  #search  #sqlite
 ```
 
-| Command                      | What it does                                                        |
-| ---------------------------- | ------------------------------------------------------------------- |
-| `add URL [-t TAG]...`        | Add a bookmark, or update it if the URL is already saved            |
-| `ls [-t TAG]... [-n N]`      | List bookmarks, newest first                                        |
-| `search QUERY...`            | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`      |
-| `show ID`                    | Show one bookmark in full                                           |
-| `edit ID [-t +TAG/-TAG]...`  | Change a bookmark's title, note, or tags                            |
-| `rm ID\|URL...`              | Delete bookmarks                                                    |
-| `open ID`                    | Open a bookmark with `$BROWSER` or the system opener                |
-| `tag ls [--sort count]`      | Tags with bookmark counts; `*` marks canonical, `=` lists aliases   |
-| `tag rename OLD NEW`         | Rename a tag                                                        |
-| `tag merge FROM INTO`        | Retag FROM's bookmarks as INTO; FROM becomes an alias               |
-| `tag alias ALIAS TAG`        | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)        |
-| `tag canonical add\|rm\|ls`  | Mark, unmark, or list canonical tags                                |
-| `tag canonical import FILE`  | Add a canonical list: one tag per line, aliases after it            |
-| `tag canonical export`       | Print the canonical list in that format                             |
-| `import FILE`                | Import a browser export (Netscape HTML) or JSON lines; `-` is stdin |
-| `export [--format html]`     | Print every bookmark as JSON lines, or HTML that browsers import    |
-| `suggest ID...\|--all`       | Suggest tags from domain rules (see [Config](#config))              |
-| `suggest ls [ID]`            | List pending suggestions                                            |
-| `suggest accept ID [TAG]...` | Accept a bookmark's suggestions (`--all` accepts every one)         |
-| `suggest reject ID [TAG]...` | Reject suggestions; they aren't offered again for that bookmark     |
-| `config path\|show`          | Print the config file path, or the effective config                 |
+| Command                      | What it does                                                         |
+| ---------------------------- | -------------------------------------------------------------------- |
+| `add URL [-t TAG]...`        | Add a bookmark, or update it if the URL is already saved             |
+| `ls [-t TAG]... [-n N]`      | List bookmarks, newest first                                         |
+| `search QUERY...`            | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`       |
+| `show ID`                    | Show one bookmark in full                                            |
+| `edit ID [-t +TAG/-TAG]...`  | Change a bookmark's title, note, or tags                             |
+| `rm ID\|URL...`              | Delete bookmarks                                                     |
+| `open ID`                    | Open a bookmark with `$BROWSER` or the system opener                 |
+| `tag ls [--sort count]`      | Tags with bookmark counts; `*` marks canonical, `=` lists aliases    |
+| `tag rename OLD NEW`         | Rename a tag                                                         |
+| `tag merge FROM INTO`        | Retag FROM's bookmarks as INTO; FROM becomes an alias                |
+| `tag alias ALIAS TAG`        | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)         |
+| `tag canonical add\|rm\|ls`  | Mark, unmark, or list canonical tags                                 |
+| `tag canonical import FILE`  | Add a canonical list: one tag per line, aliases after it             |
+| `tag canonical export`       | Print the canonical list in that format                              |
+| `import FILE`                | Import a browser export (Netscape HTML) or JSON lines; `-` is stdin  |
+| `export [--format html]`     | Print every bookmark as JSON lines, or HTML that browsers import     |
+| `suggest ID...\|--all`       | Suggest tags from domain rules (see [Config](#config))               |
+| `suggest ls [ID]`            | List pending suggestions                                             |
+| `suggest accept ID [TAG]...` | Accept a bookmark's suggestions (`--all` accepts every one)          |
+| `suggest reject ID [TAG]...` | Reject suggestions; they aren't offered again for that bookmark      |
+| `config path\|show`          | Print the config file path, or the effective config                  |
+| `fetch ID...\|--all`         | Set titles from the pages (`--all`: bookmarks without one) (`fetch`) |
 
 `ls`, `search`, `tag ls`, and `suggest ls` take `--json` for one JSON object per line. `-n 0` shows
 every result.
@@ -92,6 +104,12 @@ and `place:` URLs. Browser folders become tags only with `--folders-as-tags`. Wi
 import with non-canonical tags writes nothing unless you pass `--drop-unknown-tags`. `export` then
 `import` (JSON) reproduces a database, uids included. Domain rules run on imported bookmarks as they
 do on `add`; `--no-rules` skips them.
+
+With the `fetch` feature, `add --fetch` downloads the page and takes its title (`<title>`, else
+`og:title`) unless `--title` is given. A fetch that fails (offline, timeout, HTTP error, not HTML)
+prints a warning and still adds the bookmark. `shlv fetch` fills in titles afterwards, a few
+requests at a time (`-j`), and exits nonzero if any failed. Requests time out after 15 s, follow at
+most 5 redirects, read at most 2 MiB, and send `User-Agent: shlv/VERSION`.
 
 The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 `~/.local/share/shlv/shlv.db`.

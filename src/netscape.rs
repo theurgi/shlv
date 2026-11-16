@@ -3,6 +3,8 @@
 
 use std::io::{self, Write};
 
+use crate::html::decode;
+use crate::html::{Tag, tag_end};
 use crate::store::{Bookmark, normalize_tag};
 use crate::transfer::ImportItem;
 
@@ -95,85 +97,6 @@ pub fn parse(text: &str, folders_as_tags: bool) -> Vec<ImportItem> {
     items
 }
 
-/// The index of the `>` that ends the tag starting at `s[0] == '<'`, skipping quoted values.
-fn tag_end(s: &str) -> Option<usize> {
-    let mut quote = None;
-    for (i, c) in s.char_indices().skip(1) {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '"' | '\'') => quote = Some(c),
-            (None, '>') => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// A start or end tag: its name and raw attributes.
-struct Tag<'a> {
-    name: &'a str,
-    closing: bool,
-    attrs: &'a str,
-}
-
-impl<'a> Tag<'a> {
-    /// Parses the inside of `<...>`.
-    fn parse(inner: &'a str) -> Self {
-        let inner = inner.trim_start();
-        let (closing, inner) = match inner.strip_prefix('/') {
-            Some(rest) => (true, rest),
-            None => (false, inner),
-        };
-        let split = inner
-            .find(|c: char| c.is_ascii_whitespace() || c == '/')
-            .unwrap_or(inner.len());
-        Tag {
-            name: &inner[..split],
-            closing,
-            attrs: &inner[split..],
-        }
-    }
-
-    /// The raw (still escaped) value of attribute `name`, matched case-insensitively. A bare
-    /// attribute has the value "".
-    fn attr(&self, name: &str) -> Option<String> {
-        let mut s = self.attrs;
-        loop {
-            s = s.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '/');
-            if s.is_empty() {
-                return None;
-            }
-            let key_end = s
-                .find(|c: char| c.is_ascii_whitespace() || c == '=')
-                .unwrap_or(s.len());
-            let key = &s[..key_end];
-            s = s[key_end..].trim_start();
-            let value = match s.strip_prefix('=') {
-                Some(v) => {
-                    let v = v.trim_start();
-                    match v.chars().next() {
-                        Some(q @ ('"' | '\'')) => {
-                            let close = v[1..].find(q).map_or(v.len(), |i| i + 1);
-                            s = v.get(close + 1..).unwrap_or("");
-                            &v[1..close]
-                        }
-                        _ => {
-                            let end = v.find(|c: char| c.is_ascii_whitespace()).unwrap_or(v.len());
-                            s = &v[end..];
-                            &v[..end]
-                        }
-                    }
-                }
-                None => "",
-            };
-            if key.eq_ignore_ascii_case(name) {
-                return Some(value.to_string());
-            }
-        }
-    }
-}
-
 /// `ADD_DATE` is in seconds, but some tools write milliseconds or microseconds. Values too large
 /// for seconds (after the year 5000) are read as those. Returns Unix milliseconds; 0 and
 /// unparsable dates are `None`.
@@ -189,51 +112,6 @@ fn parse_date(s: &str) -> Option<i64> {
 fn non_empty(s: String) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
-}
-
-/// Decodes HTML entities: the five XML ones, `&nbsp;`, and numeric references. Others are kept.
-pub fn decode(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        rest = &rest[i..];
-        let entity = rest[1..]
-            .find(';')
-            .filter(|&n| n <= 10)
-            .map(|n| &rest[1..n + 1]);
-        let ch = entity.and_then(|e| match e {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some('\u{a0}'),
-            _ => {
-                let num = e.strip_prefix('#')?;
-                let code = match num.strip_prefix(['x', 'X']) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-                    None => num.parse().ok()?,
-                };
-                char::from_u32(code)
-            }
-        });
-        match (ch, entity) {
-            (Some(c), Some(e)) => {
-                out.push(c);
-                rest = &rest[e.len() + 2..];
-            }
-            _ => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Escapes text for element content and double- or single-quoted attributes. Line breaks become
@@ -307,20 +185,6 @@ mod tests {
         );
         assert_eq!(decode("AT&T &bogus; & &#xZZ; &"), "AT&T &bogus; & &#xZZ; &");
         assert_eq!(decode(&escape("<a href='x'>&\n\"")), "<a href='x'>&\n\"");
-    }
-
-    #[test]
-    fn parses_attributes() {
-        let t = Tag::parse(r#"A HREF="x?a=1&amp;b=2" add_date=12 TAGS='a,b' FLAG"#);
-        assert_eq!(t.name, "A");
-        assert_eq!(t.attr("href").as_deref(), Some("x?a=1&amp;b=2"));
-        assert_eq!(t.attr("ADD_DATE").as_deref(), Some("12"));
-        assert_eq!(t.attr("tags").as_deref(), Some("a,b"));
-        assert_eq!(t.attr("flag").as_deref(), Some(""));
-        assert_eq!(t.attr("icon"), None);
-        let t = Tag::parse("/DL");
-        assert!(t.closing);
-        assert_eq!(t.name, "DL");
     }
 
     #[test]
