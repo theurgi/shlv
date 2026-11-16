@@ -4,6 +4,8 @@ pub mod bulk;
 pub mod config;
 pub mod db;
 #[cfg(feature = "fetch")]
+pub mod extract;
+#[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod html;
 pub mod netscape;

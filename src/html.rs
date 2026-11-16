@@ -122,7 +122,7 @@ pub fn collapse_ws(s: &str) -> String {
 }
 
 /// The index of the `>` that ends the tag starting at `s[0] == '<'`, skipping quoted values.
-pub(crate) fn tag_end(s: &str) -> Option<usize> {
+pub fn tag_end(s: &str) -> Option<usize> {
     let mut quote = None;
     for (i, c) in s.char_indices().skip(1) {
         match (quote, c) {
@@ -137,7 +137,7 @@ pub(crate) fn tag_end(s: &str) -> Option<usize> {
 }
 
 /// A start or end tag: its name and raw attributes.
-pub(crate) struct Tag<'a> {
+pub struct Tag<'a> {
     pub name: &'a str,
     pub closing: bool,
     pub attrs: &'a str,

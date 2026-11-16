@@ -38,3 +38,7 @@ fetch = ["dep:ureq"]
 lto = true
 codegen-units = 1
 strip = true
+
+[[example]]
+name = "extract"
+required-features = ["fetch"]
