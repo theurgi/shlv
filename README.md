@@ -89,7 +89,7 @@ $ shlv search fts5
 | `tag canonical export`       | Print the canonical list in that format                              |
 | `import FILE`                | Import a browser export (Netscape HTML) or JSON lines; `-` is stdin  |
 | `export [--format html]`     | Print every bookmark as JSON lines, or HTML that browsers import     |
-| `suggest ID...\|--all`       | Suggest tags from domain rules (see [Config](#config))               |
+| `suggest ID...\|--all`       | Suggest tags: domain rules, then the `[ai] tag` provider (`ai`)      |
 | `suggest ls [ID]`            | List pending suggestions                                             |
 | `suggest accept ID [TAG]...` | Accept a bookmark's suggestions (`--all` accepts every one)          |
 | `suggest reject ID [TAG]...` | Reject suggestions; they aren't offered again for that bookmark      |
