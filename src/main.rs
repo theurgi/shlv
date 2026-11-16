@@ -181,6 +181,15 @@ enum Cmd {
         /// Go ahead when more than 20 bookmarks would be sent
         #[arg(short, long)]
         yes: bool,
+        /// Submit one Message Batch (half price, results within 24 hours) instead of live requests
+        #[arg(long)]
+        batch: bool,
+    },
+    /// Collect Message Batches submitted with --batch (kind "anthropic")
+    #[cfg(feature = "ai")]
+    Batch {
+        #[command(subcommand)]
+        cmd: ai_cmd::BatchCmd,
     },
     /// Show where the config file is and what it sets
     Config {
@@ -604,6 +613,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             force,
             jobs,
             yes,
+            batch,
         } => {
             return ai_cmd::run_summarize(
                 &mut store,
@@ -613,9 +623,17 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 force,
                 jobs.into(),
                 yes,
+                batch,
                 &mut out,
                 &style,
             );
+        }
+        #[cfg(feature = "ai")]
+        Cmd::Batch { cmd } => {
+            out.flush()?;
+            let code = ai_cmd::run_batch(&mut store, &config, cmd, &mut out)?;
+            out.flush()?;
+            return Ok(code);
         }
         Cmd::Config { .. } => unreachable!("handled before opening the database"),
     }

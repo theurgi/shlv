@@ -125,7 +125,22 @@ impl Llm for Anthropic {
         }
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| anyhow!("the API returned a response that isn't JSON: {e}"))?;
-        if let Some(u) = v.get("usage") {
+        self.count(&v);
+        message_text(&v).map_err(|e| anyhow!(e))
+    }
+
+    fn usage(&self) -> Usage {
+        *self.usage.lock().unwrap()
+    }
+
+    fn batches(&self) -> Option<&Anthropic> {
+        Some(self)
+    }
+}
+
+impl Anthropic {
+    fn count(&self, message: &Value) {
+        if let Some(u) = message.get("usage") {
             let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
             let mut usage = self.usage.lock().unwrap();
             usage.requests += 1;
@@ -134,41 +149,169 @@ impl Llm for Anthropic {
             usage.cache_read += n("cache_read_input_tokens");
             usage.cache_write += n("cache_creation_input_tokens");
         }
-        match v.get("stop_reason").and_then(Value::as_str) {
-            Some("refusal") => {
-                let d = v.get("stop_details");
-                let cat = d
-                    .and_then(|d| d.get("category"))
-                    .and_then(Value::as_str)
-                    .map(|c| format!(" ({c})"))
-                    .unwrap_or_default();
-                let why = d
-                    .and_then(|d| d.get("explanation"))
-                    .and_then(Value::as_str)
-                    .map(|e| format!(": {e}"))
-                    .unwrap_or_default();
-                bail!("the model declined{cat}{why}");
-            }
-            Some("max_tokens") => bail!("the reply was cut off at max_tokens ({MAX_TOKENS})"),
-            _ => {}
-        }
-        let text: String = v
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect();
-        if text.is_empty() {
-            bail!("the reply has no text");
+    }
+
+    fn batches_url(&self) -> String {
+        format!("{}/batches", self.url)
+    }
+
+    /// GETs `url` with the API headers; returns the body of a 2xx response.
+    fn get(&self, url: &str) -> Result<String> {
+        let mut resp = self
+            .agent
+            .get(url)
+            .header("x-api-key", &self.key)
+            .header("anthropic-version", API_VERSION)
+            .call()
+            .map_err(transport_error)?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .body_mut()
+            .with_config()
+            .limit(256 << 20)
+            .read_to_string()
+            .map_err(transport_error)?;
+        if !(200..300).contains(&status) {
+            bail!("HTTP {status}: {}", error_message(&text));
         }
         Ok(text)
     }
 
-    fn usage(&self) -> Usage {
-        *self.usage.lock().unwrap()
+    /// `POST /v1/messages/batches`; returns the batch id.
+    pub fn submit_batch(&self, requests: Vec<(String, Value)>) -> Result<String> {
+        let requests: Vec<Value> = requests
+            .into_iter()
+            .map(|(id, params)| json!({"custom_id": id, "params": params}))
+            .collect();
+        let mut resp = self
+            .agent
+            .post(&self.batches_url())
+            .header("content-type", "application/json")
+            .header("x-api-key", &self.key)
+            .header("anthropic-version", API_VERSION)
+            .send(json!({"requests": requests}).to_string())
+            .map_err(transport_error)?;
+        let status = resp.status().as_u16();
+        let text = resp.body_mut().read_to_string().map_err(transport_error)?;
+        if !(200..300).contains(&status) {
+            bail!("HTTP {status}: {}", error_message(&text));
+        }
+        let v: Value = serde_json::from_str(&text)?;
+        v.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("the API returned no batch id"))
     }
+
+    /// `GET /v1/messages/batches/{id}`.
+    pub fn batch_status(&self, id: &str) -> Result<BatchStatus> {
+        let v: Value = serde_json::from_str(&self.get(&format!("{}/{id}", self.batches_url()))?)?;
+        let n = |k: &str| {
+            v.pointer(&format!("/request_counts/{k}"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        Ok(BatchStatus {
+            id: id.to_string(),
+            ended: v.get("processing_status").and_then(Value::as_str) == Some("ended"),
+            processing: n("processing"),
+            succeeded: n("succeeded"),
+            errored: n("errored"),
+            canceled: n("canceled"),
+            expired: n("expired"),
+            results_url: v
+                .get("results_url")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    /// The results of an ended batch: per `custom_id`, the reply text or why there is none.
+    pub fn batch_results(
+        &self,
+        status: &BatchStatus,
+    ) -> Result<Vec<(String, Result<String, String>)>> {
+        let Some(url) = &status.results_url else {
+            bail!("batch {} has no results yet", status.id);
+        };
+        let text = self.get(url)?;
+        let mut out = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: Value = serde_json::from_str(line)?;
+            let id = v
+                .get("custom_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let r = &v["result"];
+            let res = match r.get("type").and_then(Value::as_str) {
+                Some("succeeded") => {
+                    self.count(&r["message"]);
+                    message_text(&r["message"])
+                }
+                Some("errored") => Err(format!(
+                    "errored: {}",
+                    error_message(&r["error"].to_string())
+                )),
+                Some("expired") => Err("expired before it ran".into()),
+                Some("canceled") => Err("canceled".into()),
+                t => Err(format!("unknown result type {t:?}")),
+            };
+            out.push((id, res));
+        }
+        Ok(out)
+    }
+}
+
+/// A Message Batch's progress.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BatchStatus {
+    pub id: String,
+    pub ended: bool,
+    pub processing: u64,
+    pub succeeded: u64,
+    pub errored: u64,
+    pub canceled: u64,
+    pub expired: u64,
+    pub results_url: Option<String>,
+}
+
+/// The reply text of a message, or why it has none: a refusal or a `max_tokens` stop.
+fn message_text(v: &Value) -> Result<String, String> {
+    match v.get("stop_reason").and_then(Value::as_str) {
+        Some("refusal") => {
+            let d = v.get("stop_details");
+            let cat = d
+                .and_then(|d| d.get("category"))
+                .and_then(Value::as_str)
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            let why = d
+                .and_then(|d| d.get("explanation"))
+                .and_then(Value::as_str)
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            return Err(format!("the model declined{cat}{why}"));
+        }
+        Some("max_tokens") => {
+            return Err(format!(
+                "the reply was cut off at max_tokens ({MAX_TOKENS})"
+            ));
+        }
+        _ => {}
+    }
+    let text: String = v
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(Value::as_str))
+        .collect();
+    if text.is_empty() {
+        return Err("the reply has no text".into());
+    }
+    Ok(text)
 }
 
 /// How long to wait before retry `attempt` (0-based): `retry-after` seconds when the API sends

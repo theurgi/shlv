@@ -96,6 +96,7 @@ $ shlv search fts5
 | `config path\|show`          | Print the config file path, or the effective config                  |
 | `fetch ID...\|--all`         | Set titles from the pages (`--all`: bookmarks without one) (`fetch`) |
 | `summarize ID...\|--all`     | Summarize pages with the `[ai] summarize` provider (`ai`)            |
+| `batch status\|collect`      | Check on or apply Message Batches from `--batch` (`ai`)              |
 
 `ls`, `search`, `tag ls`, and `suggest ls` take `--json` for one JSON object per line. `-n 0` shows
 every result.
@@ -217,6 +218,12 @@ own confidence isn't calibrated. The bookmark's summary is sent if it has one, e
 the provider hasn't tagged before (`--force` sends them again), with the same `-j`, `--yes`, and
 failure reporting as `summarize`. When `[ai] summarize` and `[ai] tag` name the same provider, a
 bookmark without a summary gets both from one request.
+
+With an `anthropic` provider, `summarize --batch` and `suggest --batch` submit one Message Batch
+instead of live requests: half the price, with results within 24 hours. Pages are fetched when
+submitting. `shlv batch status` shows submitted batches, and `shlv batch collect` applies the
+results of ended ones (from any later run, since pending batches are recorded in the database).
+Failed or expired items are reported; rerunning the command without `--batch` retries them live.
 
 Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped, and
 empty or overlong summaries are rejected. If a server doesn't support JSON-schema output, shlv falls

@@ -142,10 +142,17 @@ pub fn run_summarize(
     force: bool,
     jobs: usize,
     yes: bool,
+    batch: bool,
     out: &mut impl Write,
     style: &Style,
 ) -> Result<ExitCode> {
     let provider = provider(config, Task::Summarize)?;
+    if batch && !provider.supports_batches() {
+        bail!(
+            "--batch needs a provider of kind \"anthropic\" (the Message Batches API); {} isn't one",
+            provider.name()
+        );
+    }
     let (targets, had) = targets(store, ids, all, |b| force || b.summary.is_none())?;
     if had > 0 {
         eprintln!(
@@ -165,6 +172,9 @@ pub fn run_summarize(
         &describe_provider(config, &provider),
         yes,
     )?;
+    if batch {
+        return batch_summaries(store, &provider, &targets, jobs, out);
+    }
 
     let fetcher = Fetcher::default();
     let mut progress = Progress::new("summarizing", targets.len());
@@ -243,6 +253,9 @@ pub struct LlmArgs {
     /// Go ahead when more than 20 bookmarks would be sent
     #[arg(short, long)]
     pub yes: bool,
+    /// Submit one Message Batch (half price, results within 24 hours) instead of live requests
+    #[arg(long)]
+    pub batch: bool,
 }
 
 /// The `[ai] tag` provider, if one is configured.
@@ -325,6 +338,49 @@ pub fn run_suggest_llm(
     )?;
 
     let combined = same_provider(config);
+    if args.batch {
+        if !provider.supports_batches() {
+            bail!(
+                "--batch needs a provider of kind \"anthropic\" (the Message Batches API); {} \
+                 isn't one",
+                provider.name()
+            );
+        }
+        let need: Vec<Bookmark> = work
+            .iter()
+            .filter(|(b, _)| b.summary.is_none())
+            .map(|(b, _)| b.clone())
+            .collect();
+        let texts = fetch_texts(&need, args.jobs.into());
+        let mut text_of: std::collections::HashMap<i64, Option<String>> = need
+            .iter()
+            .zip(texts)
+            .map(|(b, t)| (b.id, t.ok().flatten()))
+            .collect();
+        let jobs: Vec<BatchJob> = work
+            .iter()
+            .map(|(b, _)| {
+                let text = text_of.remove(&b.id).flatten();
+                let job = if combined && text.is_some() {
+                    ai::Job::Both
+                } else {
+                    ai::Job::Tags
+                };
+                BatchJob {
+                    bookmark: b.id,
+                    job,
+                    item: Item {
+                        text,
+                        ..Item::from_bookmark(b)
+                    },
+                }
+            })
+            .collect();
+        // One schema for the whole batch: the full list. Tags a bookmark has or rejected are
+        // dropped when the results are collected.
+        submit_batch(store, provider, &jobs, &list, out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
     let fetcher = Fetcher::default();
     let mut progress = Progress::new("suggesting", work.len());
     let (mut pending, mut applied, mut summarized) = (0, 0, 0);
@@ -404,4 +460,215 @@ pub fn run_suggest_llm(
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// `shlv batch` subcommands.
+#[derive(clap::Subcommand)]
+pub enum BatchCmd {
+    /// Show submitted batches that haven't been collected, with their progress
+    Status,
+    /// Apply the results of ended batches (summaries and tag suggestions)
+    Collect,
+}
+
+/// One job for a batch: the bookmark, what to ask, and what to send.
+struct BatchJob {
+    bookmark: i64,
+    job: ai::Job,
+    item: Item,
+}
+
+/// Submits `jobs` as one Message Batch and records it.
+fn submit_batch(
+    store: &mut Store,
+    provider: &Provider,
+    jobs: &[BatchJob],
+    list: &[shlv::choose::TagOption],
+    out: &mut impl Write,
+) -> Result<()> {
+    if jobs.is_empty() {
+        eprintln!("shlv: nothing to submit");
+        return Ok(());
+    }
+    let requests: Vec<(String, ai::Job, Item)> = jobs
+        .iter()
+        .map(|j| {
+            let (s, t) = match j.job {
+                ai::Job::Summary => (true, false),
+                ai::Job::Tags => (false, true),
+                ai::Job::Both => (true, true),
+            };
+            (
+                shlv::batch::custom_id(j.bookmark, s, t),
+                j.job,
+                j.item.clone(),
+            )
+        })
+        .collect();
+    let id = provider.submit_batch(&requests, list)?;
+    store.add_batch(&id, provider.name(), requests.len())?;
+    writeln!(
+        out,
+        "submitted batch {id} ({}); collect the results with `shlv batch collect`",
+        plural(requests.len(), "request")
+    )?;
+    Ok(())
+}
+
+/// Fetches page text for bookmarks a few at a time. Returns, in input order, the text (or
+/// `None` when the page has none) or why the fetch failed.
+fn fetch_texts(targets: &[Bookmark], jobs: usize) -> Vec<Result<Option<String>, String>> {
+    let fetcher = Fetcher::default();
+    let mut texts: Vec<Result<Option<String>, String>> = vec![Ok(None); targets.len()];
+    let mut progress = Progress::new("fetching", targets.len());
+    let _ = bulk::run(
+        targets,
+        jobs,
+        |b| page_text(&fetcher, &b.url).map_err(|e| format!("{e:#}")),
+        |i, r| -> Result<(), ()> {
+            texts[i] = r;
+            progress.tick();
+            Ok(())
+        },
+    );
+    texts
+}
+
+/// `summarize --batch`: fetch pages now, submit the summaries as a batch.
+fn batch_summaries(
+    store: &mut Store,
+    provider: &Provider,
+    targets: &[Bookmark],
+    jobs: usize,
+    out: &mut impl Write,
+) -> Result<ExitCode> {
+    let texts = fetch_texts(targets, jobs);
+    let mut batch = Vec::new();
+    let mut failed = 0;
+    for (b, t) in targets.iter().zip(texts) {
+        match t {
+            Ok(Some(text)) => batch.push(BatchJob {
+                bookmark: b.id,
+                job: ai::Job::Summary,
+                item: Item {
+                    text: Some(text),
+                    ..Item::from_bookmark(b)
+                },
+            }),
+            Ok(None) => eprintln!("shlv: {}: skipped, no text on the page: {}", b.id, b.url),
+            Err(e) => {
+                failed += 1;
+                eprintln!("shlv: {}: failed: {}: {e}", b.id, b.url);
+            }
+        }
+    }
+    submit_batch(store, provider, &batch, &[], out)?;
+    Ok(if failed > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// `shlv batch status|collect`.
+pub fn run_batch(
+    store: &mut Store,
+    config: &Config,
+    cmd: BatchCmd,
+    out: &mut impl Write,
+) -> Result<ExitCode> {
+    use shlv::Source;
+    use shlv::choose::TagOption;
+
+    let pending = store.pending_batches()?;
+    if pending.is_empty() {
+        writeln!(out, "no batches waiting")?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let list: Vec<TagOption> = store
+        .canonical_tags()?
+        .iter()
+        .map(TagOption::from)
+        .collect();
+    let mut code = ExitCode::SUCCESS;
+    for pb in pending {
+        let Some(pc) = config.provider.get(&pb.provider) else {
+            eprintln!(
+                "shlv: batch {}: provider {} is no longer configured",
+                pb.id, pb.provider
+            );
+            code = ExitCode::FAILURE;
+            continue;
+        };
+        let provider = Provider::new(&pb.provider, pc.get_ref())?;
+        let st = provider.batch_status(&pb.id)?;
+        let counts = format!(
+            "{} processing, {} succeeded, {} errored, {} expired, {} canceled",
+            st.processing, st.succeeded, st.errored, st.expired, st.canceled
+        );
+        if matches!(cmd, BatchCmd::Status) || !st.ended {
+            let state = if st.ended { "ended" } else { "in progress" };
+            writeln!(
+                out,
+                "{}  {} ({}): {state}: {counts}",
+                pb.id,
+                pb.provider,
+                plural(pb.requests as usize, "request")
+            )?;
+            continue;
+        }
+        let results = provider.batch_results(
+            &st,
+            |id| {
+                shlv::batch::parse_custom_id(id).map(|(_, s, t)| match (s, t) {
+                    (true, true) => ai::Job::Both,
+                    (true, false) => ai::Job::Summary,
+                    _ => ai::Job::Tags,
+                })
+            },
+            &list,
+        )?;
+        let (mut summaries, mut suggested, mut failed) = (0, 0, Vec::new());
+        for (cid, r) in results {
+            let Some((id, _, tags)) = shlv::batch::parse_custom_id(&cid) else {
+                failed.push((cid, "unknown custom_id".to_string()));
+                continue;
+            };
+            match r {
+                Ok(a) => {
+                    if let Some(s) = &a.summary
+                        && store.set_summary(id, Some(s))?
+                    {
+                        summaries += 1;
+                    }
+                    if tags && store.get(id)?.is_some() {
+                        let st = store.offer_choices(id, Source::Llm, &a.tags)?;
+                        suggested += st.pending + st.applied;
+                    }
+                }
+                Err(e) => failed.push((format!("bookmark {id}"), e)),
+            }
+        }
+        for (what, e) in &failed {
+            eprintln!("shlv: batch {}: {what}: {e}", pb.id);
+        }
+        writeln!(
+            out,
+            "collected batch {}: {} summaries, {} tag suggestions, {} failed",
+            pb.id,
+            summaries,
+            suggested,
+            failed.len()
+        )?;
+        if !failed.is_empty() {
+            eprintln!(
+                "shlv: rerun `shlv summarize --all` or `shlv suggest --all` (without --batch) to \
+                 retry the failed ones live"
+            );
+            code = ExitCode::FAILURE;
+        }
+        store.finish_batch(&pb.id)?;
+        print_usage(&provider);
+    }
+    Ok(code)
 }

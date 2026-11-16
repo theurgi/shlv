@@ -206,6 +206,11 @@ pub trait Llm: Send + Sync {
     fn usage(&self) -> Usage {
         Usage::default()
     }
+
+    /// The Message Batches API, for kinds that have one.
+    fn batches(&self) -> Option<&anthropic::Anthropic> {
+        None
+    }
 }
 
 /// A configured provider.
@@ -252,45 +257,16 @@ impl Provider {
 
     /// A short summary of the bookmark.
     pub fn summarize(&self, item: &Item) -> Result<String> {
-        let req = Request {
-            system: SUMMARY_PROMPT.to_string(),
-            user: describe(item),
-            schema_name: "summary",
-            schema: json!({
-                "type": "object",
-                "properties": { "summary": { "type": "string" } },
-                "required": ["summary"],
-                "additionalProperties": false,
-            }),
-            retry: None,
-        };
-        self.ask(Task::Summarize, req, summary_of)
+        Ok(self
+            .run(Job::Summary, item, &[])?
+            .summary
+            .unwrap_or_default())
     }
 
     /// Tags from `list` that fit the bookmark. Unknown names in the reply are dropped and aliases
     /// resolved; confidence is `None` (LLMs' stated confidence isn't calibrated).
     pub fn choose_tags(&self, item: &Item, list: &[TagOption]) -> Result<Vec<Choice>> {
-        if list.is_empty() {
-            bail!(
-                "provider {} (tag): the canonical tag list is empty; declare tags in \
-                 [tags.canonical] or mark some with `shlv tag canonical add`",
-                self.name
-            );
-        }
-        let canonical = Canonical::new(list);
-        let req = Request {
-            system: format!("{TAG_PROMPT}\n\n{}", tag_list(list)),
-            user: describe(item),
-            schema_name: "tags",
-            schema: json!({
-                "type": "object",
-                "properties": { "tags": tags_schema(list) },
-                "required": ["tags"],
-                "additionalProperties": false,
-            }),
-            retry: None,
-        };
-        self.ask(Task::Tag, req, |v| tags_of(v, &canonical))
+        Ok(self.run(Job::Tags, item, list)?.tags)
     }
 
     /// Both in one request.
@@ -302,50 +278,171 @@ impl Provider {
         if list.is_empty() {
             return Ok((self.summarize(item)?, Vec::new()));
         }
-        let canonical = Canonical::new(list);
-        let req = Request {
-            system: format!("{SUMMARY_PROMPT}\n\n{TAG_PROMPT}\n\n{}", tag_list(list)),
-            user: describe(item),
-            schema_name: "summary_and_tags",
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "summary": { "type": "string" },
-                    "tags": tags_schema(list),
-                },
-                "required": ["summary", "tags"],
-                "additionalProperties": false,
-            }),
-            retry: None,
-        };
-        self.ask(Task::Summarize, req, |v| {
-            Ok((summary_of(v)?, tags_of(v, &canonical)?))
+        let a = self.run(Job::Both, item, list)?;
+        Ok((a.summary.unwrap_or_default(), a.tags))
+    }
+
+    /// Sends one job; a reply that isn't valid is retried once, with what was wrong.
+    fn run(&self, job: Job, item: &Item, list: &[TagOption]) -> Result<Answer> {
+        let at = || format!("provider {} ({})", self.name, job.task().as_str());
+        if job != Job::Summary && list.is_empty() {
+            bail!(
+                "provider {} (tag): the canonical tag list is empty; declare tags in \
+                 [tags.canonical] or mark some with `shlv tag canonical add`",
+                self.name
+            );
+        }
+        let mut req = job.request(item, list);
+        for attempt in 0..2 {
+            let reply = self.llm.complete(&req).with_context(at)?;
+            match job.check(&reply, list) {
+                Ok(a) => return Ok(a),
+                Err(why) if attempt == 1 => {
+                    return Err(anyhow!("invalid reply twice: {why}")).with_context(at);
+                }
+                Err(why) => req.retry = Some((reply, why)),
+            }
+        }
+        unreachable!()
+    }
+
+    /// Whether this provider can run jobs as a Message Batch (kind `anthropic`).
+    pub fn supports_batches(&self) -> bool {
+        self.llm.batches().is_some()
+    }
+
+    fn batches(&self) -> Result<&anthropic::Anthropic> {
+        self.llm.batches().ok_or_else(|| {
+            anyhow!(
+                "provider {}: batches need kind \"anthropic\" (the Message Batches API)",
+                self.name
+            )
         })
     }
 
-    /// Sends `req`; a reply that isn't valid is retried once, with what was wrong.
-    fn ask<T>(
+    /// Submits jobs as one Message Batch; returns its id. Each job has a `custom_id` that comes
+    /// back with its result.
+    pub fn submit_batch(&self, jobs: &[(String, Job, Item)], list: &[TagOption]) -> Result<String> {
+        let b = self.batches()?;
+        let requests = jobs
+            .iter()
+            .map(|(id, job, item)| (id.clone(), b.body(&job.request(item, list))))
+            .collect();
+        b.submit_batch(requests)
+            .with_context(|| format!("provider {} (batch)", self.name))
+    }
+
+    /// A batch's processing status and counts.
+    pub fn batch_status(&self, id: &str) -> Result<anthropic::BatchStatus> {
+        self.batches()?
+            .batch_status(id)
+            .with_context(|| format!("provider {} (batch {id})", self.name))
+    }
+
+    /// An ended batch's results, checked like live replies: `(custom_id, answer or reason)`.
+    pub fn batch_results(
         &self,
-        task: Task,
-        mut req: Request,
-        check: impl Fn(&Value) -> Result<T, String>,
-    ) -> Result<T> {
-        let at = || format!("provider {} ({})", self.name, task.as_str());
-        for attempt in 0..2 {
-            let reply = self.llm.complete(&req).with_context(at)?;
-            let why = match serde_json::from_str::<Value>(strip_fences(&reply)) {
-                Ok(v) => match check(&v) {
-                    Ok(t) => return Ok(t),
-                    Err(why) => why,
-                },
-                Err(e) => format!("not JSON ({e})"),
-            };
-            if attempt == 1 {
-                return Err(anyhow!("invalid reply twice: {why}")).with_context(at);
-            }
-            req.retry = Some((reply, why));
+        status: &anthropic::BatchStatus,
+        job_of: impl Fn(&str) -> Option<Job>,
+        list: &[TagOption],
+    ) -> Result<Vec<(String, Result<Answer, String>)>> {
+        let raw = self
+            .batches()?
+            .batch_results(status)
+            .with_context(|| format!("provider {} (batch {})", self.name, status.id))?;
+        Ok(raw
+            .into_iter()
+            .map(|(id, r)| {
+                let a = match (r, job_of(&id)) {
+                    (Ok(text), Some(job)) => job.check(&text, list),
+                    (Ok(_), None) => Err(format!("unknown custom_id {id:?}")),
+                    (Err(e), _) => Err(e),
+                };
+                (id, a)
+            })
+            .collect())
+    }
+}
+
+/// What one request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Job {
+    Summary,
+    Tags,
+    Both,
+}
+
+/// A checked reply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Answer {
+    pub summary: Option<String>,
+    pub tags: Vec<Choice>,
+}
+
+impl Job {
+    pub fn task(self) -> Task {
+        match self {
+            Job::Tags => Task::Tag,
+            Job::Summary | Job::Both => Task::Summarize,
         }
-        unreachable!()
+    }
+
+    /// The structured-output request for this job.
+    pub fn request(self, item: &Item, list: &[TagOption]) -> Request {
+        let summary = json!({ "type": "string" });
+        let (system, name, props, required) = match self {
+            Job::Summary => (
+                SUMMARY_PROMPT.to_string(),
+                "summary",
+                json!({ "summary": summary }),
+                json!(["summary"]),
+            ),
+            Job::Tags => (
+                format!("{TAG_PROMPT}\n\n{}", tag_list(list)),
+                "tags",
+                json!({ "tags": tags_schema(list) }),
+                json!(["tags"]),
+            ),
+            Job::Both => (
+                format!("{SUMMARY_PROMPT}\n\n{TAG_PROMPT}\n\n{}", tag_list(list)),
+                "summary_and_tags",
+                json!({ "summary": summary, "tags": tags_schema(list) }),
+                json!(["summary", "tags"]),
+            ),
+        };
+        Request {
+            system,
+            user: describe(item),
+            schema_name: name,
+            schema: json!({
+                "type": "object",
+                "properties": props,
+                "required": required,
+                "additionalProperties": false,
+            }),
+            retry: None,
+        }
+    }
+
+    /// Checks a reply: valid JSON with the job's fields; tags resolved against `list`.
+    pub fn check(self, reply: &str, list: &[TagOption]) -> Result<Answer, String> {
+        let v: Value =
+            serde_json::from_str(strip_fences(reply)).map_err(|e| format!("not JSON ({e})"))?;
+        let canonical = Canonical::new(list);
+        Ok(match self {
+            Job::Summary => Answer {
+                summary: Some(summary_of(&v)?),
+                tags: Vec::new(),
+            },
+            Job::Tags => Answer {
+                summary: None,
+                tags: tags_of(&v, &canonical)?,
+            },
+            Job::Both => Answer {
+                summary: Some(summary_of(&v)?),
+                tags: tags_of(&v, &canonical)?,
+            },
+        })
     }
 }
 

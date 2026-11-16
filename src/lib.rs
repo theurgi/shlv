@@ -2,6 +2,7 @@
 
 #[cfg(feature = "ai")]
 pub mod ai;
+pub mod batch;
 pub mod bulk;
 pub mod choose;
 pub mod config;
