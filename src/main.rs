@@ -16,6 +16,8 @@ use shlv::{netscape, transfer};
 
 #[cfg(feature = "ai")]
 mod ai_cmd;
+#[cfg(feature = "model")]
+mod model_cmd;
 
 /// A fast bookmark manager.
 #[derive(Parser)]
@@ -184,6 +186,12 @@ enum Cmd {
         /// Submit one Message Batch (half price, results within 24 hours) instead of live requests
         #[arg(long)]
         batch: bool,
+    },
+    /// Train, inspect, or evaluate the tag classifier
+    #[cfg(feature = "model")]
+    Model {
+        #[command(subcommand)]
+        cmd: model_cmd::ModelCmd,
     },
     /// Collect Message Batches submitted with --batch (kind "anthropic")
     #[cfg(feature = "ai")]
@@ -627,6 +635,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 &mut out,
                 &style,
             );
+        }
+        #[cfg(feature = "model")]
+        Cmd::Model { cmd } => {
+            let code = model_cmd::run(&mut store, &config, cmd, &mut out)?;
+            out.flush()?;
+            return Ok(code);
         }
         #[cfg(feature = "ai")]
         Cmd::Batch { cmd } => {

@@ -53,9 +53,10 @@ The default build is offline. Network features are Cargo features, off by defaul
 | ------- | ----------------------------------------------------------------------------------- |
 | `fetch` | `add --fetch` and `shlv fetch`: page titles from the web                            |
 | `ai`    | AI summaries and tag suggestions through a provider you configure (implies `fetch`) |
+| `model` | An in-binary tag classifier that learns from your tags; offline, no dependencies    |
 
 The flake's `shlv-full` package has every feature (`nix run github:theurgi/shlv#shlv-full`). With
-Cargo, pass `--features fetch,ai` (or `--all-features`).
+Cargo, pass `--features fetch,ai,model` (or `--all-features`).
 
 ## Usage
 
@@ -97,6 +98,7 @@ $ shlv search fts5
 | `fetch ID...\|--all`         | Set titles from the pages (`--all`: bookmarks without one) (`fetch`) |
 | `summarize ID...\|--all`     | Summarize pages with the `[ai] summarize` provider (`ai`)            |
 | `batch status\|collect`      | Check on or apply Message Batches from `--batch` (`ai`)              |
+| `model train\|status\|eval`  | Train, inspect, or measure the tag classifier (`model`)              |
 
 `ls`, `search`, `tag ls`, and `suggest ls` take `--json` for one JSON object per line. `-n 0` shows
 every result.
@@ -230,6 +232,24 @@ Failed or expired items are reported; rerunning the command without `--batch` re
 Replies are checked: malformed JSON is retried once, tags not in the canonical list are dropped, and
 empty or overlong summaries are rejected. If a server doesn't support JSON-schema output, shlv falls
 back to JSON mode with the schema in the prompt.
+
+### Tag classifier
+
+With the `model` feature, shlv learns tags from your own bookmarks: a small classifier (logistic
+regression over words from the title, host, URL path, summary, and note) trained on bookmarks that
+have canonical tags, plus suggestions you rejected. It runs offline in microseconds and is stored in
+the database. Tags with few examples fall back on matching their name, aliases, and description
+(`tag describe`), so it helps from the first day.
+
+```console
+$ shlv model train      # suggest retrains it by itself when your tags change
+trained on 8039 examples for 30 canonical tags in 182 ms; the model is 325 KB
+$ shlv model eval       # train on your oldest 80%, test on the newest 20%
+```
+
+`model eval` reports precision and recall of the first choices, calibration (whether a 0.9 means
+90%), and with `--provider` the same for the `[ai] tag` provider on a few test bookmarks, so you can
+choose layers by measurement. Nothing leaves your machine unless you pass `--provider`.
 
 ## Performance
 

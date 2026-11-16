@@ -36,6 +36,8 @@ fetch = ["dep:ureq"]
 # AI summaries and tag suggestions through a configured provider. Implies fetch: summaries need
 # page text, and both use the same HTTP client.
 ai = ["fetch"]
+# The in-binary tag classifier (task 022): no dependencies, offline.
+model = []
 
 [profile.release]
 lto = true

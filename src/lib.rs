@@ -12,6 +12,8 @@ pub mod extract;
 #[cfg(feature = "fetch")]
 pub mod fetch;
 pub mod html;
+#[cfg(feature = "model")]
+pub mod model;
 pub mod netscape;
 pub mod search;
 pub mod store;
