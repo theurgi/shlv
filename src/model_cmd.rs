@@ -37,7 +37,7 @@ pub enum ModelCmd {
 
 pub fn run(
     store: &mut Store,
-    #[allow(unused)] config: &Config,
+    config: &Config,
     cmd: ModelCmd,
     out: &mut impl Write,
 ) -> Result<ExitCode> {
@@ -91,7 +91,7 @@ pub fn run(
         },
         #[cfg(not(feature = "ai"))]
         ModelCmd::Eval {} => {
-            eval(store, out)?;
+            eval(store, config, out)?;
         }
         #[cfg(feature = "ai")]
         ModelCmd::Eval {
@@ -99,7 +99,7 @@ pub fn run(
             limit,
             yes,
         } => {
-            let test = eval(store, out)?;
+            let test = eval(store, config, out)?;
             if provider {
                 return eval_provider(store, config, &test, limit, yes, out);
             }
@@ -119,7 +119,8 @@ fn size(bytes: usize) -> String {
 type TestSet = Vec<(shlv::choose::Item, HashSet<String>)>;
 
 /// The time-split evaluation of the classifier; returns the test set for a provider run.
-fn eval(store: &Store, out: &mut impl Write) -> Result<TestSet> {
+fn eval(store: &Store, config: &Config, out: &mut impl Write) -> Result<TestSet> {
+    let offer_at = config.model.threshold;
     let list = model::canonical_list(store)?;
     if list.is_empty() {
         bail!("no canonical tags: the classifier chooses from the canonical list");
@@ -159,24 +160,51 @@ fn eval(store: &Store, out: &mut impl Write) -> Result<TestSet> {
         plural(train_set.len(), "example"),
         plural(test.len(), "tagged bookmark")
     )?;
-    header(out)?;
+    header(out, offer_at)?;
     let t = std::time::Instant::now();
     let r = run_layer(&trained, &test, &list)?;
     let micros = t.elapsed().as_secs_f64() * 1e6 / test.len() as f64;
-    row(
-        out,
-        "classifier",
-        &model::evaluate(&r, list.len()),
-        &format!("{micros:.0} µs"),
-    )?;
+    let classifier = model::evaluate(&r, list.len(), offer_at);
+    row(out, "classifier", &classifier, &format!("{micros:.0} µs"))?;
     let r = run_layer(&lexical, &test, &list)?;
     row(
         out,
         "names and descriptions only",
-        &model::evaluate(&r, list.len()),
+        &model::evaluate(&r, list.len(), offer_at),
         "",
     )?;
+    writeln!(
+        out,
+        "\n±: 95% sampling error of P@1 on {}; smaller differences between layers are \
+         noise.\nECE: over every bookmark and tag, mostly easy negatives; \
+         ECE≥{offer_at}: over offered choices only.",
+        plural(test.len(), "test bookmark")
+    )?;
+    reliability(out, &classifier, offer_at)?;
     Ok(test)
+}
+
+/// What the classifier offered, by probability, against how often it was right.
+fn reliability(out: &mut impl Write, m: &Metrics, offer_at: f64) -> std::io::Result<()> {
+    if m.reliability.is_empty() {
+        return writeln!(out, "\nThe classifier offered nothing at p ≥ {offer_at}.");
+    }
+    writeln!(
+        out,
+        "\nClassifier choices offered (p ≥ {offer_at}):\n{:<11} {:>7} {:>7} {:>6}",
+        "p", "choices", "mean p", "right"
+    )?;
+    for b in &m.reliability {
+        writeln!(
+            out,
+            "{:<11} {:>7} {:>7.2} {:>6.2}",
+            format!("{}-{:.1}", b.from, b.to),
+            b.choices,
+            b.mean_p,
+            b.precision
+        )?;
+    }
+    Ok(())
 }
 
 fn run_layer(
@@ -189,11 +217,20 @@ fn run_layer(
         .collect()
 }
 
-fn header(out: &mut impl Write) -> std::io::Result<()> {
+fn header(out: &mut impl Write, offer_at: f64) -> std::io::Result<()> {
     writeln!(
         out,
-        "\n{:<28} {:>5} {:>5} {:>6} {:>6} {:>6} {:>8} {:>7}  time/bookmark",
-        "layer", "P@1", "R@3", "P@0.5", "R@0.5", "ECE", "P@0.9", "n@0.9"
+        "\n{:<28} {:>5} {:>5} {:>5} {:>6} {:>6} {:>6} {:>8} {:>6} {:>6}  time/bookmark",
+        "layer",
+        "P@1",
+        "±",
+        "R@3",
+        "P@0.5",
+        "R@0.5",
+        "ECE",
+        format!("ECE≥{offer_at}"),
+        "P@0.9",
+        "n@0.9"
     )
 }
 
@@ -201,13 +238,15 @@ fn row(out: &mut impl Write, name: &str, m: &Metrics, time: &str) -> std::io::Re
     let opt = |x: Option<f64>| x.map_or("-".to_string(), |x| format!("{x:.2}"));
     writeln!(
         out,
-        "{:<28} {:>5.2} {:>5.2} {:>6.2} {:>6.2} {:>6} {:>8} {:>7.2}  {time}",
+        "{:<28} {:>5.2} {:>5.2} {:>5.2} {:>6.2} {:>6.2} {:>6} {:>8} {:>6} {:>6.2}  {time}",
         name,
         m.precision_at_1,
+        m.precision_at_1_margin,
         m.recall_at_3,
         m.precision_at_half,
         m.recall_at_half,
         opt(m.ece),
+        opt(m.ece_offered),
         opt(m.precision_at_09),
         m.per_item_at_09
     )
@@ -249,7 +288,7 @@ fn eval_provider(
     row(
         out,
         &format!("provider {}", provider.name()),
-        &model::evaluate(&results, list.len()),
+        &model::evaluate(&results, list.len(), config.model.threshold),
         &format!("{secs:.1} s"),
     )?;
     writeln!(

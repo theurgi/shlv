@@ -39,13 +39,13 @@ const TOPICS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// A database with 60 examples per tag (so the classifier trusts them), plus a declared-free
+/// A database with 120 examples per tag (past `FULL_AT`, so the classifier trusts them), plus a declared-free
 /// canonical list that also has an untrained tag, `music`.
 fn fixture(path: &Path) {
     let mut s = Store::open(path).unwrap();
     for (tag, host, titles) in TOPICS {
         for (n, t) in titles.iter().enumerate() {
-            for v in 0..10 {
+            for v in 0..20 {
                 s.add(&NewBookmark {
                     // Half on a shared host, so titles carry the signal, not just hosts.
                     url: if v % 2 == 0 {

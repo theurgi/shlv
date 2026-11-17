@@ -4,6 +4,7 @@
 //! tag-models prep DATA_DIR OUT_DIR       # dataset.jsonl from the HetRec files, time-ordered
 //! tag-models run CANDIDATE OUT_DIR       # predictions/CANDIDATE.jsonl
 //! tag-models eval OUT_DIR                # metrics table (Markdown) for every predictions file
+//! tag-models small OUT_DIR               # task 038: the shipped classifier on 200..5k bookmarks
 //! ```
 //!
 //! Candidates: `lexical` (zero-shot), `nb-few`, `lr-few`, `nb`, `lr` (hashed tokens, trained on
@@ -47,7 +48,8 @@ fn main() -> Result<()> {
         ["prep", data, out] => prep(Path::new(data), Path::new(out)),
         ["run", cand, out] => run(cand, Path::new(out)),
         ["eval", out] => eval(Path::new(out)),
-        _ => bail!("usage: tag-models prep DATA OUT | run CANDIDATE OUT | eval OUT"),
+        ["small", out] => small(Path::new(out)),
+        _ => bail!("usage: tag-models prep DATA OUT | run CANDIDATE OUT | eval OUT | small OUT"),
     }
 }
 
@@ -741,9 +743,9 @@ fn eval(out: &Path) -> Result<()> {
             .join(" "),
     );
     println!(
-        "| candidate | setting | n | P@1 | R@3 | P@0.5 | R@0.5 | recall@3 common | recall@3 rare | ECE | P(p≥0.9) | cov(p≥0.9) | ms/item |"
+        "| candidate | setting | n | P@1 | ± | R@3 | P@0.5 | R@0.5 | recall@3 common | recall@3 rare | ECE | P(p≥0.9) | cov(p≥0.9) | ms/item |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
     // `SAMPLE_ONLY=1`: every candidate on the slow candidates' sample, for a fair comparison.
     let only: Option<HashSet<u64>> =
         std::env::var_os("SAMPLE_ONLY").map(|_| sample(&s.test).iter().map(|i| i.id).collect());
@@ -874,6 +876,7 @@ fn metrics(
     let f = |x: f64| format!("{x:.3}");
     vec![
         f(p1 / n),
+        format!("±{:.3}", shlv::model::wilson_margin(p1 / n, n)),
         f(r3 / n),
         if pred5 > 0.0 {
             f(tp5 / pred5)
@@ -892,4 +895,591 @@ fn metrics(
         if no_probs { "n/a".into() } else { f(hi_n / n) },
         format!("{:.1}", ms / n),
     ]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Task 038: the shipped classifier (`shlv::model`) trained on small random subsets of the train
+// split, tested on the whole test split.
+
+/// Training-set sizes: a personal library, not 40k bookmarks.
+const SIZES: &[usize] = &[200, 500, 1000, 2000, 5000];
+/// Random subsets per size.
+const SEEDS: u64 = 5;
+/// Cold-start blend sweep: examples at which the trained model fully replaces the lexical score
+/// (`shlv::model::FULL_AT` ships 50; 1 means no blend once a tag has an example).
+/// Name, FULL_AT, the largest weight the trained model gets, and whether the trained model also
+/// sees the lexical match kinds as features (stacking).
+const BLENDS: &[(&str, usize, f64, bool)] = &[
+    ("1", 1, 1.0, false),
+    ("20", 20, 1.0, false),
+    ("50", 50, 1.0, false),
+    ("100", 100, 1.0, false),
+    ("150", 150, 1.0, false),
+    ("200", 200, 1.0, false),
+    ("50 cap 0.7", 50, 0.7, false),
+    ("50 cap 0.8", 50, 0.8, false),
+    ("50 cap 0.85", 50, 0.85, false),
+    ("50 cap 0.9", 50, 0.9, false),
+    ("100 cap 0.8", 100, 0.8, false),
+    ("stack 1", 1, 1.0, true),
+    ("stack 50", 50, 1.0, true),
+];
+/// The shipped blend.
+const SHIPPED: &str = "100";
+
+/// Per-tag features for the lexical match kind (stacking variant), in shlv's hash space.
+fn lex_features(lex: &[f64]) -> Vec<u32> {
+    lex.iter()
+        .enumerate()
+        .filter(|x| *x.1 > 0.0)
+        .map(|(t, p)| {
+            let s = format!("x:{t}:{p}");
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in s.bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            (h % shlv::model::BUCKETS as u64) as u32
+        })
+        .collect()
+}
+/// Bootstrap resamples of the test set.
+const BOOT: usize = 400;
+
+fn options(tags: &[Tag]) -> Vec<shlv::choose::TagOption> {
+    tags.iter()
+        .map(|t| shlv::choose::TagOption {
+            name: t.name.clone(),
+            aliases: t.aliases.clone(),
+            description: Some(t.description.clone()),
+        })
+        .collect()
+}
+
+fn choose_item(i: &Item) -> shlv::choose::Item {
+    shlv::choose::Item {
+        url: i.url.clone(),
+        title: Some(i.title.clone()),
+        ..Default::default()
+    }
+}
+
+/// One test bookmark's contribution to the summed metrics.
+#[derive(Default, Clone, Copy)]
+struct Row {
+    hit1: f64,
+    r3: f64,
+    n5: f64,
+    tp5: f64,
+    n9: f64,
+    tp9: f64,
+}
+
+impl Row {
+    fn add(&mut self, o: &Row) {
+        self.hit1 += o.hit1;
+        self.r3 += o.r3;
+        self.n5 += o.n5;
+        self.tp5 += o.tp5;
+        self.n9 += o.n9;
+        self.tp9 += o.tp9;
+    }
+}
+
+/// Calibration bins: (count, sum of p, sum of outcomes).
+type Bins = [(f64, f64, f64); 10];
+
+fn ece(bins: &Bins) -> f64 {
+    let total: f64 = bins.iter().map(|b| b.0).sum();
+    bins.iter()
+        .filter(|b| b.0 > 0.0)
+        .map(|b| (b.0 / total) * ((b.1 - b.2) / b.0).abs())
+        .sum()
+}
+
+/// Tag groups by training examples: none, 1-49, 50-99, 100+.
+const GROUPS: [&str; 4] = ["0", "1-49", "50-99", "100+"];
+
+fn group(n: usize) -> usize {
+    match n {
+        0 => 0,
+        1..50 => 1,
+        50..100 => 2,
+        _ => 3,
+    }
+}
+
+struct Small {
+    rows: Vec<Row>,
+    all: Bins,
+    /// Choices at or above 0.5 (what `suggest` offers by default).
+    offered: Bins,
+    /// Per tag group: (n5, tp5, n9, tp9).
+    groups: [[f64; 4]; 4],
+}
+
+/// Scores per test item in list order; `truth` likewise. Ranks as `ChooseTags` does: choices
+/// below `MIN_REPORTED` dropped, a stable sort by probability over the list order.
+fn score_small(scores: &[Vec<f64>], truth: &[Vec<bool>], counts: &[usize]) -> Small {
+    let mut s = Small {
+        rows: Vec::with_capacity(scores.len()),
+        all: [(0.0, 0.0, 0.0); 10],
+        offered: [(0.0, 0.0, 0.0); 10],
+        groups: [[0.0; 4]; 4],
+    };
+    for (sc, tr) in scores.iter().zip(truth) {
+        let mut order: Vec<usize> = (0..sc.len())
+            .filter(|&t| sc[t] >= shlv::model::MIN_REPORTED)
+            .collect();
+        order.sort_by(|&a, &b| sc[b].total_cmp(&sc[a]));
+        let n_true = tr.iter().filter(|&&y| y).count() as f64;
+        let mut r = Row {
+            hit1: if order.first().is_some_and(|&t| tr[t]) {
+                1.0
+            } else {
+                0.0
+            },
+            r3: order.iter().take(3).filter(|&&t| tr[t]).count() as f64 / n_true,
+            ..Default::default()
+        };
+        for (t, (&p, &y)) in sc.iter().zip(tr).enumerate() {
+            let y = if y { 1.0 } else { 0.0 };
+            let b = ((p * 10.0) as usize).min(9);
+            for bins in [&mut s.all]
+                .into_iter()
+                .chain((p >= 0.5).then_some(&mut s.offered))
+            {
+                bins[b].0 += 1.0;
+                bins[b].1 += p;
+                bins[b].2 += y;
+            }
+            let g = &mut s.groups[group(counts[t])];
+            if p >= 0.5 {
+                r.n5 += 1.0;
+                r.tp5 += y;
+                g[0] += 1.0;
+                g[1] += y;
+            }
+            if p >= 0.9 {
+                r.n9 += 1.0;
+                r.tp9 += y;
+                g[2] += 1.0;
+                g[3] += y;
+            }
+        }
+        s.rows.push(r);
+    }
+    s
+}
+
+/// P@1, R@3, P@0.5, P@0.9 from summed rows.
+fn ratios(rows: &[Row]) -> [f64; 4] {
+    let mut t = Row::default();
+    for r in rows {
+        t.add(r);
+    }
+    let n = rows.len() as f64;
+    let div = |a: f64, b: f64| if b > 0.0 { a / b } else { f64::NAN };
+    [t.hit1 / n, t.r3 / n, div(t.tp5, t.n5), div(t.tp9, t.n9)]
+}
+
+/// 95% bootstrap half-widths of [`ratios`] over test bookmarks.
+fn bootstrap(rows: &[Row]) -> [f64; 4] {
+    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+    let mut draws: Vec<[f64; 4]> = Vec::with_capacity(BOOT);
+    let mut pick = vec![Row::default(); rows.len()];
+    for _ in 0..BOOT {
+        for p in pick.iter_mut() {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            *p = rows[(rng % rows.len() as u64) as usize];
+        }
+        draws.push(ratios(&pick));
+    }
+    std::array::from_fn(|k| {
+        let mut v: Vec<f64> = draws.iter().map(|d| d[k]).filter(|x| !x.is_nan()).collect();
+        v.sort_by(f64::total_cmp);
+        if v.len() < 10 {
+            return f64::NAN;
+        }
+        (v[v.len() * 975 / 1000] - v[v.len() * 25 / 1000]) / 2.0
+    })
+}
+
+fn random_subset(train: &[Item], n: usize, seed: u64) -> Vec<Item> {
+    let mut idx: Vec<usize> = (0..train.len()).collect();
+    let mut rng = 0x2545_f491_4f6c_dd1du64 ^ (seed + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    for k in (1..idx.len()).rev() {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        idx.swap(k, (rng % (k as u64 + 1)) as usize);
+    }
+    idx.truncate(n);
+    idx.sort_unstable();
+    idx.into_iter().map(|i| train[i].clone()).collect()
+}
+
+fn small(out: &Path) -> Result<()> {
+    use shlv::model::{Classifier, Example, Lexical, features as shlv_features, train};
+    let tags = canonical()?;
+    let list = options(&tags);
+    let s = splits(read_items(out)?, &tags);
+    let test: Vec<shlv::choose::Item> = s.test.iter().map(choose_item).collect();
+    let truth: Vec<Vec<bool>> = s
+        .test
+        .iter()
+        .map(|i| tags.iter().map(|t| i.tags.contains(&t.name)).collect())
+        .collect();
+    let test_feats: Vec<Vec<u32>> = test.iter().map(shlv_features).collect();
+    let lex = Lexical::new(&list);
+    let lexical: Vec<Vec<f64>> = test.iter().map(|i| lex.probabilities(i)).collect();
+    let n_test = test.len();
+    let sample_ids: HashSet<u64> = sample(&s.test).iter().map(|i| i.id).collect();
+    let in_sample: Vec<bool> = s.test.iter().map(|i| sample_ids.contains(&i.id)).collect();
+
+    // Lexical only: what a new user with nothing tagged gets.
+    println!("train split {}, test split {n_test}\n", s.train.len());
+    println!("### Lexical probabilities (cold start, whole test split)\n");
+    println!("| p | choices | precision | 95% |");
+    println!("|---|---|---|---|");
+    for v in [0.65, 0.45, 0.15, 0.05] {
+        let (mut n, mut ok) = (0.0f64, 0.0f64);
+        for (sc, tr) in lexical.iter().zip(&truth) {
+            for (&p, &y) in sc.iter().zip(tr) {
+                if p == v {
+                    n += 1.0;
+                    ok += if y { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        let p = ok / n;
+        println!(
+            "| {v} | {n} | {p:.3} | ±{:.3} |",
+            1.96 * (p * (1.0 - p) / n).sqrt()
+        );
+    }
+
+    // results[size][blend] = per-seed Small.
+    struct Run {
+        size: usize,
+        tags_at_50: usize,
+        blends: Vec<(&'static str, Small)>,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    let cold = score_small(&lexical, &truth, &vec![0; tags.len()]);
+    let mut plan: Vec<(usize, u64)> = SIZES
+        .iter()
+        .flat_map(|&n| (0..SEEDS).map(move |k| (n, k)))
+        .collect();
+    plan.push((s.train.len(), 0));
+    for (size, seed) in plan {
+        let sub = if size == s.train.len() {
+            s.train.clone()
+        } else {
+            random_subset(&s.train, size, seed)
+        };
+        let examples: Vec<Example> = sub
+            .iter()
+            .map(|i| Example {
+                features: shlv_features(&choose_item(i)),
+                positive: i.tags.iter().cloned().collect(),
+                negative: None,
+            })
+            .collect();
+        let with_lex = |f: &[u32], item: &shlv::choose::Item| -> Vec<u32> {
+            let mut f = f.to_vec();
+            f.extend(lex_features(&lex.probabilities(item)));
+            f.sort_unstable();
+            f.dedup();
+            f
+        };
+        let stacked_examples: Vec<Example> = examples
+            .iter()
+            .zip(&sub)
+            .map(|(e, i)| Example {
+                features: with_lex(&e.features, &choose_item(i)),
+                ..e.clone()
+            })
+            .collect();
+        let stacked_model = train(&stacked_examples, &list);
+        let stacked: Vec<Vec<f64>> = test_feats
+            .iter()
+            .zip(&test)
+            .map(|(f, i)| {
+                let f = with_lex(f, i);
+                stacked_model
+                    .tags
+                    .iter()
+                    .map(|m| 1.0 / (1.0 + (-f64::from(m.logit(&f))).exp()))
+                    .collect()
+            })
+            .collect();
+        let t0 = Instant::now();
+        let model = train(&examples, &list);
+        let train_ms = t0.elapsed().as_millis();
+        let counts: Vec<usize> = model.tags.iter().map(|t| t.positives as usize).collect();
+        let trained: Vec<Vec<f64>> = test_feats
+            .iter()
+            .map(|f| {
+                model
+                    .tags
+                    .iter()
+                    .map(|m| 1.0 / (1.0 + (-f64::from(m.logit(f))).exp()))
+                    .collect()
+            })
+            .collect();
+        let blend = |full_at: usize, cap: f64, stack: bool| -> Vec<Vec<f64>> {
+            if stack { &stacked } else { &trained }
+                .iter()
+                .zip(&lexical)
+                .map(|(tp, lx)| {
+                    tp.iter()
+                        .zip(lx)
+                        .zip(&counts)
+                        .map(|((&p, &l), &n)| {
+                            if n == 0 {
+                                l
+                            } else {
+                                let w = (n as f64 / full_at as f64).min(cap);
+                                w * p + (1.0 - w) * l
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // The blend at FULL_AT is what `Classifier` ships: check on a few bookmarks.
+        assert_eq!(SHIPPED, shlv::model::FULL_AT.to_string());
+        let shipped = blend(shlv::model::FULL_AT, 1.0, false);
+        let c = Classifier::new(&list, Some(&model));
+        for k in (0..n_test).step_by(n_test / 20) {
+            let p: Vec<f64> = c.probabilities(&test[k]).into_iter().map(|x| x.1).collect();
+            assert!(
+                p.iter().zip(&shipped[k]).all(|(a, b)| (a - b).abs() < 1e-9),
+                "blend differs from Classifier"
+            );
+        }
+        let blends = BLENDS
+            .iter()
+            .map(|&(name, at, cap, st)| (name, score_small(&blend(at, cap, st), &truth, &counts)))
+            .collect();
+        eprintln!("size {size} seed {seed}: trained in {train_ms} ms");
+        runs.push(Run {
+            size,
+            tags_at_50: counts
+                .iter()
+                .filter(|&&n| n >= shlv::model::FULL_AT)
+                .count(),
+            blends,
+        });
+    }
+    let sizes: Vec<usize> = {
+        let mut v: Vec<usize> = runs.iter().map(|r| r.size).collect();
+        v.dedup();
+        v
+    };
+    let of = |size: usize, b: &str| -> Vec<&Small> {
+        runs.iter()
+            .filter(|r| r.size == size)
+            .map(|r| &r.blends.iter().find(|x| x.0 == b).unwrap().1)
+            .collect()
+    };
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let range = |v: &[f64]| {
+        let lo = v.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if v.len() > 1 {
+            format!(" ({lo:.2}-{hi:.2})")
+        } else {
+            String::new()
+        }
+    };
+    let f3 = |x: f64| {
+        if x.is_nan() {
+            "-".to_string()
+        } else {
+            format!("{x:.3}")
+        }
+    };
+
+    println!(
+        "\n### Shipped classifier (FULL_AT {}) by training size\n",
+        shlv::model::FULL_AT
+    );
+    println!(
+        "Mean over {SEEDS} random subsets of the train split (range in parentheses); ± is the 95% \
+         bootstrap half-width over the {n_test} test bookmarks for the first subset; ±300 the \
+         same on the 300-bookmark sample.\n"
+    );
+    println!(
+        "| train | tags ≥FULL_AT ex. | P@1 | ± | ±300 | R@3 | P@0.5 | n@0.5 | P@0.9 | ± | choices ≥0.9 | n@0.9 | ECE all | ECE offered |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let print_row = |label: String, tags50: String, v: &[&Small]| {
+        let r: Vec<[f64; 4]> = v.iter().map(|x| ratios(&x.rows)).collect();
+        let col = |k: usize| r.iter().map(|x| x[k]).collect::<Vec<f64>>();
+        let ci = bootstrap(&v[0].rows);
+        let sample_rows: Vec<Row> = v[0]
+            .rows
+            .iter()
+            .zip(&in_sample)
+            .filter(|x| *x.1)
+            .map(|x| *x.0)
+            .collect();
+        let ci300 = bootstrap(&sample_rows);
+        let n5: Vec<f64> = v
+            .iter()
+            .map(|x| x.rows.iter().map(|r| r.n5).sum::<f64>() / n_test as f64)
+            .collect();
+        let n9: Vec<f64> = v
+            .iter()
+            .map(|x| x.rows.iter().map(|r| r.n9).sum::<f64>())
+            .collect();
+        let p9: Vec<f64> = col(3).into_iter().filter(|x| !x.is_nan()).collect();
+        println!(
+            "| {label} | {tags50} | {:.3}{} | ±{:.3} | ±{:.3} | {:.3} | {:.3} | {:.2} | {}{} | ±{} | {:.0} | {:.3} | {:.4} | {:.3} |",
+            mean(&col(0)),
+            range(&col(0)),
+            ci[0],
+            ci300[0],
+            mean(&col(1)),
+            mean(&col(2)),
+            mean(&n5),
+            if p9.is_empty() {
+                "-".into()
+            } else {
+                f3(mean(&p9))
+            },
+            if p9.is_empty() {
+                String::new()
+            } else {
+                range(&p9)
+            },
+            f3(ci[3]),
+            mean(&n9),
+            mean(&n9) / n_test as f64,
+            mean(&v.iter().map(|x| ece(&x.all)).collect::<Vec<_>>()),
+            mean(&v.iter().map(|x| ece(&x.offered)).collect::<Vec<_>>()),
+        );
+    };
+    print_row("0 (lexical)".into(), "0".into(), &[&cold]);
+    for &size in &sizes {
+        let t50: Vec<f64> = runs
+            .iter()
+            .filter(|r| r.size == size)
+            .map(|r| r.tags_at_50 as f64)
+            .collect();
+        print_row(
+            size.to_string(),
+            format!("{:.0}", mean(&t50)),
+            &of(size, SHIPPED),
+        );
+    }
+
+    println!("\n### Reliability of offered choices (shipped, all subsets pooled)\n");
+    print!("| p |");
+    for size in &sizes {
+        print!(" {size}: n | mean p | precision |");
+    }
+    println!();
+    println!("|---|{}", "---|---|---|".repeat(sizes.len()));
+    for b in 5..10 {
+        print!("| {:.1}-{:.1} |", b as f64 / 10.0, (b + 1) as f64 / 10.0);
+        for &size in &sizes {
+            let v = of(size, SHIPPED);
+            let (n, sp, sy) = v.iter().fold((0.0, 0.0, 0.0), |a, x| {
+                (
+                    a.0 + x.offered[b].0,
+                    a.1 + x.offered[b].1,
+                    a.2 + x.offered[b].2,
+                )
+            });
+            let k = v.len() as f64;
+            if n > 0.0 {
+                print!(" {:.0} | {:.3} | {:.3} |", n / k, sp / n, sy / n);
+            } else {
+                print!(" 0 | - | - |");
+            }
+        }
+        println!();
+    }
+    let lex_offered = &cold.offered;
+    println!("\nLexical only, offered (≥0.5): ");
+    for (b, x) in lex_offered.iter().enumerate().filter(|x| x.1.0 > 0.0) {
+        println!(
+            "- bin {b}: n {:.0}, mean p {:.3}, precision {:.3}",
+            x.0,
+            x.1 / x.0,
+            x.2 / x.0
+        );
+    }
+
+    println!("\n### Precision by the tag's training examples (shipped, pooled subsets)\n");
+    print!("| train |");
+    for g in GROUPS {
+        print!(" {g}: P@0.5 (n) | P@0.9 (n) |");
+    }
+    println!();
+    println!("|---|{}", "---|---|".repeat(4));
+    for &size in &sizes {
+        let v = of(size, SHIPPED);
+        let k = v.len() as f64;
+        print!("| {size} |");
+        for g in 0..4 {
+            let a = v.iter().fold([0.0; 4], |mut a, x| {
+                for (s, y) in a.iter_mut().zip(x.groups[g]) {
+                    *s += y;
+                }
+                a
+            });
+            let p = |ok: f64, n: f64| {
+                if n > 0.0 {
+                    format!("{:.2} ({:.0})", ok / n, n / k)
+                } else {
+                    "- (0)".into()
+                }
+            };
+            print!(" {} | {} |", p(a[1], a[0]), p(a[3], a[2]));
+        }
+        println!();
+    }
+
+    println!("\n### Cold-start blend sweep (mean over subsets)\n");
+    println!("FULL_AT: examples at which the trained model replaces the lexical score.\n");
+    println!("| train | blend | P@1 | R@3 | P@0.5 | n@0.5 | P@0.9 | choices ≥0.9 | ECE offered |");
+    println!("|---|---|---|---|---|---|---|---|---|");
+    for &size in &sizes {
+        for &(b, ..) in BLENDS {
+            let v = of(size, b);
+            let r: Vec<[f64; 4]> = v.iter().map(|x| ratios(&x.rows)).collect();
+            let col =
+                |k: usize| -> Vec<f64> { r.iter().map(|x| x[k]).filter(|x| !x.is_nan()).collect() };
+            let n5 = mean(
+                &v.iter()
+                    .map(|x| x.rows.iter().map(|r| r.n5).sum::<f64>() / n_test as f64)
+                    .collect::<Vec<_>>(),
+            );
+            let n9 = mean(
+                &v.iter()
+                    .map(|x| x.rows.iter().map(|r| r.n9).sum::<f64>())
+                    .collect::<Vec<_>>(),
+            );
+            let p9 = col(3);
+            println!(
+                "| {size} | {b} | {:.3} | {:.3} | {:.3} | {n5:.2} | {} | {n9:.0} | {:.3} |",
+                mean(&col(0)),
+                mean(&col(1)),
+                mean(&col(2)),
+                if p9.is_empty() {
+                    "-".into()
+                } else {
+                    f3(mean(&p9))
+                },
+                mean(&v.iter().map(|x| ece(&x.offered)).collect::<Vec<_>>()),
+            );
+        }
+    }
+    Ok(())
 }

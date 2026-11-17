@@ -22,8 +22,10 @@ use crate::choose::{Choice, ChooseTags, Item, TagOption};
 /// Hash buckets. 025: 2^16 was within 0.01 of 2^18 at P@1 and a quarter of the size.
 pub const BUCKETS: usize = 1 << 16;
 
-/// Examples of a tag at which the trained model fully replaces the lexical score.
-pub const FULL_AT: usize = 50;
+/// Examples of a tag at which the trained model fully replaces the lexical score. 038: at 50, P@1
+/// dipped at 1k-2k bookmarks (0.41, against 0.43 at 500), as tags lost the lexical score before
+/// their model was good; 100 gave 0.45 and 0.44 there, the same from 5k up, and 0.01 less at 200.
+pub const FULL_AT: usize = 100;
 
 /// Choices below this probability aren't returned by [`ChooseTags`].
 pub const MIN_REPORTED: f64 = 0.05;
@@ -183,7 +185,8 @@ pub struct TagModel {
 }
 
 impl TagModel {
-    fn logit(&self, features: &[u32]) -> f32 {
+    /// The log-odds of the tag for a bookmark's hashed features.
+    pub fn logit(&self, features: &[u32]) -> f32 {
         let mut z = self.bias;
         for &f in features {
             if let Ok(i) = self
@@ -803,22 +806,65 @@ pub struct Metrics {
     pub items: usize,
     /// The first choice is one of the bookmark's tags.
     pub precision_at_1: f64,
+    /// Sampling error of `precision_at_1`: the half-width of its 95% Wilson interval. About
+    /// ±0.06 at 300 test bookmarks, ±0.13 at 50.
+    pub precision_at_1_margin: f64,
     /// Share of the bookmark's tags among the first three choices.
     pub recall_at_3: f64,
     /// Precision and recall of choices with p ≥ 0.5.
     pub precision_at_half: f64,
     pub recall_at_half: f64,
     /// Expected calibration error over every (bookmark, tag) pair (10 bins); `None` for layers
-    /// without probabilities.
+    /// without probabilities. Easy negatives (p near 0, rightly) dominate it, so it stays small
+    /// even when the offered choices are off.
     pub ece: Option<f64>,
+    /// Expected calibration error over the offered choices only (p ≥ the `offer_at` given to
+    /// [`evaluate`]); `None` without probabilities or without offered choices.
+    pub ece_offered: Option<f64>,
+    /// The offered choices by probability, in tenths: what was predicted against what was right.
+    pub reliability: Vec<ReliabilityBin>,
     /// Precision of choices with p ≥ 0.9, and how many there are per bookmark.
     pub precision_at_09: Option<f64>,
     pub per_item_at_09: f64,
 }
 
+/// One row of a reliability table: offered choices with `from <= p < to`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReliabilityBin {
+    pub from: f64,
+    pub to: f64,
+    pub choices: usize,
+    pub mean_p: f64,
+    pub precision: f64,
+}
+
+/// Half-width of the 95% Wilson score interval of a proportion `p` over `n` trials.
+pub fn wilson_margin(p: f64, n: f64) -> f64 {
+    let z2 = 1.96f64 * 1.96;
+    1.96 * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt() / (1.0 + z2 / n)
+}
+
+/// Calibration bins: (choices, sum of p, right ones).
+type Bins = [(f64, f64, f64); 10];
+
+fn ece(bins: &Bins) -> Option<f64> {
+    let total: f64 = bins.iter().map(|b| b.0).sum();
+    (total > 0.0).then(|| {
+        bins.iter()
+            .filter(|b| b.0 > 0.0)
+            .map(|b| (b.0 / total) * ((b.1 - b.2) / b.0).abs())
+            .sum()
+    })
+}
+
 /// Evaluates choices against the true tags. `n_tags` is the size of the list, for calibration:
-/// tags a layer didn't return count as p = 0.
-pub fn evaluate(results: &[(Vec<Choice>, HashSet<String>)], n_tags: usize) -> Metrics {
+/// tags a layer didn't return count as p = 0. `offer_at` is the probability from which choices
+/// are offered (`[model] threshold`), for [`Metrics::ece_offered`] and the reliability table.
+pub fn evaluate(
+    results: &[(Vec<Choice>, HashSet<String>)],
+    n_tags: usize,
+    offer_at: f64,
+) -> Metrics {
     let mut m = Metrics {
         items: results.len(),
         ..Default::default()
@@ -827,7 +873,8 @@ pub fn evaluate(results: &[(Vec<Choice>, HashSet<String>)], n_tags: usize) -> Me
         return m;
     }
     let (mut tp5, mut pred5, mut truth_n, mut hi, mut hi_ok) = (0.0, 0.0, 0.0, 0.0, 0.0);
-    let mut bins = [(0.0f64, 0.0f64, 0.0f64); 10];
+    let mut bins: Bins = [(0.0, 0.0, 0.0); 10];
+    let mut offered: Bins = [(0.0, 0.0, 0.0); 10];
     let mut have_probs = true;
     for (choices, truth) in results {
         truth_n += truth.len() as f64;
@@ -862,6 +909,11 @@ pub fn evaluate(results: &[(Vec<Choice>, HashSet<String>)], n_tags: usize) -> Me
             bins[b].0 += 1.0;
             bins[b].1 += p;
             bins[b].2 += y;
+            if p >= offer_at {
+                offered[b].0 += 1.0;
+                offered[b].1 += p;
+                offered[b].2 += y;
+            }
         }
         let missing = n_tags.saturating_sub(choices.len()) as f64;
         let missed_true = truth
@@ -873,17 +925,25 @@ pub fn evaluate(results: &[(Vec<Choice>, HashSet<String>)], n_tags: usize) -> Me
     }
     let n = results.len() as f64;
     m.precision_at_1 /= n;
+    m.precision_at_1_margin = wilson_margin(m.precision_at_1, n);
     m.recall_at_3 /= n;
     m.precision_at_half = if pred5 > 0.0 { tp5 / pred5 } else { 0.0 };
     m.recall_at_half = if truth_n > 0.0 { tp5 / truth_n } else { 0.0 };
     if have_probs {
-        let total: f64 = bins.iter().map(|b| b.0).sum();
-        m.ece = Some(
-            bins.iter()
-                .filter(|b| b.0 > 0.0)
-                .map(|b| (b.0 / total) * ((b.1 / b.0) - (b.2 / b.0)).abs())
-                .sum(),
-        );
+        m.ece = ece(&bins);
+        m.ece_offered = ece(&offered);
+        m.reliability = offered
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.0 > 0.0)
+            .map(|(k, b)| ReliabilityBin {
+                from: (k as f64 / 10.0).max(offer_at),
+                to: (k + 1) as f64 / 10.0,
+                choices: b.0 as usize,
+                mean_p: b.1 / b.0,
+                precision: b.2 / b.0,
+            })
+            .collect();
         m.precision_at_09 = (hi > 0.0).then(|| hi_ok / hi);
         m.per_item_at_09 = hi / n;
     }
@@ -951,7 +1011,7 @@ mod tests {
 
     fn examples() -> Vec<Example> {
         let mut v = Vec::new();
-        for i in 0..120 {
+        for i in 0..240 {
             let (title, tag) = if i % 2 == 0 {
                 (format!("borrow checker lifetimes {i}"), "rust")
             } else {
@@ -969,8 +1029,8 @@ mod tests {
     #[test]
     fn trains_and_predicts() {
         let m = train(&examples(), &list());
-        assert_eq!(m.examples, 120);
-        assert_eq!(m.tags[0].positives, 60);
+        assert_eq!(m.examples, 240);
+        assert_eq!(m.tags[0].positives, 120);
         let c = Classifier::new(&list(), Some(&m));
         let p: HashMap<String, f64> = c
             .probabilities(&item(
@@ -1007,6 +1067,59 @@ mod tests {
             .into_iter()
             .collect();
         assert!(p["rust"] < 0.3, "{p:?}");
+    }
+
+    #[test]
+    fn calibration_of_offered_choices() {
+        let c = |tag: &str, p: f64| Choice {
+            tag: tag.into(),
+            confidence: Some(p),
+        };
+        let truth = |t: &[&str]| t.iter().map(|t| t.to_string()).collect::<HashSet<_>>();
+        // Four bookmarks, 50 tags each: offered choices at 0.95 (half right) and 0.55 (right),
+        // and many easy negatives that dilute the all-pairs ECE.
+        let results = vec![
+            (vec![c("a", 0.95), c("b", 0.55)], truth(&["b"])),
+            (vec![c("a", 0.95), c("b", 0.2)], truth(&["a"])),
+            (vec![c("b", 0.55)], truth(&["b"])),
+            (vec![c("c", 0.05)], truth(&["a"])),
+        ];
+        let m = evaluate(&results, 50, 0.5);
+        assert_eq!(m.precision_at_1, 0.5);
+        assert_eq!(m.precision_at_09, Some(0.5));
+        assert_eq!(
+            m.reliability,
+            [
+                ReliabilityBin {
+                    from: 0.5,
+                    to: 0.6,
+                    choices: 2,
+                    mean_p: 0.55,
+                    precision: 1.0
+                },
+                ReliabilityBin {
+                    from: 0.9,
+                    to: 1.0,
+                    choices: 2,
+                    mean_p: 0.95,
+                    precision: 0.5
+                },
+            ]
+        );
+        // Offered: |0.55 - 1| and |0.95 - 0.5|, equally weighted.
+        assert!((m.ece_offered.unwrap() - 0.45).abs() < 1e-9);
+        assert!(m.ece.unwrap() < 0.02, "{:?}", m.ece);
+        assert!((m.precision_at_1_margin - wilson_margin(0.5, 4.0)).abs() < 1e-12);
+        // Near the bounds, the interval stays wide (the normal approximation gives 0).
+        assert!((wilson_margin(1.0, 33.0) - 0.052).abs() < 0.001);
+        assert!((wilson_margin(0.6, 300.0) - 0.055).abs() < 0.001);
+        assert!((wilson_margin(0.5, 50.0) - 0.13).abs() < 0.005);
+        // Offered from 0.6: only the 0.95s, and the first bin starts at the threshold.
+        let m = evaluate(&results, 50, 0.6);
+        assert_eq!(m.reliability.len(), 1);
+        assert!((m.ece_offered.unwrap() - 0.45).abs() < 1e-9);
+        let m = evaluate(&results, 50, 0.52);
+        assert_eq!(m.reliability[0].from, 0.52);
     }
 
     #[test]

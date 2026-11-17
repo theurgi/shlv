@@ -67,7 +67,7 @@ fn store() -> Store {
     let mut s = Store::open_in_memory().unwrap();
     for (n, (tag, host, title)) in FIXTURE.iter().enumerate() {
         // Repeat each with a variant so every tag has enough examples for the trained model.
-        for v in 0..9 {
+        for v in 0..18 {
             s.add(&NewBookmark {
                 url: format!("https://{host}/{n}/{v}"),
                 title: Some(format!("{title} part {v}")),
@@ -106,7 +106,7 @@ fn trains_stores_and_predicts() {
     let mut s = store();
     assert!(s.stored_model().unwrap().is_none());
     let t = s.train_model().unwrap();
-    assert_eq!((t.examples, t.tags), (162, 4));
+    assert_eq!((t.examples, t.tags), (324, 4));
     let stored = s.stored_model().unwrap().unwrap();
     assert!(!stored.stale);
     assert_eq!(stored.bytes, t.bytes);
@@ -151,7 +151,7 @@ fn retrains_when_the_tags_change() {
     s.classifier(true).unwrap();
     let st = s.stored_model().unwrap().unwrap();
     assert!(!st.stale);
-    assert_eq!(st.model.examples, 163);
+    assert_eq!(st.model.examples, 325);
     // Without retraining allowed, a stale model is used as it is.
     s.add_canonical(&["jazz".into()]).unwrap();
     s.classifier(false).unwrap();
@@ -210,17 +210,27 @@ fn cli_train_status_eval() {
     let (ok, out, err) = shlv(&db, &["model", "train"]);
     assert!(ok, "{err}");
     assert!(
-        out.starts_with("trained on 162 examples for 4 canonical tags in "),
+        out.starts_with("trained on 324 examples for 4 canonical tags in "),
         "{out}"
     );
     let (_, out, _) = shlv(&db, &["model", "status"]);
-    assert!(out.contains("on 162 examples for 4 tags"), "{out}");
-    assert!(out.contains("fewer than 50 examples"), "{out}");
+    assert!(out.contains("on 324 examples for 4 tags"), "{out}");
+    assert!(out.contains("fewer than 100 examples"), "{out}");
     let (ok, out, err) = shlv(&db, &["model", "eval"]);
     assert!(ok, "{err}");
     assert!(out.contains("tested on the newest"), "{out}");
     assert!(
         out.contains("classifier") && out.contains("names and descriptions only"),
+        "{out}"
+    );
+    // Calibration of what's offered, and the sampling error, next to the all-pairs ECE.
+    assert!(
+        out.contains("ECE≥0.5") && out.contains("95% sampling error"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Classifier choices offered (p ≥ 0.5)")
+            || out.contains("offered nothing at p ≥ 0.5"),
         "{out}"
     );
     let _ = std::fs::remove_dir_all(&dir);

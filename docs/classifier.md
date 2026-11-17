@@ -4,7 +4,8 @@ With the `model` feature, shlv learns tags from your own bookmarks: a small clas
 regression over words from the title, host, URL path, summary, and note) trained on bookmarks that
 have canonical tags, plus suggestions you rejected. It runs offline in microseconds and is stored in
 the database. Tags with few examples fall back on matching their name, aliases, and description
-(`tag describe`), so it helps from the first day.
+(`tag describe`), so it helps from the first day; the match counts less as a tag gathers examples
+and drops out at 100.
 
 ```console
 $ shlv model train      # suggest retrains it by itself when your tags change
@@ -14,7 +15,12 @@ $ shlv model eval       # train on your oldest 80%, test on the newest 20%
 
 `model eval` reports precision and recall of the first choices, calibration (whether a 0.9 means
 90%), and with `--provider` the same for the `[ai] tag` provider on a few test bookmarks, so you can
-choose layers by measurement. Nothing leaves your machine unless you pass `--provider`.
+choose layers by measurement. Nothing leaves your machine unless you pass `--provider`. Read it with
+its sampling error: the `±` column is the 95% margin of P@1 from the test sample alone, about ±0.13
+with 50 test bookmarks (a 250-bookmark library) and ±0.06 with 300, so smaller differences between
+layers may well be chance. Calibration comes twice: `ECE` over every bookmark and tag, which the
+many easy "no"s keep small, and `ECE≥0.5` over the choices it would offer (`threshold`), followed by
+a table of those choices by probability against how often they were right.
 
 With the classifier built, `suggest` runs the layers in order: domain rules, then the classifier
 (suggestions with source `model` and its probability), then the `[ai] tag` provider where the
@@ -27,8 +33,8 @@ auto_threshold = 0.9 # with suggestions = "auto", apply only from here up; the r
 provider = "fallback" # ask [ai] tag: "fallback" (when the classifier is unsure), "always", "never"
 ```
 
-"Unsure" means nothing reached `threshold`, or a tag that did has fewer than 50 examples. Every
-accepted or rejected suggestion is a training example the next time the model trains.
+"Unsure" means nothing reached `threshold`, or a tag that did has no examples yet. Every accepted or
+rejected suggestion is a training example the next time the model trains.
 
 ## Back-filling a new tag
 
