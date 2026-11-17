@@ -13,16 +13,18 @@
 //! proposal: the AI's becomes a suggestion of that tag. A name that is an alias of a tag off the
 //! list is proposed under that tag's name.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::choose::NewTag;
-use crate::store::{Store, ensure_tag, normalize_tag, now_ms, resolve_tag, touch_many};
+use crate::store::{
+    Store, ensure_tag, normalize_tag, now_ms, resolve_tag, styled_name, touch_many,
+};
 use crate::suggest::{self, OfferStats, Offered, Source};
 use crate::tag::{
     add_alias, alias_target, check_description, forget_declared, live_tag, merge_into, pinned,
-    set_description, tag_name,
+    set_description,
 };
 
 /// Who proposed a name. Stored as text in `tag_proposal.source` and `tag_proposal_bookmark`.
@@ -165,6 +167,8 @@ pub struct ProposeStats {
     pub suggested: OfferStats,
     /// Names dropped because they were rejected.
     pub rejected: Vec<String>,
+    /// Names the tag style refused, with the reason.
+    pub refused: Vec<String>,
 }
 
 /// The result of accepting or aliasing a proposal.
@@ -282,6 +286,22 @@ pub(crate) fn divert(
 }
 
 /// A proposal by exact (normalized) name: (id, description, state).
+impl Store {
+    /// The proposal `raw` names: normalized, or if no proposal has that name, fixed by the
+    /// style (a name rejected ahead of time is stored as a proposed one would be).
+    fn proposal_name(&self, raw: &str) -> Result<String> {
+        let base = normalize_tag(raw);
+        if base.is_empty() {
+            bail!("empty tag name");
+        }
+        if self.style.is_default() || find(&self.conn, &base)?.is_some() {
+            return Ok(base);
+        }
+        let fixed = self.style.fix(&base);
+        Ok(if fixed.is_empty() { base } else { fixed })
+    }
+}
+
 fn find(conn: &Connection, name: &str) -> Result<Option<(i64, Option<String>, String)>> {
     Ok(conn
         .prepare_cached("SELECT id, description, state FROM tag_proposal WHERE name = ?1")?
@@ -291,7 +311,8 @@ fn find(conn: &Connection, name: &str) -> Result<Option<(i64, Option<String>, St
 
 impl Store {
     /// Records a layer's proposed names for one bookmark, in one short transaction. Names are
-    /// normalized (empty ones skipped); a rejected name is dropped. A name that is a canonical
+    /// normalized and styled (empty ones skipped, ones the style refuses in
+    /// [`ProposeStats::refused`]); a rejected name is dropped. A name that is a canonical
     /// tag or an alias of one is offered as a suggestion of that tag instead (like
     /// [`Store::offer_choices`], source `llm`), or for other sources added as a tag.
     pub fn propose_tags(
@@ -305,10 +326,16 @@ impl Store {
         let mut stats = ProposeStats::default();
         let mut touched = false;
         for t in tags {
-            let name = normalize_tag(&t.name);
-            if name.is_empty() {
+            if normalize_tag(&t.name).is_empty() {
                 continue;
             }
+            let name = match styled_name(&tx, &self.style, &t.name) {
+                Ok(n) => n,
+                Err(e) => {
+                    stats.refused.push(e.to_string());
+                    continue;
+                }
+            };
             let description = t
                 .description
                 .as_deref()
@@ -418,16 +445,19 @@ impl Store {
     /// declared list too: the tag goes on the list in the database. A rejected name can be
     /// accepted; that undoes the rejection.
     pub fn accept_proposal(&mut self, name: &str) -> Result<Decided> {
-        let name = tag_name(name)?;
+        let name = self.proposal_name(name)?;
         let now = now_ms();
         let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let Some((id, description, _)) = find(&tx, &name)? else {
             bail!("no proposal {name:?} (see `shlv tag proposals`)");
         };
-        let tag_id = match resolve_tag(&tx, &name)? {
+        // A name proposed before the style was set is fixed now, or refused.
+        let styled = styled_name(&tx, &self.style, &name)
+            .map_err(|e| anyhow!("cannot accept {name:?}: {e}; alias it to a tag or reject it"))?;
+        let tag_id = match resolve_tag(&tx, &styled)? {
             Some(t) => t,
-            None => ensure_tag(&tx, &name, now)?,
+            None => ensure_tag(&tx, &styled, now)?,
         };
         tx.execute(
             "UPDATE tag SET canonical = 1, updated_at = ?2 WHERE id = ?1 AND NOT canonical",
@@ -459,7 +489,7 @@ impl Store {
     /// the list, that tag is merged into `tag`, as `tag merge` would. In strict mode, `tag` must
     /// be canonical.
     pub fn alias_proposal(&mut self, name: &str, tag: &str) -> Result<Decided> {
-        let (name, tag) = (tag_name(name)?, tag_name(tag)?);
+        let (name, tag) = (self.proposal_name(name)?, self.lookup(tag)?);
         let now = now_ms();
         let strict = self.strict_tags();
         let pinned_name = self.pinned.as_ref().is_some_and(|p| p.is_tag(&name));
@@ -524,7 +554,7 @@ impl Store {
     /// ahead of time works). Returns how many bookmarks it was proposed for; they don't get it.
     /// A name that is a canonical tag or an alias of one can't be rejected.
     pub fn reject_proposal(&mut self, name: &str) -> Result<usize> {
-        let name = tag_name(name)?;
+        let name = self.proposal_name(name)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
         if let Some(t) = resolve_tag(&tx, &name)? {

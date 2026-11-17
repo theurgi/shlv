@@ -589,7 +589,7 @@ impl Store {
     /// Renames a tag in place, keeping its row and `uid`. Fails if `new` is already a tag (merge
     /// instead) or an alias of another tag. If `new` is an alias of this tag, the alias goes away.
     pub fn rename_tag(&mut self, old: &str, new: &str) -> Result<Retagged> {
-        let (old, new) = (tag_name(old)?, tag_name(new)?);
+        let (old, new) = (self.lookup(old)?, self.new_name(new)?);
         if self.pinned.as_ref().is_some_and(|p| p.is_tag(&old)) {
             return Err(pinned(format!("cannot rename pinned tag {old}")));
         }
@@ -634,7 +634,7 @@ impl Store {
     /// becomes canonical if `from` was. A pinned tag can't be merged away, but other tags can be
     /// merged into it.
     pub fn merge_tags(&mut self, from: &str, into: &str) -> Result<Retagged> {
-        let (from, into) = (tag_name(from)?, tag_name(into)?);
+        let (from, into) = (self.lookup(from)?, self.lookup(into)?);
         if self.pinned.as_ref().is_some_and(|p| p.is_tag(&from)) {
             return Err(pinned(format!("cannot merge away pinned tag {from}")));
         }
@@ -660,7 +660,7 @@ impl Store {
     /// Makes `alias` resolve to the live tag `tag`. Returns false if it already did. Fails if
     /// `alias` is a live tag or already an alias of another tag.
     pub fn add_alias(&mut self, alias: &str, tag: &str) -> Result<bool> {
-        let (alias, tag) = (tag_name(alias)?, tag_name(tag)?);
+        let (alias, tag) = (self.alias_name(alias)?, self.lookup(tag)?);
         let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let tag_id = require_tag(&tx, &tag)?;
@@ -673,7 +673,7 @@ impl Store {
     /// Removes an alias. Returns the name of the tag it pointed at, or `None` if there was no
     /// such alias.
     pub fn remove_alias(&mut self, alias: &str) -> Result<Option<String>> {
-        let alias = tag_name(alias)?;
+        let alias = self.lookup(alias)?;
         if let Some(tag) = self.pinned.as_ref().and_then(|p| p.alias_of(&alias)) {
             return Err(pinned(format!(
                 "cannot remove alias {alias} of pinned tag {tag}"
@@ -693,12 +693,13 @@ impl Store {
 
     /// Marks tags canonical, creating them if needed. Returns how many changed.
     pub fn add_canonical(&mut self, tags: &[String]) -> Result<usize> {
+        let tags = self.tag_names(tags)?;
         let now = now_ms();
         let forget = self.pinned.is_none();
         let tx = self.conn.transaction()?;
         let mut changed = 0;
-        for t in tags {
-            changed += usize::from(mark_canonical(&tx, &tag_name(t)?, now)?);
+        for t in &tags {
+            changed += usize::from(mark_canonical(&tx, t, now)?);
         }
         forget_declared(&tx, forget)?;
         tx.commit()?;
@@ -708,10 +709,7 @@ impl Store {
     /// Unmarks canonical tags; the tags and their bookmarks stay. Returns how many changed.
     /// Pinned tags can't be unmarked.
     pub fn remove_canonical(&mut self, tags: &[String]) -> Result<usize> {
-        let tags = tags
-            .iter()
-            .map(|t| tag_name(t))
-            .collect::<Result<Vec<_>>>()?;
+        let tags = self.lookup_names(tags)?;
         if let Some(t) = tags
             .iter()
             .find(|t| self.pinned.as_ref().is_some_and(|p| p.is_tag(t)))
@@ -738,7 +736,7 @@ impl Store {
     /// name and whether anything changed. A description declared for a pinned tag can't be
     /// changed; a pinned tag declared without one can be described here.
     pub fn describe_tag(&mut self, tag: &str, text: &str) -> Result<(String, bool)> {
-        let name = tag_name(tag)?;
+        let name = self.lookup(tag)?;
         let text = check_description(text).map_err(anyhow::Error::msg)?;
         self.check_pinned_description(&name, text.as_deref())?;
         let tx = self.conn.transaction()?;
@@ -753,6 +751,23 @@ impl Store {
     /// description keeps the tag's current one. All or nothing: on an error (such as an alias that
     /// is a live tag, or a description that differs from a pinned one) nothing changes.
     pub fn import_canonical(&mut self, entries: &[CanonicalEntry]) -> Result<ImportStats> {
+        // Names are styled first: new tags must follow the style, and existing ones keep their
+        // names.
+        let styled = entries
+            .iter()
+            .map(|e| {
+                let at = || format!("line {}", e.line);
+                Ok(CanonicalEntry {
+                    tag: self.styled(&e.tag).with_context(at)?,
+                    aliases: (e.aliases.iter())
+                        .map(|a| self.alias_name(a))
+                        .collect::<Result<_>>()
+                        .with_context(at)?,
+                    ..e.clone()
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let entries = &styled;
         for e in entries {
             if let Some(d) = &e.description {
                 let d = check_description(d).map_err(anyhow::Error::msg);
@@ -945,15 +960,6 @@ pub(crate) fn forget_declared(tx: &Transaction, forget: bool) -> Result<()> {
         meta_delete(tx, DECLARED_HASH)?;
     }
     Ok(())
-}
-
-/// Normalizes a single tag name, rejecting empty ones.
-pub(crate) fn tag_name(name: &str) -> Result<String> {
-    let n = normalize_tag(name);
-    if n.is_empty() {
-        bail!("empty tag name");
-    }
-    Ok(n)
 }
 
 /// A live tag's id by exact name; aliases aren't followed.

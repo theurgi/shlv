@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 #[cfg(not(feature = "ai"))]
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "ai")]
 use toml::Spanned;
 
+use crate::style::StyleConfig;
 use crate::suggest::{DomainRules, SuggestMode};
 use crate::tag::DeclaredTags;
 
@@ -119,11 +119,142 @@ pub struct Tags {
     /// Domain rules, `host = [tags]`; a host also matches its subdomains.
     #[serde(default, skip_serializing_if = "DomainRules::is_empty")]
     pub rules: DomainRules,
+    /// How tags are written: rules applied wherever a tag enters, and guidelines for the AI.
+    #[serde(default, skip_serializing_if = "StyleConfig::is_empty")]
+    pub style: StyleConfig,
 }
 
 impl Tags {
     fn is_empty(&self) -> bool {
-        self.canonical.is_none() && self.suggestions.is_default() && self.rules.is_empty()
+        self.canonical.is_none()
+            && self.suggestions.is_default()
+            && self.rules.is_empty()
+            && self.style.is_empty()
+    }
+
+    /// A declared tag, alias, or rule tag that breaks `[tags.style]`: where, and the message.
+    /// Config is a source of truth, so its names must already be in style, as they must already
+    /// be normalized.
+    fn bad_style(&self) -> Option<(StyleSite, String)> {
+        let style = self.style.tag_style();
+        if style.is_default() {
+            return None;
+        }
+        for (tag, aliases) in self.canonical.iter().flat_map(|d| d.iter()) {
+            if let Some(why) = style.violation(tag) {
+                return Some((
+                    StyleSite::Tag(tag.into()),
+                    format!("[tags.canonical]: {why}"),
+                ));
+            }
+            // Aliases are names to type, not tags, so only their separators matter.
+            for a in aliases {
+                let fixed = style.fix(a);
+                if &fixed != a {
+                    return Some((
+                        StyleSite::Alias(tag.into(), a.clone()),
+                        format!(
+                            "[tags.canonical] {tag}: alias {a:?} breaks [tags.style]; \
+                             write {fixed:?}"
+                        ),
+                    ));
+                }
+            }
+        }
+        for (host, tags) in self.rules.iter() {
+            for t in tags {
+                if let Some(why) = style.violation(t) {
+                    return Some((
+                        StyleSite::Rule(host.into(), t.clone()),
+                        format!("[tags.rules] {host:?}: {why}"),
+                    ));
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Where a style violation is in the config, to find its position.
+enum StyleSite {
+    Tag(String),
+    Alias(String, String),
+    Rule(String, String),
+}
+
+impl StyleSite {
+    /// The byte offset of the name in `text`. The config is parsed again for this, only on
+    /// error: the declared list and rules validate as they deserialize and keep no spans.
+    fn find(&self, text: &str) -> Option<usize> {
+        use std::collections::BTreeMap;
+        #[derive(Deserialize)]
+        struct Spans {
+            tags: Option<SpanTags>,
+        }
+        #[derive(Deserialize)]
+        struct SpanTags {
+            #[serde(default)]
+            canonical: BTreeMap<Spanned<String>, SpanEntry>,
+            #[serde(default)]
+            rules: BTreeMap<String, Vec<Spanned<String>>>,
+        }
+        /// A declared entry's aliases, from either form. Not an untagged enum: those buffer
+        /// their input and lose the spans.
+        struct SpanEntry(Vec<Spanned<String>>);
+        impl<'de> Deserialize<'de> for SpanEntry {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> serde::de::Visitor<'de> for V {
+                    type Value = SpanEntry;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("aliases")
+                    }
+                    fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                        self,
+                        mut seq: A,
+                    ) -> Result<SpanEntry, A::Error> {
+                        let mut v = Vec::new();
+                        while let Some(s) = seq.next_element()? {
+                            v.push(s);
+                        }
+                        Ok(SpanEntry(v))
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<SpanEntry, A::Error> {
+                        let mut v = Vec::new();
+                        while let Some(k) = map.next_key::<String>()? {
+                            if k == "aliases" {
+                                v = map.next_value()?;
+                            } else {
+                                map.next_value::<serde::de::IgnoredAny>()?;
+                            }
+                        }
+                        Ok(SpanEntry(v))
+                    }
+                }
+                d.deserialize_any(V)
+            }
+        }
+        let tags = toml::from_str::<Spans>(text).ok()?.tags?;
+        let in_list = |list: &[Spanned<String>], name: &str| {
+            list.iter()
+                .find(|s| s.get_ref() == name)
+                .map(|s| s.span().start)
+        };
+        match self {
+            StyleSite::Tag(tag) => tags
+                .canonical
+                .keys()
+                .find(|k| k.get_ref() == tag)
+                .map(|k| k.span().start),
+            StyleSite::Alias(tag, alias) => {
+                let (_, entry) = tags.canonical.iter().find(|(k, _)| k.get_ref() == tag)?;
+                in_list(&entry.0, alias)
+            }
+            StyleSite::Rule(host, tag) => in_list(tags.rules.get(host)?, tag),
+        }
     }
 }
 
@@ -157,6 +288,9 @@ impl Config {
             .map_err(|e| at(e.span().map(|s| s.start), e.message().trim_end()))?;
         if let Err(msg) = config.model.check() {
             return Err(at(None, &msg));
+        }
+        if let Some((site, msg)) = config.tags.bad_style() {
+            return Err(at(site.find(text), &msg));
         }
         #[cfg(feature = "ai")]
         if let Some((pos, msg)) = config.bad_ai() {
@@ -547,6 +681,86 @@ mod tests {
             e.contains("rule \"GitHub.com\": not a normalized host; write \"github.com\""),
             "{e}"
         );
+    }
+
+    #[test]
+    fn parses_style() {
+        use crate::{Separator, TagStyle};
+        let c = parse("").unwrap();
+        assert!(c.tags.style.is_empty());
+        assert!(c.tags.style.tag_style().is_default());
+
+        let text = "[tags.style]\nseparator = \"_\"\nmax_length = 24\n\
+                    guidelines = \"\"\"\nSingular nouns.\nNo format tags.\n\"\"\"\n";
+        let c = parse(text).unwrap();
+        assert_eq!(
+            c.tags.style.tag_style(),
+            TagStyle {
+                separator: Some(Separator::Underscore),
+                max_length: Some(24)
+            }
+        );
+        assert_eq!(
+            c.tags.style.guidelines(),
+            Some("Singular nouns.\nNo format tags.")
+        );
+        // `config show` prints the section, and it reads back.
+        let shown = c.to_toml();
+        assert!(
+            shown.contains("[tags.style]\nseparator = \"_\"\nmax_length = 24\nguidelines = "),
+            "{shown}"
+        );
+        assert_eq!(parse(&shown).unwrap().tags.style, c.tags.style);
+        let c = parse("[tags.style]\nseparator = \"\"\n").unwrap();
+        assert_eq!(c.tags.style.separator, Some(Separator::None));
+        assert!(c.to_toml().contains("separator = \"\"\n"));
+
+        let e = |t: &str| parse(t).unwrap_err().to_string();
+        let err = e("[tags.style]\nseparator = \".\"\n");
+        assert!(
+            err.starts_with("/c.toml:2:13: unknown variant `.`"),
+            "{err}"
+        );
+        let err = e("[tags.style]\nmax_length = 0\n");
+        assert!(err.starts_with("/c.toml:2:14: "), "{err}");
+        let err = e("[tags.style]\nmax = 3\n");
+        assert!(err.starts_with("/c.toml:2:1: unknown field `max`"), "{err}");
+    }
+
+    #[test]
+    fn declared_names_must_follow_the_style() {
+        let style = "[tags.style]\nseparator = \"_\"\nmax_length = 8\n";
+        let e = |t: &str| parse(&format!("{style}{t}")).unwrap_err().to_string();
+        let err = e("[tags.canonical]\nrust = []\nhome-lab = []\n");
+        assert_eq!(
+            err,
+            "/c.toml:6:1: [tags.canonical]: \"home-lab\" breaks [tags.style]; write \"home_lab\""
+        );
+        let err = e("[tags.canonical]\nnetworking = []\n");
+        assert_eq!(
+            err,
+            "/c.toml:5:1: [tags.canonical]: \"networking\" is longer than [tags.style] \
+             max_length = 8"
+        );
+        let err = e("[tags.canonical]\nweb = { aliases = [\"www\", \"web-dev\"] }\n");
+        assert_eq!(
+            err,
+            "/c.toml:5:27: [tags.canonical] web: alias \"web-dev\" breaks [tags.style]; \
+             write \"web_dev\""
+        );
+        // Aliases have no length limit.
+        parse(&format!(
+            "{style}[tags.canonical]\nweb = [\"world_wide_web\"]\n"
+        ))
+        .unwrap();
+        let err = e("[tags.rules]\n\"github.com\" = [\"code\", \"open-source\"]\n");
+        assert_eq!(
+            err,
+            "/c.toml:5:25: [tags.rules] \"github.com\": \"open-source\" breaks [tags.style]; \
+             write \"open_source\""
+        );
+        // Without a style, as before.
+        parse("[tags.canonical]\nhome-lab = []\nself-hosting-infrastructure = []\n").unwrap();
     }
 
     #[test]

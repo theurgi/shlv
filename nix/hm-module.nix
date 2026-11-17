@@ -62,6 +62,10 @@ in
           into tag suggestions. With `strict_tags`, rule tags must be canonical.
         - `tags.suggestions`: `"confirm"` (the default) keeps suggestions for review with
           `shlv suggest ls|accept|reject`; `"auto"` applies them at once.
+        - `tags.style`: how tags are written. `separator` (`"-"`, `"_"`, or `""`) is what spaces
+          and the other separators in new tag names become; `max_length` refuses longer new
+          names. Declared names and rule tags must already follow them. `guidelines` is plain
+          text sent to the AI with every tagging request.
         - `ai` and `provider` (builds with the `ai` feature, such as `shlv-full`): `ai.summarize`
           and `ai.tag` name a `provider.<name>` with `kind` (`"openai-compatible"` or
           `"anthropic"`), `model`, `base_url`, `api_key_env` or `api_key_file`, `timeout`, and for

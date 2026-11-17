@@ -394,6 +394,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     store.set_strict_tags(config.strict_tags);
     store.set_suggest_mode(config.tags.suggestions);
     store.set_rules(config.tags.rules.clone());
+    store.set_style(config.tags.style.tag_style());
     // The store keeps the declared list; nothing else reads it from `config`.
     if let Some(tags) = config.tags.canonical.take() {
         let stats = store.pin(tags).with_context(|| {
@@ -608,6 +609,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             if !s.dropped_tags.is_empty() {
                 eprintln!("shlv: dropped tags: {}", s.dropped_tags.join(" "));
+            }
+            for why in &s.refused_tags {
+                eprintln!("shlv: dropped tag: {why}");
             }
             if !s.proposed.is_empty() {
                 eprintln!(

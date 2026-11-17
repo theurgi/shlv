@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use toml::Spanned;
 
 use crate::choose::{Canonical, Choice, ChooseTags, Item, NewTag, TagOption};
+use crate::style::{StyleConfig, TagStyle};
 
 /// Longest summary accepted, in characters.
 pub const MAX_SUMMARY: usize = 1000;
@@ -245,6 +246,7 @@ pub struct Provider {
     name: String,
     llm: Box<dyn Llm>,
     proposing: Proposing,
+    style: StyleConfig,
 }
 
 impl Provider {
@@ -272,6 +274,7 @@ impl Provider {
             name: name.to_string(),
             llm,
             proposing: Proposing::default(),
+            style: StyleConfig::default(),
         }
     }
 
@@ -282,6 +285,13 @@ impl Provider {
     /// Asks for new tag names in tag requests from now on; see [`Proposing`].
     pub fn set_proposing(&mut self, p: Proposing) {
         self.proposing = p;
+    }
+
+    /// The tag style (`[tags.style]`) for tag requests from now on: its rules and guidelines go
+    /// in the prompt, and new names in replies are fixed by it, or dropped if it refuses them
+    /// ([`Answer::refused`]).
+    pub fn set_style(&mut self, style: StyleConfig) {
+        self.style = style;
     }
 
     /// Whether tag requests ask for new names.
@@ -336,10 +346,10 @@ impl Provider {
                 self.name
             );
         }
-        let mut req = job.request(item, list, &self.proposing);
+        let mut req = job.request(item, list, &self.proposing, &self.style);
         for attempt in 0..2 {
             let reply = self.llm.complete(&req).with_context(at)?;
-            match job.check(&reply, list, self.proposing.max) {
+            match job.check(&reply, list, self.proposing.max, self.style.tag_style()) {
                 Ok(a) => return Ok(a),
                 Err(why) if attempt == 1 => {
                     return Err(anyhow!("invalid reply twice: {why}")).with_context(at);
@@ -373,7 +383,7 @@ impl Provider {
             .map(|(id, job, item)| {
                 (
                     id.clone(),
-                    b.body(&job.request(item, list, &self.proposing)),
+                    b.body(&job.request(item, list, &self.proposing, &self.style)),
                 )
             })
             .collect();
@@ -403,7 +413,9 @@ impl Provider {
             .into_iter()
             .map(|(id, r)| {
                 let a = match (r, job_of(&id)) {
-                    (Ok(text), Some(job)) => job.check(&text, list, self.proposing.max),
+                    (Ok(text), Some(job)) => {
+                        job.check(&text, list, self.proposing.max, self.style.tag_style())
+                    }
                     (Ok(_), None) => Err(format!("unknown custom_id {id:?}")),
                     (Err(e), _) => Err(e),
                 };
@@ -429,6 +441,8 @@ pub struct Answer {
     /// New names for the list, when proposing: normalized, none of them on the list (a list
     /// name or alias given as new is moved to `tags`), at most [`Proposing::max`].
     pub proposed: Vec<NewTag>,
+    /// New names the tag style refused, with the reason.
+    pub refused: Vec<String>,
 }
 
 impl Job {
@@ -441,7 +455,13 @@ impl Job {
 
     /// The structured-output request for this job. With an empty `list`, a tag job asks only
     /// for new names (when `proposing`).
-    pub fn request(self, item: &Item, list: &[TagOption], proposing: &Proposing) -> Request {
+    pub fn request(
+        self,
+        item: &Item,
+        list: &[TagOption],
+        proposing: &Proposing,
+        style: &StyleConfig,
+    ) -> Request {
         let mut props = serde_json::Map::new();
         let mut system = Vec::new();
         if self != Job::Tags {
@@ -449,7 +469,7 @@ impl Job {
             props.insert("summary".into(), json!({ "type": "string" }));
         }
         if self != Job::Summary {
-            system.push(tag_prompt(list, proposing));
+            system.push(tag_prompt(list, proposing, style));
             if !list.is_empty() {
                 props.insert("tags".into(), tags_schema(list));
             }
@@ -478,16 +498,17 @@ impl Job {
     }
 
     /// Checks a reply: valid JSON with the job's fields; tags resolved against `list`; with
-    /// `proposals` above 0, up to that many new names.
+    /// `proposals` above 0, up to that many new names, fixed by `style` (or refused).
     pub fn check(
         self,
         reply: &str,
         list: &[TagOption],
         proposals: usize,
+        style: TagStyle,
     ) -> Result<Answer, String> {
         let v: Value =
             serde_json::from_str(strip_fences(reply)).map_err(|e| format!("not JSON ({e})"))?;
-        let canonical = Canonical::new(list);
+        let canonical = Canonical::new(list).styled(style);
         let mut a = Answer::default();
         if self != Job::Tags {
             a.summary = Some(summary_of(&v)?);
@@ -501,7 +522,7 @@ impl Job {
             }
             if proposals > 0 {
                 let new = new_tags_of(&v)?;
-                let raw = new_tags_into(new, &canonical, proposals, &mut a.proposed);
+                let raw = new_tags_into(new, &canonical, proposals, style, &mut a);
                 let mut tags = std::mem::take(&mut a.tags);
                 tags.extend(raw);
                 a.tags = canonical.filter(tags).0;
@@ -512,16 +533,19 @@ impl Job {
 }
 
 /// Splits checked new names: those on the list (or aliases of list tags) become choices, which
-/// are returned; the rest go into `out`, deduplicated, at most `max`.
+/// are returned; the rest go into `a.proposed`, fixed by `style`, deduplicated, at most `max`.
+/// Names the style refuses go into `a.refused`.
 fn new_tags_into(
     new: Vec<NewTag>,
     canonical: &Canonical,
     max: usize,
-    out: &mut Vec<NewTag>,
+    style: TagStyle,
+    a: &mut Answer,
 ) -> Vec<Choice> {
     let mut listed = Vec::new();
+    let out = &mut a.proposed;
     for t in new {
-        let name = crate::store::normalize_tag(&t.name);
+        let name = style.fix(&t.name);
         if name.is_empty() {
             continue;
         }
@@ -530,6 +554,8 @@ fn new_tags_into(
                 tag: name,
                 confidence: None,
             });
+        } else if let Err(why) = style.check(&name) {
+            a.refused.push(why);
         } else if out.len() < max && !out.iter().any(|o| o.name == name) {
             let description = t.description.and_then(|d| {
                 crate::tag::check_description(&crate::html::collapse_ws(&d))
@@ -575,15 +601,30 @@ const TAG_PROMPT: &str = "You tag bookmarked web pages with tags from a fixed li
     tags that clearly fit the page: usually one to three, and none if nothing fits well. Use only \
     names from the list below, exactly as written. Reply with JSON only: {\"tags\": [...]}.";
 
-/// What a proposed name should look like.
-const NEW_TAG_STYLE: &str = "A new tag is a short, general topic name in lowercase, words joined \
-    by hyphens, like GitHub topics (rust, wifi, security, home-lab): one concept each (pages get \
-    several tags rather than one compound tag), the common name, a singular noun, never a synonym \
-    of a listed tag, and never about format or quality (article, tutorial, useful).";
+/// What a proposed name should look like, in the configured style (hyphens by default).
+fn new_tag_style(style: &TagStyle) -> String {
+    use crate::style::Separator;
+    let (joined, example) = match style.separator {
+        None | Some(Separator::Hyphen) => ("words joined by hyphens", "home-lab"),
+        Some(Separator::Underscore) => ("words joined by underscores", "home_lab"),
+        Some(Separator::None) => ("words run together", "homelab"),
+    };
+    let length = style
+        .max_length
+        .map_or(String::new(), |n| format!(", at most {n} characters"));
+    format!(
+        "A new tag is a short, general topic name in lowercase, {joined}{length}, like GitHub \
+         topics (rust, wifi, security, {example}): one concept each (pages get several tags \
+         rather than one compound tag), the common name, a singular noun, never a synonym of a \
+         listed tag, and never about format or quality (article, tutorial, useful)."
+    )
+}
 
-/// The tagging instructions, the list (if any), and with proposing, the names already proposed.
-fn tag_prompt(list: &[TagOption], p: &Proposing) -> String {
+/// The tagging instructions, the user's guidelines (`[tags.style] guidelines`), the list (if
+/// any), and with proposing, the names already proposed.
+fn tag_prompt(list: &[TagOption], p: &Proposing, style: &StyleConfig) -> String {
     let n = p.max;
+    let new_tag_style = new_tag_style(&style.tag_style());
     let new_format = "\"new_tags\": [{\"name\": \"...\", \"description\": \"...\"}]";
     let mut s = if n == 0 {
         TAG_PROMPT.to_string()
@@ -591,7 +632,7 @@ fn tag_prompt(list: &[TagOption], p: &Proposing) -> String {
         format!(
             "You tag bookmarked web pages. There is no tag list yet: propose up to {n} tags that \
              fit the page in \"new_tags\", usually one to three, each with a one-line description \
-             of what belongs under it. {NEW_TAG_STYLE} Reply with JSON only: {{{new_format}}}."
+             of what belongs under it. {new_tag_style} Reply with JSON only: {{{new_format}}}."
         )
     } else {
         format!(
@@ -600,10 +641,14 @@ fn tag_prompt(list: &[TagOption], p: &Proposing) -> String {
              names from the list below, exactly as written, in \"tags\". If a main topic of the \
              page has no tag on the list, propose up to {n} new tags for the list in \
              \"new_tags\", each with a one-line description of what belongs under it; otherwise \
-             leave \"new_tags\" empty. {NEW_TAG_STYLE} Reply with JSON only: \
+             leave \"new_tags\" empty. {new_tag_style} Reply with JSON only: \
              {{\"tags\": [...], {new_format}}}."
         )
     };
+    if let Some(g) = style.guidelines() {
+        s.push_str("\n\nThe user's guidelines for tags (they apply to choosing and proposing):\n");
+        s.push_str(g);
+    }
     if !list.is_empty() {
         s.push_str("\n\n");
         s.push_str(&tag_list(list));

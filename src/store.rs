@@ -3,11 +3,12 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
 
 use crate::proposal::{self, Diverted, ProposalSource, StrictTags};
+use crate::style::TagStyle;
 use crate::suggest::{self, DomainRules, SuggestMode};
 use crate::tag::NonCanonicalTags;
 use crate::{db, search, url};
@@ -132,6 +133,7 @@ pub struct Store {
     pub(crate) pinned: Option<crate::tag::DeclaredTags>,
     pub(crate) rules: DomainRules,
     pub(crate) suggest_mode: SuggestMode,
+    pub(crate) style: TagStyle,
 }
 
 impl Store {
@@ -156,6 +158,7 @@ impl Store {
             pinned: None,
             rules: DomainRules::default(),
             suggest_mode: SuggestMode::default(),
+            style: TagStyle::default(),
         }
     }
 
@@ -174,6 +177,71 @@ impl Store {
     /// The strict mode; see [`Store::set_strict_tags`].
     pub fn strict_mode(&self) -> StrictTags {
         self.strict_tags
+    }
+
+    /// Sets the tag style (`[tags.style]`) that names entering from now on must follow; see
+    /// [`crate::style`]. None by default.
+    pub fn set_style(&mut self, style: TagStyle) {
+        self.style = style;
+    }
+
+    pub fn style(&self) -> TagStyle {
+        self.style
+    }
+
+    /// Typed or given tag names as they will be stored: see [`styled_name`]. Fails on the first
+    /// empty name or one the style refuses, before anything is written.
+    pub(crate) fn tag_names(&self, tags: &[String]) -> Result<Vec<String>> {
+        tags.iter()
+            .map(|t| styled_name(&self.conn, &self.style, t))
+            .collect()
+    }
+
+    /// One name entering as a tag; see [`styled_name`].
+    pub fn styled(&self, tag: &str) -> Result<String> {
+        styled_name(&self.conn, &self.style, tag)
+    }
+
+    /// A tag's new name (`tag rename`, the way to fix an old name): always fixed by the style and
+    /// checked, even if it names an existing tag as typed.
+    pub(crate) fn new_name(&self, tag: &str) -> Result<String> {
+        let fixed = self.style.fix(tag);
+        if fixed.is_empty() {
+            bail!("empty tag name");
+        }
+        self.style.check(&fixed).map_err(|why| anyhow!(why))?;
+        Ok(fixed)
+    }
+
+    /// A new alias: like [`Store::styled`], but only separators are fixed. An alias is a name to
+    /// type, not a tag, so it has no length limit.
+    pub(crate) fn alias_name(&self, alias: &str) -> Result<String> {
+        let base = normalize_tag(alias);
+        if base.is_empty() {
+            bail!("empty tag name");
+        }
+        if self.style.is_default() || resolve_tag(&self.conn, &base)?.is_some() {
+            return Ok(base);
+        }
+        let fixed = self.style.fix(&base);
+        if fixed.is_empty() {
+            bail!("{alias:?} is not a valid tag name");
+        }
+        Ok(fixed)
+    }
+
+    /// The name of an existing tag or alias; see [`lookup_name`]. Fails on an empty name.
+    pub(crate) fn lookup(&self, tag: &str) -> Result<String> {
+        let n = lookup_name(&self.conn, &self.style, tag)?;
+        if n.is_empty() {
+            bail!("empty tag name");
+        }
+        Ok(n)
+    }
+
+    /// Names of existing tags or aliases to look up; see [`lookup_name`].
+    pub(crate) fn lookup_names(&self, tags: &[String]) -> Result<Vec<String>> {
+        tags.iter().map(|t| self.lookup(t)).collect()
     }
 
     /// Splits typed tags (normalized) into those a bookmark gets and those that become
@@ -229,7 +297,7 @@ impl Store {
     /// bookmark ([`Added::diverted`]).
     pub fn add(&mut self, new: &NewBookmark) -> Result<Added> {
         let (full, norm) = check_url(&new.url)?;
-        let (tags, divert) = self.split_strict(normalize_tags(&new.tags)?)?;
+        let (tags, divert) = self.split_strict(self.tag_names(&new.tags)?)?;
         self.check_rules()?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
@@ -290,8 +358,8 @@ impl Store {
     /// Like [`Store::edit`], but says which added tags became proposals (with
     /// `strict_tags = "propose"`). Returns `None` if there's no live bookmark with that id.
     pub fn edit_diverting(&mut self, id: i64, edit: &Edit) -> Result<Option<Diverted>> {
-        let (add, divert) = self.split_strict(normalize_tags(&edit.add_tags)?)?;
-        let remove = normalize_tags(&edit.remove_tags)?;
+        let (add, divert) = self.split_strict(self.tag_names(&edit.add_tags)?)?;
+        let remove = self.lookup_names(&edit.remove_tags)?;
         let now = now_ms();
         let tx = self.conn.transaction()?;
         let n = tx.execute(
@@ -505,7 +573,9 @@ impl Store {
     /// nothing can match.
     fn tag_filter(&self, tags: &[String], sql: &mut String, args: &mut Vec<Value>) -> Result<bool> {
         for tag in tags {
-            let Some(tag_id) = resolve_tag(&self.conn, &normalize_tag(tag))? else {
+            let Some(tag_id) =
+                resolve_tag(&self.conn, &lookup_name(&self.conn, &self.style, tag)?)?
+            else {
                 return Ok(false);
             };
             sql.push_str(
@@ -611,16 +681,41 @@ fn uid_taken(tx: &Transaction, uid: &str) -> Result<bool> {
         .query_row([uid], |r| r.get(0))?)
 }
 
-pub(crate) fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
-    tags.iter()
-        .map(|t| {
-            let n = normalize_tag(t);
-            if n.is_empty() {
-                bail!("empty tag name");
-            }
-            Ok(n)
-        })
-        .collect()
+/// The name a tag entering from outside (typed, imported, proposed) stands for: a name that
+/// already resolves to a tag or alias as is, else normalized and fixed by `style` and checked
+/// against it. Fails for an empty name and one the style refuses.
+pub(crate) fn styled_name(conn: &Connection, style: &TagStyle, raw: &str) -> Result<String> {
+    let base = normalize_tag(raw);
+    if base.is_empty() {
+        bail!("empty tag name");
+    }
+    if style.is_default() || resolve_tag(conn, &base)?.is_some() {
+        return Ok(base);
+    }
+    let fixed = style.fix(&base);
+    if fixed.is_empty() {
+        bail!("{raw:?} is not a valid tag name");
+    }
+    if fixed != base && resolve_tag(conn, &fixed)?.is_some() {
+        return Ok(fixed);
+    }
+    style.check(&fixed).map_err(|why| anyhow!(why))?;
+    Ok(fixed)
+}
+
+/// The name to look up for `raw`, which names an existing tag or alias: normalized, or if that
+/// resolves to nothing, fixed by `style` (so `Home Lab` finds `home_lab`). Never fails; a name
+/// that resolves to nothing either way comes back normalized.
+pub(crate) fn lookup_name(conn: &Connection, style: &TagStyle, raw: &str) -> Result<String> {
+    let base = normalize_tag(raw);
+    if style.is_default() || resolve_tag(conn, &base)?.is_some() {
+        return Ok(base);
+    }
+    let fixed = style.fix(&base);
+    if !fixed.is_empty() && resolve_tag(conn, &fixed)?.is_some() {
+        return Ok(fixed);
+    }
+    Ok(base)
 }
 
 /// Finds a live tag by alias or name.

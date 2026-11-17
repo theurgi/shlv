@@ -22,6 +22,15 @@ infra = { aliases = ["ops"], description = "servers, deployment, Nix, CI" }
 [tags.rules]
 "developer.mozilla.org" = ["javascript"]
 "docs.rs" = ["rust"]
+
+# How tags are written; see "Tag style" below.
+[tags.style]
+separator = "-" # what spaces and the other separators become: "-", "_", or ""
+max_length = 24
+guidelines = """
+Singular nouns: plugin, not plugins.
+One concept per tag; combine tags rather than compounding them: rust + wifi, not rust-wifi.
+"""
 ```
 
 The canonical list lives in the database, so `tag canonical add|rm|import`, `tag alias`,
@@ -39,7 +48,8 @@ is a pinned base on top:
   removing a declared alias, and changing a declared description are refused with a pointer to the
   config file. A pinned tag declared without a description can be described in shlv.
 
-Declared names must already be normalized (`web-dev`, not `Web Dev`).
+Declared names must already be normalized (`web-dev`, not `Web Dev`) and follow the
+[tag style](#tag-style).
 
 `tag describe TAG TEXT` sets a description (`""` clears it). `tag ls` shows descriptions after `#`,
 and `tag canonical export` writes them the same way (`infra ops # servers, deployment, Nix, CI`), so
@@ -87,3 +97,23 @@ per line, with the bookmark ids. Each decision is one command:
   `tag proposals ls --rejected` lists them; accepting a rejected name undoes the rejection.
 
 Removing a proposed name from a bookmark with `edit -t -NAME` withdraws it for that bookmark.
+
+## Tag style
+
+Without `[tags.style]`, tag names are only normalized: lowercase, a leading `#` dropped, spaces
+turned into `-`. Its settings add rules, checked wherever a new name enters: `add` and `edit`,
+`import`, `tag canonical add|import`, `tag rename`, `tag alias`, proposals, and AI replies.
+
+- `separator` (`"-"`, `"_"`, or `""`): what spaces, `-`, and `_` between words become. With `"_"`,
+  `Home Lab` and `home-lab` become `home_lab`; with `""`, `homelab`.
+- `max_length`: the most characters in a tag name. A longer name can't be fixed, so it is refused
+  with the reason: `add` and `edit` fail, `import` drops the tag and says so, and an AI proposal is
+  dropped with a note.
+- `guidelines`: plain-language rules that code can't check (singular nouns, one concept per tag),
+  sent to the AI with every tagging request; see [AI providers](ai.md#proposals).
+
+Names that already resolve to a tag or an alias are left alone: after you set `separator = "_"`,
+typing `web-dev` still finds an existing `web-dev`, and nothing is rewritten. `tag rename` applies
+the style to the new name, so `tag rename web-dev web-dev` gives `web_dev`. Names in the config
+(declared tags and aliases, rule tags) must already follow the style; the error gives the position
+and the fixed name. Aliases are names to type, not tags, so `max_length` doesn't apply to them.

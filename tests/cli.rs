@@ -1446,3 +1446,67 @@ fn strict_propose_and_tag_proposals() {
         (&serde_json::json!("css"), &serde_json::json!("rejected"))
     );
 }
+
+#[test]
+fn tag_style() {
+    let db = Db::new();
+    db.ok(&[
+        "add",
+        "a.com",
+        "-t",
+        "web-dev",
+        "-t",
+        "self-hosting-infrastructure",
+    ]);
+    std::fs::write(
+        db.config(),
+        "[tags.style]\nseparator = \"_\"\nmax_length = 12\nguidelines = \"Singular nouns.\"\n",
+    )
+    .unwrap();
+    let shown = db.ok(&["config", "show"]);
+    assert!(
+        shown.contains(
+            "[tags.style]\nseparator = \"_\"\nmax_length = 12\nguidelines = \"Singular nouns.\"\n"
+        ),
+        "{shown}"
+    );
+    // New names are fixed or refused; existing ones are left alone.
+    db.ok(&["add", "b.com", "-t", "Home Lab", "-t", "web-dev"]);
+    let tags = db.ok(&["tag", "ls"]);
+    for t in ["home_lab", "web-dev", "self-hosting-infrastructure"] {
+        assert!(tags.contains(t), "{tags}");
+    }
+    let err = db.fail(&["add", "c.com", "-t", "self hosting stack"]);
+    assert!(
+        err.contains("\"self_hosting_stack\" is longer than [tags.style] max_length = 12"),
+        "{err}"
+    );
+    let (ok, out, err) = db.run_stdin(
+        &["import", "-"],
+        "{\"url\": \"d.com\", \"tags\": [\"sci fi\", \"science-fiction\"]}\n",
+    );
+    assert!(ok, "{err}");
+    assert!(out.contains("1 added"), "{out}");
+    assert!(
+        err.contains(
+            "dropped tag: \"science_fiction\" is longer than [tags.style] max_length = 12"
+        ),
+        "{err}"
+    );
+    assert!(db.ok(&["tag", "ls"]).contains("sci_fi"));
+
+    // Config names must follow the style, with a position.
+    std::fs::write(
+        db.config(),
+        "[tags.style]\nseparator = \"_\"\n[tags.canonical]\nweb-dev = []\n",
+    )
+    .unwrap();
+    let path = db.config().display().to_string();
+    let err = db.fail(&["ls"]);
+    assert!(
+        err.contains(&format!(
+            "{path}:4:1: [tags.canonical]: \"web-dev\" breaks [tags.style]; write \"web_dev\""
+        )),
+        "{err}"
+    );
+}

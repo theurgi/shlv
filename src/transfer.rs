@@ -1,12 +1,14 @@
 //! Import and export: JSON lines (the shape of `ls --json`), Netscape bookmark HTML (see
 //! [`crate::netscape`]), and, for import only, plain lists of URLs.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 
 use crate::proposal::{Diverted, ProposalSource, StrictTags, divert};
-use crate::store::{Put, check_url, non_empty, normalize_tag, now_ms, put, reindex_many};
+use crate::store::{
+    Put, check_url, non_empty, normalize_tag, now_ms, put, reindex_many, styled_name,
+};
 use crate::suggest::{RuleStats, offer_rules_many};
 use crate::tag::NonCanonicalTags;
 use crate::{Store, netscape};
@@ -166,6 +168,8 @@ pub struct ImportSummary {
     pub dropped_tags: Vec<String>,
     /// Tags kept as proposals ([`ImportOptions::propose_unknown`]), in first-seen order.
     pub proposed: Vec<String>,
+    /// Tags the tag style refused (and dropped), each with the reason, in first-seen order.
+    pub refused_tags: Vec<String>,
     /// What the domain rules did; `checked` counts distinct bookmarks.
     pub rules: RuleStats,
 }
@@ -244,6 +248,9 @@ impl Store {
             }
         }
 
+        if !self.style.is_default() {
+            self.style_import(&mut ready, &mut summary)?;
+        }
         let mut seen = HashSet::new();
         let all: Vec<String> = ready
             .iter()
@@ -283,6 +290,37 @@ impl Store {
         // bulk cache (and 4.7 s with 128 MiB).
         self.with_bulk_cache(|s| s.write_import(&ready, rules, &mut summary))?;
         Ok(summary)
+    }
+
+    /// Applies the tag style to the items' (normalized) tags: fixed where they can be, dropped
+    /// and reported where they can't. Names of existing tags and aliases are kept as they are.
+    fn style_import(&self, ready: &mut [Ready], summary: &mut ImportSummary) -> Result<()> {
+        let mut styled: HashMap<String, Option<String>> = HashMap::new();
+        for r in ready.iter_mut() {
+            let mut tags = Vec::with_capacity(r.tags.len());
+            for t in std::mem::take(&mut r.tags) {
+                if !styled.contains_key(&t) {
+                    let s = match styled_name(&self.conn, &self.style, &t) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            let why = e.to_string();
+                            if !summary.refused_tags.contains(&why) {
+                                summary.refused_tags.push(why);
+                            }
+                            None
+                        }
+                    };
+                    styled.insert(t.clone(), s);
+                }
+                if let Some(s) = &styled[&t]
+                    && !tags.contains(s)
+                {
+                    tags.push(s.clone());
+                }
+            }
+            r.tags = tags;
+        }
+        Ok(())
     }
 
     fn write_import(

@@ -18,6 +18,7 @@ pub mod netscape;
 pub mod proposal;
 pub mod search;
 pub mod store;
+pub mod style;
 pub mod suggest;
 pub mod tag;
 pub mod transfer;
@@ -28,6 +29,7 @@ pub use proposal::{
     Decided, Diverted, Proposal, ProposalSource, ProposalState, ProposeStats, StrictTags,
 };
 pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
+pub use style::{Separator, StyleConfig, TagStyle};
 pub use suggest::{
     DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source, SuggestMode, Suggestion,
 };

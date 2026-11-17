@@ -669,7 +669,7 @@ impl Store {
         }
         let mut picked: Vec<(i64, String)> = Vec::new();
         for t in tags {
-            let name = normalize_tag(t);
+            let name = self.lookup(t)?;
             let found = resolve_tag(&self.conn, &name)?
                 .and_then(|id| pending.iter().find(|(p, _)| *p == id));
             match found {

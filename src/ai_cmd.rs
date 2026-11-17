@@ -19,7 +19,7 @@ pub const CONFIRM_ABOVE: usize = 20;
 
 /// The provider for `task`, or an error saying how to configure one.
 pub fn provider(config: &Config, task: Task) -> Result<Provider> {
-    ai::for_task(config.ai.as_ref(), &config.provider, task)?.ok_or_else(|| {
+    for_task(config, task)?.ok_or_else(|| {
         anyhow!(
             "no provider for {}: set [ai] {} in {} (see `shlv config show`)",
             task.as_str(),
@@ -29,6 +29,15 @@ pub fn provider(config: &Config, task: Task) -> Result<Provider> {
                 .unwrap_or_else(|_| "the config file".into())
         )
     })
+}
+
+/// The provider configured for `task`, with the tag style (`[tags.style]`) set.
+fn for_task(config: &Config, task: Task) -> Result<Option<Provider>> {
+    let p = ai::for_task(config.ai.as_ref(), &config.provider, task)?;
+    Ok(p.map(|mut p| {
+        p.set_style(config.tags.style.clone());
+        p
+    }))
 }
 
 /// One line saying where requests go, for the notice before a run.
@@ -261,7 +270,7 @@ pub struct LlmArgs {
 /// The `[ai] tag` provider, if one is configured, set to propose new names as `[ai] proposals`
 /// says (see [`proposing`]).
 pub fn tag_provider(config: &Config, store: &Store) -> Result<Option<Provider>> {
-    let Some(mut p) = ai::for_task(config.ai.as_ref(), &config.provider, Task::Tag)? else {
+    let Some(mut p) = for_task(config, Task::Tag)? else {
         return Ok(None);
     };
     p.set_proposing(proposing(config, store)?);
@@ -309,6 +318,9 @@ fn record(
 ) -> Result<(shlv::OfferStats, Vec<String>)> {
     let mut st = store.offer_choices(bookmark, shlv::Source::Llm, &a.tags)?;
     let p = store.propose_tags(bookmark, ProposalSource::Llm, &a.proposed)?;
+    for why in a.refused.iter().chain(&p.refused) {
+        eprintln!("shlv: {bookmark}: dropped proposed tag: {why}");
+    }
     st.pending += p.suggested.pending;
     st.applied += p.suggested.applied;
     Ok((st, p.proposed))
@@ -640,6 +652,7 @@ pub fn run_batch(
             continue;
         };
         let mut provider = Provider::new(&pb.provider, pc.get_ref())?;
+        provider.set_style(config.tags.style.clone());
         // New names in the results are kept up to the current `[ai] proposals`.
         provider.set_proposing(ai::Proposing {
             known: Vec::new(),

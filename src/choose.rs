@@ -75,6 +75,7 @@ pub trait ChooseTags {
 /// Name and alias lookup over a canonical list.
 pub struct Canonical<'a> {
     names: HashMap<&'a str, &'a str>,
+    style: crate::style::TagStyle,
 }
 
 impl<'a> Canonical<'a> {
@@ -86,13 +87,27 @@ impl<'a> Canonical<'a> {
                 names.insert(a.as_str(), t.name.as_str());
             }
         }
-        Canonical { names }
+        Canonical {
+            names,
+            style: Default::default(),
+        }
     }
 
-    /// The canonical name for `name` (normalized first), if it or an alias is in the list.
+    /// Also resolves names once fixed by `style`: with `separator = "_"`, `home-lab` finds
+    /// `home_lab`.
+    pub fn styled(mut self, style: crate::style::TagStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// The canonical name for `name` (normalized first, then fixed by the style), if it or an
+    /// alias is in the list.
     pub fn resolve(&self, name: &str) -> Option<&'a str> {
         let n = crate::store::normalize_tag(name);
-        self.names.get(n.as_str()).copied()
+        self.names.get(n.as_str()).copied().or_else(|| {
+            let fixed = self.style.fix(&n);
+            self.names.get(fixed.as_str()).copied()
+        })
     }
 
     /// Resolves raw choices: unknown names are dropped (returned second), aliases become their

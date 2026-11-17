@@ -6,10 +6,11 @@ already saved the way `add` does: it updates the bookmark and merges tags. It ke
 titles, tags, and notes, and skips `javascript:` and `place:` URLs. Browser folders become tags only
 with `--folders-as-tags`. With `strict_tags`, an import with non-canonical tags writes nothing
 unless you pass `--drop-unknown-tags`, or `--propose-unknown-tags` to keep them as
-[proposals](config.md#proposals) for the list (always the case with `strict_tags = "propose"`).
-`export` then `import` (JSON) reproduces a database, uids included. Domain rules run on imported
-bookmarks as they do on `add`; `--no-rules` skips them. A title that is only the bookmark's URL is
-dropped, so `shlv fetch --all` can find a real one.
+[proposals](config.md#proposals) for the list (always the case with `strict_tags = "propose"`). Tags
+are fixed to the [tag style](config.md#tag-style); tags it refuses (too long) are dropped and
+reported. `export` then `import` (JSON) reproduces a database, uids included. Domain rules run on
+imported bookmarks as they do on `add`; `--no-rules` skips them. A title that is only the bookmark's
+URL is dropped, so `shlv fetch --all` can find a real one.
 
 A URL list has one URL per line, in any form `add` takes (`lwn.net` works). Blank lines and lines
 starting with `#` are skipped. A line with spaces in it stops the import with its line number, and

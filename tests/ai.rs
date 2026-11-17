@@ -468,3 +468,71 @@ fn proposes_new_names_alongside_list_tags() {
     p.set_proposing(Proposing::default());
     assert!(p.tag(&item(), &[]).is_err());
 }
+
+#[test]
+fn style_goes_in_every_tag_prompt_and_fixes_new_names() {
+    use shlv::ai::Proposing;
+    use shlv::{Separator, StyleConfig};
+    let s = scripted(vec![
+        chat(
+            r#"{"tags": ["rust"], "new_tags": [
+                {"name": "Async Runtime", "description": "a"},
+                {"name": "tokio-runtime-internals", "description": "too long"},
+                {"name": "web-dev", "description": "b"}]}"#,
+        ),
+        chat(r#"{"tags": ["async"]}"#),
+        chat(r#"{"summary": "Tokio.", "tags": ["rust"]}"#),
+    ]);
+    let mut p = provider(&s);
+    p.set_style(StyleConfig {
+        separator: Some(Separator::Underscore),
+        max_length: std::num::NonZeroUsize::new(16),
+        guidelines: Some("\nSingular nouns: plugin, not plugins.\n".into()),
+    });
+    p.set_proposing(Proposing {
+        max: 3,
+        known: Vec::new(),
+    });
+    let a = p.tag(&item(), &list()).unwrap();
+    let new: Vec<&str> = a.proposed.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(new, ["async_runtime", "web_dev"]);
+    assert_eq!(
+        a.refused,
+        ["\"tokio_runtime_internals\" is longer than [tags.style] max_length = 16"]
+    );
+    let system = |i: usize| {
+        messages(&s.requests()[i])[0]["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let sys = system(0);
+    assert!(
+        sys.contains(
+            "words joined by underscores, at most 16 characters, like GitHub topics \
+                      (rust, wifi, security, home_lab)"
+        ),
+        "{sys}"
+    );
+    let guide = "The user's guidelines for tags (they apply to choosing and proposing):\n\
+                 Singular nouns: plugin, not plugins.\n\nTags:";
+    assert!(sys.contains(guide), "{sys}");
+
+    // Choosing only, and summarizing with tags: the guidelines go too.
+    p.set_proposing(Proposing::default());
+    p.tag(&item(), &list()).unwrap();
+    assert!(system(1).contains(guide), "{}", system(1));
+    assert!(!system(1).contains("underscores"));
+    let a = p.summarize_and_tag(&item(), &list()).unwrap();
+    assert_eq!(a.summary.as_deref(), Some("Tokio."));
+    assert!(system(2).contains(guide), "{}", system(2));
+
+    // Without a style, the prompt is as before.
+    let s = scripted(vec![chat(r#"{"tags": ["rust"]}"#)]);
+    provider(&s).tag(&item(), &list()).unwrap();
+    let sys = messages(&s.requests()[0])[0]["content"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(!sys.contains("guidelines"), "{sys}");
+}

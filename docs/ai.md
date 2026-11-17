@@ -73,8 +73,11 @@ proposals = 3 # new names per bookmark; 0 turns proposals off
 The prompt asks for short, general, one-concept names and lists the names already proposed (up to
 100, most proposed first), so the model reuses them rather than inventing synonyms. Replies are
 normalized: a name on the list (or an alias of one) becomes a suggestion of that tag, a rejected
-name is dropped, and names past the cap are ignored. `suggest` prints the proposals for the
-bookmarks it was given; `suggest --all` marks them with `+` on each bookmark's line.
+name is dropped, and names past the cap are ignored. With a [tag style](config.md#tag-style), the
+prompt asks for names in it, new names are fixed to it, and those it refuses are dropped with a
+note; `[tags.style] guidelines` go in every tagging prompt, for choosing as well as proposing.
+`suggest` prints the proposals for the bookmarks it was given; `suggest --all` marks them with `+`
+on each bookmark's line.
 
 With an empty list, the provider only proposes, so `suggest` works from the first bookmark: let
 proposals pile up, then accept the most proposed names to start the list. With `proposals = 0` and
