@@ -9,7 +9,7 @@ use shlv::health::{Health, HealthOptions, StyleKind};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, format_canonical_nix, format_canonical_toml, parse_canonical};
 use shlv::{
-    Bookmark, Diverted, Edit, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalRuleTags,
+    Bookmark, Diverted, Format, ImportOptions, ListQuery, NewBookmark, NonCanonicalRuleTags,
     NonCanonicalTags, Pinned, Proposal, ProposalState, RuleStats, Store, SuggestMode, Suggestion,
     TagInfo, TagSort,
 };
@@ -17,10 +17,10 @@ use shlv::{netscape, transfer};
 
 #[cfg(feature = "ai")]
 mod ai_cmd;
+mod edit_cmd;
 #[cfg(feature = "model")]
 mod model_cmd;
-// The interactive screen; only `tag seed` uses it so far (`review`, task 039, won't need `ai`).
-#[cfg(feature = "ai")]
+// The interactive screen: `edit --pick` and `tag seed` (later `tag draft` and `review`).
 mod screen;
 #[cfg(feature = "ai")]
 mod seed_cmd;
@@ -79,19 +79,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Change a bookmark's title, note, or tags
-    Edit {
-        id: i64,
-        /// New title ("" clears it)
-        #[arg(long)]
-        title: Option<String>,
-        /// New note ("" clears it)
-        #[arg(long)]
-        note: Option<String>,
-        /// +TAG adds, -TAG removes (repeatable); a bare TAG adds
-        #[arg(short, long = "tag", value_name = "±TAG", allow_hyphen_values = true)]
-        tags: Vec<String>,
-    },
+    /// Change bookmarks' tags, title, or note: by id, or ids from stdin (`search ... | shlv edit -`)
+    Edit(edit_cmd::EditArgs),
     /// Delete bookmarks by id or URL
     Rm {
         #[arg(required = true, value_name = "ID|URL")]
@@ -551,39 +540,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 print_full(&mut out, &b)?;
             }
         }
-        Cmd::Edit {
-            id,
-            title,
-            note,
-            tags,
-        } => {
-            let mut edit = Edit {
-                title,
-                note,
-                ..Default::default()
-            };
-            for t in tags {
-                if let Some(t) = t.strip_prefix('-') {
-                    edit.remove_tags.push(t.to_string());
-                } else {
-                    edit.add_tags
-                        .push(t.strip_prefix('+').unwrap_or(&t).to_string());
-                }
-            }
-            if edit.title.is_none()
-                && edit.note.is_none()
-                && edit.add_tags.is_empty()
-                && edit.remove_tags.is_empty()
-            {
-                bail!("nothing to change; pass --title, --note, or -t");
-            }
-            let Some(diverted) = store.edit_diverting(id, &edit)? else {
-                bail!("no bookmark with id {id}");
-            };
-            let b = get(&store, id)?;
-            write!(out, "updated ")?;
-            print_line(&mut out, &b, 0, &style)?;
-            print_diverted(&mut out, &diverted, &style)?;
+        Cmd::Edit(args) => {
+            let code = edit_cmd::run_edit(&mut store, args, &mut out, &style)?;
+            out.flush()?;
+            return Ok(code);
         }
         Cmd::Rm { targets } => {
             let mut failed = false;
@@ -966,7 +926,7 @@ fn run_fetch(
             progress.clear();
             match r {
                 Ok(Some(title)) => {
-                    let edit = Edit {
+                    let edit = shlv::Edit {
                         title: Some(title),
                         ..Default::default()
                     };

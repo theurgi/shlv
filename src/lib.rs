@@ -31,7 +31,7 @@ pub use proposal::{
     Decided, Diverted, Proposal, ProposalSource, ProposalState, ProposeStats, StrictTags,
 };
 pub use seed::{Candidate, Decision, Interest, SeedName, Seeded};
-pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
+pub use store::{Added, Bookmark, Edit, Edited, ListQuery, MissingBookmarks, NewBookmark, Store};
 pub use style::{Separator, StyleConfig, TagStyle};
 pub use suggest::{
     DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source, SuggestMode, Suggestion,

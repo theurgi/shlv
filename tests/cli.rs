@@ -192,6 +192,97 @@ fn edit_tags() {
 }
 
 #[test]
+fn edit_many_and_from_stdin() {
+    let db = Db::new();
+    db.ok(&[
+        "add",
+        "https://a.com/wifi",
+        "--title",
+        "Wifi A",
+        "-t",
+        "old",
+    ]);
+    db.ok(&["add", "https://b.com/wifi", "--title", "Wifi B"]);
+    db.ok(&["add", "https://c.com", "--title", "Other", "-t", "old"]);
+
+    let out = db.ok(&["edit", "1", "2", "1", "-t", "net", "-t", "-old"]);
+    assert_eq!(out, "updated 2 bookmarks  +#net 2  -#old 1\n");
+    let out = db.ok(&["edit", "1", "2", "-t", "net"]);
+    assert_eq!(out, "updated 0 bookmarks  +#net 0  (2 already so)\n");
+
+    // Plain search output, --json, and bare ids all work on stdin.
+    let found = db.ok(&["search", "wifi"]);
+    let (ok, out, err) = db.run_stdin(&["edit", "-", "-t", "wifi"], &found);
+    assert!(ok, "{err}");
+    assert_eq!(out, "updated 2 bookmarks  +#wifi 2\n");
+    let json = db.ok(&["ls", "--json", "-t", "wifi"]);
+    let (ok, out, _) = db.run_stdin(&["edit", "-", "3", "-t", "x"], &json);
+    assert!(ok);
+    assert_eq!(out, "updated 3 bookmarks  +#x 3\n");
+    let (ok, out, _) = db.run_stdin(&["edit", "-", "-t", "-x"], "3\n\n1\n");
+    assert!(ok);
+    assert_eq!(out, "updated 2 bookmarks  -#x 2\n");
+    let (ok, _, err) = db.run_stdin(&["edit", "-", "-t", "y"], "");
+    assert!(ok);
+    assert!(err.contains("no bookmark ids on stdin"), "{err}");
+
+    // A stray line or a missing id fails, and nothing changes.
+    let (ok, _, err) = db.run_stdin(&["edit", "-", "-t", "y"], "1\nhttps://c.com\n");
+    assert!(!ok);
+    assert!(err.contains("stdin line 2"), "{err}");
+    let err = db.fail(&["edit", "1", "9", "8", "-t", "y"]);
+    assert!(err.contains("no bookmark with ids 9 8"), "{err}");
+    assert!(!db.ok(&["tag", "ls"]).contains("y\n"));
+    assert!(
+        db.fail(&["edit", "1", "2", "--title", "T"])
+            .contains("one title")
+    );
+    assert!(
+        db.fail(&["edit", "x", "-t", "y"])
+            .contains("isn't a bookmark id")
+    );
+
+    // Strict mode refuses the whole edit; propose mode proposes once for all of them.
+    std::fs::write(db.config(), "strict_tags = true\n").unwrap();
+    db.ok(&["tag", "canonical", "add", "net", "wifi"]);
+    let err = db.fail(&["edit", "1", "2", "-t", "new"]);
+    assert!(err.contains("not canonical"), "{err}");
+    std::fs::write(db.config(), "strict_tags = \"propose\"\n").unwrap();
+    let out = db.ok(&["edit", "1", "2", "-t", "new"]);
+    assert!(
+        out.starts_with("updated 0 bookmarks  (2 already so)\nproposed  #new  "),
+        "{out}"
+    );
+    assert!(db.ok(&["tag", "proposals"]).contains("new"));
+}
+
+#[test]
+fn edit_pick() {
+    let db = Db::new();
+    for u in ["a.com", "b.com", "c.com", "d.com"] {
+        db.ok(&["add", u]);
+    }
+    // Without a terminal, answers are lines: y, n, b(ack), n, then a(ll the rest).
+    let (ok, out, err) = db.run_stdin(
+        &["edit", "1", "2", "3", "4", "--pick", "-t", "p"],
+        "y\nn\nb\nn\na\n",
+    );
+    assert!(ok, "{err}");
+    assert!(err.contains("+#p on which of 4 bookmarks?"), "{err}");
+    assert_eq!(out, "updated 3 bookmarks  +#p 3\n");
+    assert_eq!(db.ok(&["ls", "-t", "p"]).lines().count(), 3);
+    assert!(!db.ok(&["show", "2"]).contains("tags"));
+
+    // q stops with what was picked so far (here nothing); the end of input works like q.
+    let (ok, out, _) = db.run_stdin(&["edit", "1", "2", "3", "--pick", "-t", "-p"], "n\nq\n");
+    assert!(ok);
+    assert_eq!(out, "");
+    let (ok, out, _) = db.run_stdin(&["edit", "1", "2", "--pick", "-t", "-p"], "y\n");
+    assert!(ok);
+    assert_eq!(out, "updated 1  https://a.com\n");
+}
+
+#[test]
 fn rm_by_id_and_url() {
     let db = Db::new();
     db.ok(&["add", "https://a.com"]);

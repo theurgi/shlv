@@ -34,7 +34,7 @@ $ shlv search fts5
 | `ls [-t TAG]... [-n N]`        | List bookmarks, newest first                                         |
 | `search QUERY...`              | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`       |
 | `show ID`                      | Show one bookmark in full                                            |
-| `edit ID [-t +TAG/-TAG]...`    | Change a bookmark's title, note, or tags                             |
+| `edit ID...\|- [-t ±TAG]...`   | Change tags (or title, note) of bookmarks; `-` reads ids from stdin  |
 | `rm ID\|URL...`                | Delete bookmarks                                                     |
 | `open ID`                      | Open a bookmark with `$BROWSER` or the system opener                 |
 | `tag ls [--sort count]`        | Tags with bookmark counts; `*` marks canonical, `=` lists aliases    |
@@ -63,6 +63,16 @@ $ shlv search fts5
 
 `ls`, `search`, `tag ls`, `tag proposals ls`, and `suggest ls` take `--json` for one JSON object per
 line. `-n 0` shows every result.
+
+To tag many bookmarks at once, pipe a search into `edit`, which reads ids from the start of each
+line (or `--json`); `--pick` goes through them one key each to choose some:
+
+```console
+$ shlv search wifi -n 0 | shlv edit - -t networking --pick
+```
+
+The change is one transaction: every id must exist, and with `strict_tags` every added tag must be
+canonical, or nothing changes.
 
 The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 `~/.local/share/shlv/shlv.db`.

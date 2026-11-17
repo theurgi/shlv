@@ -1,15 +1,17 @@
-//! The interactive screen (task 034, reused by `tag draft` and `review`): a plain terminal
-//! prompt loop, no TUI library.
+//! The interactive screen (task 034, reused by `edit --pick`, `tag draft`, and `review`): a
+//! plain terminal prompt loop, no TUI library.
 //!
 //! On a terminal, answers are single keypresses: the terminal is put in non-canonical mode with
 //! `stty` (`-icanon -echo -isig`, so Ctrl-C arrives as a key rather than a signal and the
 //! terminal is always restored), and back in its saved mode for text input and on drop. When
 //! stdin isn't a terminal (or `stty` fails), each answer is a line and its first character is the
-//! key: scripts and tests drive the screen that way.
+//! key: scripts and tests drive the screen that way. A command whose stdin carries data reads
+//! keys from `/dev/tty` instead ([`Screen::open_tty`]).
 //!
 //! The screen draws on stderr, so stdout keeps only the command's result.
 
-use std::io::{self, BufRead, IsTerminal, Read, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 
 use crate::Style;
@@ -27,7 +29,7 @@ pub enum Key {
 
 pub struct Screen {
     raw: Option<Raw>,
-    input: io::StdinLock<'static>,
+    input: Box<dyn BufRead>,
     out: io::Stderr,
     pub style: Style,
 }
@@ -37,11 +39,24 @@ impl Screen {
     pub fn open() -> Screen {
         let tty = io::stdin().is_terminal() && io::stderr().is_terminal();
         Screen {
-            raw: if tty { Raw::enter() } else { None },
-            input: io::stdin().lock(),
+            raw: if tty { Raw::enter(None) } else { None },
+            input: Box::new(io::stdin().lock()),
             out: io::stderr(),
             style: Style::detect(io::stderr().is_terminal()),
         }
+    }
+
+    /// Opens the screen on the controlling terminal (`/dev/tty`) and stderr, for commands whose
+    /// stdin carries data. Fails without a terminal.
+    pub fn open_tty() -> io::Result<Screen> {
+        let tty = File::open("/dev/tty")?;
+        let raw = Raw::enter(Some(tty.try_clone()?));
+        Ok(Screen {
+            raw,
+            input: Box::new(BufReader::new(tty)),
+            out: io::stderr(),
+            style: Style::detect(io::stderr().is_terminal()),
+        })
     }
 
     /// `text` dimmed, when colors are on.
@@ -97,6 +112,8 @@ impl Screen {
         })
     }
 
+    // Only `tag seed` asks for text so far.
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     /// Reads a line of text after `prompt`, with the terminal in its usual mode (echo, line
     /// editing, Ctrl-C). `None` at the end of input; the text is trimmed.
     pub fn line(&mut self, prompt: &str) -> io::Result<Option<String>> {
@@ -139,27 +156,31 @@ struct Raw {
     /// `stty -g` before.
     saved: String,
     cols: usize,
+    /// The terminal, when it isn't stdin.
+    tty: Option<File>,
 }
 
 const RAW: &[&str] = &["-icanon", "-echo", "-isig", "min", "1", "time", "0"];
 
 impl Raw {
-    fn enter() -> Option<Raw> {
-        let saved = stty(&["-g"])?;
-        let cols = stty(&["size"])
+    /// Puts the terminal (`tty`, else stdin) in non-canonical mode.
+    fn enter(tty: Option<File>) -> Option<Raw> {
+        let saved = stty(tty.as_ref(), &["-g"])?;
+        let cols = stty(tty.as_ref(), &["size"])
             .and_then(|s| s.split_whitespace().nth(1)?.parse().ok())
             .filter(|&c| c > 0)
             .unwrap_or(80);
-        stty(RAW)?;
-        Some(Raw { saved, cols })
+        stty(tty.as_ref(), RAW)?;
+        Some(Raw { saved, cols, tty })
     }
 
     fn cooked(&self) {
-        stty(&[&self.saved]);
+        stty(self.tty.as_ref(), &[&self.saved]);
     }
 
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     fn raw(&self) {
-        stty(RAW);
+        stty(self.tty.as_ref(), RAW);
     }
 }
 
@@ -169,11 +190,15 @@ impl Drop for Raw {
     }
 }
 
-/// Runs `stty` on the terminal (its stdin is ours); its output, if it succeeded.
-fn stty(args: &[&str]) -> Option<String> {
+/// Runs `stty` on the terminal (`tty`, else our stdin); its output, if it succeeded.
+fn stty(tty: Option<&File>, args: &[&str]) -> Option<String> {
+    let stdin = match tty {
+        Some(f) => Stdio::from(f.try_clone().ok()?),
+        None => Stdio::inherit(),
+    };
     let o = Command::new("stty")
         .args(args)
-        .stdin(Stdio::inherit())
+        .stdin(stdin)
         .stderr(Stdio::null())
         .output()
         .ok()?;

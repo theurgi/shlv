@@ -85,6 +85,38 @@ pub struct Added {
     pub diverted: Diverted,
 }
 
+/// What [`Store::edit_many`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Edited {
+    /// Bookmarks that changed: a field set, or a tag added or removed.
+    pub changed: usize,
+    /// Bookmarks that already were as asked.
+    pub unchanged: usize,
+    /// Each added tag (its canonical name) and how many bookmarks newly got it.
+    pub added: Vec<(String, usize)>,
+    /// Each removed tag and how many bookmarks lost it.
+    pub removed: Vec<(String, usize)>,
+    /// Added tags that became proposals, or were dropped as rejected names.
+    pub diverted: Diverted,
+}
+
+/// Ids given to [`Store::edit_many`] that aren't live bookmarks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingBookmarks(pub Vec<i64>);
+
+impl std::fmt::Display for MissingBookmarks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = if self.0.len() == 1 { "" } else { "s" };
+        write!(f, "no bookmark with id{s}")?;
+        for id in &self.0 {
+            write!(f, " {id}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MissingBookmarks {}
+
 #[derive(Debug, Clone)]
 pub struct ListQuery {
     /// Only bookmarks with all of these tags.
@@ -361,65 +393,131 @@ impl Store {
     /// Like [`Store::edit`], but says which added tags became proposals (with
     /// `strict_tags = "propose"`). Returns `None` if there's no live bookmark with that id.
     pub fn edit_diverting(&mut self, id: i64, edit: &Edit) -> Result<Option<Diverted>> {
+        match self.edit_many(&[id], edit) {
+            Ok(e) => Ok(Some(e.diverted)),
+            Err(e) if e.is::<MissingBookmarks>() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Applies `edit` to every bookmark in `ids` (a repeated id counts once), in one
+    /// transaction. Strict mode and proposals apply as in [`Store::edit`]. Fails with
+    /// [`MissingBookmarks`], changing nothing, if an id isn't a live bookmark. Only bookmarks
+    /// that changed get a new `updated_at`.
+    pub fn edit_many(&mut self, ids: &[i64], edit: &Edit) -> Result<Edited> {
         let (add, divert) = self.split_strict(self.tag_names(&edit.add_tags)?)?;
         let remove = self.lookup_names(&edit.remove_tags)?;
-        let now = now_ms();
-        let tx = self.conn.transaction()?;
-        let n = tx.execute(
-            "UPDATE bookmark SET updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
-            params![id, now],
-        )?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let mut diverted = Diverted::default();
-        proposal::divert(&tx, &divert, ProposalSource::User, id, now, &mut diverted)?;
-        if let Some(title) = &edit.title {
-            tx.execute(
-                "UPDATE bookmark SET title = ?2 WHERE id = ?1",
-                params![id, non_empty(&Some(title.clone()))],
-            )?;
-        }
-        if let Some(note) = &edit.note {
-            tx.execute(
-                "UPDATE bookmark SET note = ?2 WHERE id = ?1",
-                params![id, non_empty(&Some(note.clone()))],
-            )?;
-        }
-        for tag in &remove {
-            if let Some(tag_id) = resolve_tag(&tx, tag)? {
-                suggest::reject_applied(&tx, id, tag_id, now)?;
-                tx.execute(
-                    "DELETE FROM bookmark_tag WHERE bookmark_id = ?1 AND tag_id = ?2",
-                    params![id, tag_id],
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<i64> = ids.iter().copied().filter(|&id| seen.insert(id)).collect();
+        let run = |s: &mut Self| -> Result<Edited> {
+            let now = now_ms();
+            let tx = s.conn.transaction()?;
+            let missing = {
+                let mut live = tx.prepare_cached(
+                    "SELECT 1 FROM bookmark WHERE id = ?1 AND deleted_at IS NULL",
                 )?;
+                let mut missing = Vec::new();
+                for &id in &ids {
+                    if !live.exists([id])? {
+                        missing.push(id);
+                    }
+                }
+                missing
+            };
+            if !missing.is_empty() {
+                return Err(MissingBookmarks(missing).into());
             }
-            // Removing a name proposed for the bookmark withdraws it there, and the proposal
-            // with it if that was its last bookmark.
-            let withdrawn = tx
-                .prepare_cached(
-                    "DELETE FROM tag_proposal_bookmark WHERE bookmark_id = ?1 \
-                     AND proposal_id = (SELECT id FROM tag_proposal WHERE name = ?2)",
-                )?
-                .execute(params![id, tag])?;
-            if withdrawn > 0 {
-                tx.prepare_cached(
-                    "DELETE FROM tag_proposal WHERE name = ?1 AND state = 'pending' AND NOT \
-                     EXISTS (SELECT 1 FROM tag_proposal_bookmark WHERE proposal_id = id)",
-                )?
-                .execute([tag])?;
+            let mut out = Edited {
+                added: add.iter().map(|t| (t.clone(), 0)).collect(),
+                removed: remove.iter().map(|t| (t.clone(), 0)).collect(),
+                ..Default::default()
+            };
+            let remove_ids = remove
+                .iter()
+                .map(|t| resolve_tag(&tx, t))
+                .collect::<Result<Vec<_>>>()?;
+            let add_ids = add
+                .iter()
+                .map(|t| ensure_tag(&tx, t, now))
+                .collect::<Result<Vec<_>>>()?;
+            let fields = edit.title.is_some() || edit.note.is_some();
+            let mut changed = Vec::new();
+            for &id in &ids {
+                proposal::divert(
+                    &tx,
+                    &divert,
+                    ProposalSource::User,
+                    id,
+                    now,
+                    &mut out.diverted,
+                )?;
+                if let Some(title) = &edit.title {
+                    tx.prepare_cached("UPDATE bookmark SET title = ?2 WHERE id = ?1")?
+                        .execute(params![id, non_empty(&Some(title.clone()))])?;
+                }
+                if let Some(note) = &edit.note {
+                    tx.prepare_cached("UPDATE bookmark SET note = ?2 WHERE id = ?1")?
+                        .execute(params![id, non_empty(&Some(note.clone()))])?;
+                }
+                let mut n = 0;
+                for (i, tag) in remove.iter().enumerate() {
+                    if let Some(tag_id) = remove_ids[i] {
+                        suggest::reject_applied(&tx, id, tag_id, now)?;
+                        let k = tx
+                            .prepare_cached(
+                                "DELETE FROM bookmark_tag WHERE bookmark_id = ?1 AND tag_id = ?2",
+                            )?
+                            .execute(params![id, tag_id])?;
+                        out.removed[i].1 += k;
+                        n += k;
+                    }
+                    // Removing a name proposed for the bookmark withdraws it there, and the
+                    // proposal with it if that was its last bookmark.
+                    let withdrawn = tx
+                        .prepare_cached(
+                            "DELETE FROM tag_proposal_bookmark WHERE bookmark_id = ?1 \
+                             AND proposal_id = (SELECT id FROM tag_proposal WHERE name = ?2)",
+                        )?
+                        .execute(params![id, tag])?;
+                    if withdrawn > 0 {
+                        tx.prepare_cached(
+                            "DELETE FROM tag_proposal WHERE name = ?1 AND state = 'pending' AND \
+                             NOT EXISTS (SELECT 1 FROM tag_proposal_bookmark WHERE proposal_id = id)",
+                        )?
+                        .execute([tag])?;
+                    }
+                }
+                for (i, &tag_id) in add_ids.iter().enumerate() {
+                    let k = tx
+                        .prepare_cached(
+                            "INSERT OR IGNORE INTO bookmark_tag (bookmark_id, tag_id) \
+                             VALUES (?1, ?2)",
+                        )?
+                        .execute(params![id, tag_id])?;
+                    out.added[i].1 += k;
+                    n += k;
+                }
+                if fields || n > 0 {
+                    changed.push(id);
+                }
             }
+            out.changed = changed.len();
+            out.unchanged = ids.len() - changed.len();
+            if let [id] = changed[..] {
+                tx.prepare_cached("UPDATE bookmark SET updated_at = ?2 WHERE id = ?1")?
+                    .execute(params![id, now])?;
+                reindex(&tx, id)?;
+            } else {
+                touch_many(&tx, &changed, now)?;
+            }
+            tx.commit()?;
+            Ok(out)
+        };
+        if ids.len() > 1 {
+            self.with_bulk_cache(run)
+        } else {
+            run(self)
         }
-        for tag in &add {
-            let tag_id = ensure_tag(&tx, tag, now)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO bookmark_tag (bookmark_id, tag_id) VALUES (?1, ?2)",
-                params![id, tag_id],
-            )?;
-        }
-        reindex(&tx, id)?;
-        tx.commit()?;
-        Ok(Some(diverted))
     }
 
     /// Sets (or with `None`, clears) a bookmark's summary in its own short transaction: the
