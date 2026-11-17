@@ -8,7 +8,7 @@ use anyhow::Result;
 use shlv::ai::{Provider, Task};
 use shlv::config::Config;
 use shlv::seed::normalize_interest;
-use shlv::{Candidate, Decision, SeedName, Store};
+use shlv::{Candidate, Decision, SeedName, Seeded, Store};
 
 use crate::ai_cmd::{describe_provider, print_usage, provider};
 use crate::screen::{Key, Screen};
@@ -70,7 +70,10 @@ pub fn run_seed(
         to,
     };
     session.add(&mut screen, &mut cands, &interests, &expand)?;
-    let end = review(&mut screen, &mut cands, &mut session, &expand, |raw| {
+    let mut add = |screen: &mut Screen, cands: &mut Vec<Candidate>| {
+        add_interests(screen, cands, &mut session, &expand)
+    };
+    let end = review(&mut screen, &mut cands, Some(&mut add), |raw| {
         store_ref.seed_name(raw)
     })?;
     if end == End::Abort {
@@ -84,13 +87,31 @@ pub fn run_seed(
         Vec::new()
     };
     let s = store.apply_seed(&cands, &save)?;
+    report(out, "seeded", &s, args.save.then_some(s.saved), style)?;
+    print_usage(&provider);
+    Ok(if s.skipped.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
+/// What was written: skipped decisions on stderr, the rest as one line on `out`, starting with
+/// `verb`. `saved`: new interests stored, when asked to store them.
+pub(crate) fn report(
+    out: &mut impl Write,
+    verb: &str,
+    s: &Seeded,
+    saved: Option<usize>,
+    style: &Style,
+) -> io::Result<()> {
     for why in &s.skipped {
         eprintln!("shlv: {why}");
     }
     let t = |n: &str| format!("{}{n}{}", style.tag, style.reset);
     write!(
         out,
-        "seeded: {} on the list",
+        "{verb}: {} on the list",
         plural(s.kept.len(), "new tag")
     )?;
     if !s.kept.is_empty() {
@@ -113,16 +134,10 @@ pub fn run_seed(
     if s.described > 0 {
         write!(out, ", {}", plural(s.described, "description"))?;
     }
-    if args.save {
-        write!(out, ", {} saved", plural(s.saved, "new interest"))?;
+    if let Some(n) = saved {
+        write!(out, ", {} saved", plural(n, "new interest"))?;
     }
-    writeln!(out)?;
-    print_usage(&provider);
-    Ok(if s.skipped.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    writeln!(out)
 }
 
 /// Interests as typed: split on whitespace and commas, normalized, deduplicated in order.
@@ -187,6 +202,7 @@ fn expand(
                     name: n.name().to_string(),
                     description: t.description,
                     edited: false,
+                    hint: None,
                 }),
                 Err(e) => notes.push(format!("dropped {:?}: {e:#}", t.name)),
             }
@@ -196,7 +212,7 @@ fn expand(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum End {
+pub(crate) enum End {
     Save,
     Abort,
 }
@@ -250,31 +266,52 @@ const HELP: &str = "\
   m         merge into a tag or another candidate (it becomes an alias)
   d         drop
   e         edit the description
-  a         add interests and expand them
   b         back to the previous candidate
   q         finish: save what's decided so far
   Ctrl-C    quit without saving";
 
-/// Goes through the candidates one key each. Candidates already on the list are shown, not
-/// asked about.
-fn review(
+const HELP_ADD: &str = "  a         add interests and expand them";
+
+const HELP_HINT: &str = "\
+  For a listed tag that looks redundant: m merges it (Enter at the prompt takes the suggested
+  tag); k and d leave it as it is.";
+
+/// Adds candidates during the review (`tag seed`: expands more interests).
+pub(crate) type Add<'a> = dyn FnMut(&mut Screen, &mut Vec<Candidate>) -> Result<()> + 'a;
+
+/// The group a candidate is shown under: its interest, `redundant` for a listed tag that looks
+/// redundant, `other` for none.
+fn group(c: &Candidate) -> &str {
+    match (&c.hint, c.interest.as_str()) {
+        (Some(_), _) => "redundant",
+        (None, "") => "other",
+        (None, i) => i,
+    }
+}
+
+/// Goes through the candidates one key each (`tag seed`, `tag draft`). Candidates already on the
+/// list are shown, not asked about. With `add`, the `a` key adds more.
+pub(crate) fn review(
     screen: &mut Screen,
     cands: &mut Vec<Candidate>,
-    session: &mut Session,
-    expand: &Expand,
+    mut add: Option<&mut Add>,
     name_of: impl Fn(&str) -> Result<SeedName>,
 ) -> Result<End> {
-    let keys = screen.dim(
-        "k keep  r rename  m merge into  d drop  e edit description  a add interest  b back  \
-         q finish  ? help",
-    );
+    let a = if add.is_some() {
+        "a add interest  "
+    } else {
+        ""
+    };
+    let keys = screen.dim(&format!(
+        "k keep  r rename  m merge into  d drop  e edit description  {a}b back  q finish  ? help"
+    ));
     writeln!(screen, "\n{keys}")?;
     let mut i = 0;
-    // The interest whose name was last shown in the first column.
+    // The group whose name was last shown in the first column.
     let mut shown: Option<String> = None;
     loop {
         if i >= cands.len() {
-            match finish(screen, cands)? {
+            match finish(screen, cands, add.is_some())? {
                 Finish::Save => return Ok(End::Save),
                 Finish::Abort => return Ok(End::Abort),
                 Finish::Back => {
@@ -282,24 +319,26 @@ fn review(
                     shown = None;
                 }
                 Finish::Add => {
-                    if let Err(e) = add_interests(screen, cands, session, expand) {
+                    if let Some(add) = add.as_deref_mut()
+                        && let Err(e) = add(screen, cands)
+                    {
                         writeln!(screen, "shlv: {e:#}")?;
                     }
                 }
             }
             continue;
         }
-        let first = shown.as_deref() != Some(cands[i].interest.as_str());
-        shown = Some(cands[i].interest.clone());
+        let first = shown.as_deref() != Some(group(&cands[i]));
+        shown = Some(group(&cands[i]).to_string());
         let line = row(screen, cands, i, first);
         if cands[i].decision == Decision::Listed {
-            writeln!(screen, "{line}{}", mark(screen, &cands[i].decision))?;
+            writeln!(screen, "{line}{}", mark(screen, &cands[i]))?;
             i += 1;
             continue;
         }
         let now = match &cands[i].decision {
             Decision::Undecided => String::new(),
-            d => format!("{} ", screen.dim(&format!("[{}]", plain_mark(d)))),
+            _ => format!("{} ", screen.dim(&format!("[{}]", plain_mark(&cands[i])))),
         };
         let q = screen.dim("?");
         write!(screen, "{line}{now}{q} ")?;
@@ -307,6 +346,15 @@ fn review(
         let decided = match key {
             Key::Enter | Key::Char('k') => Some(Decision::Keep),
             Key::Char('d') => Some(Decision::Drop),
+            Key::Char('r') if cands[i].hint.is_some() => {
+                screen.redraw()?;
+                writeln!(
+                    screen,
+                    "{} is on the list: `shlv tag rename` renames it; m merges it",
+                    cands[i].name
+                )?;
+                None
+            }
             Key::Char('r') => {
                 screen.redraw()?;
                 rename(screen, cands, i, &name_of)?.map(|new| {
@@ -315,6 +363,11 @@ fn review(
                     for c in cands.iter_mut() {
                         if c.decision == Decision::Merge(old.clone()) {
                             c.decision = Decision::Merge(new.clone());
+                        }
+                        if let Some(h) = &mut c.hint
+                            && h.into == old
+                        {
+                            h.into.clone_from(&new);
                         }
                     }
                     Decision::Keep
@@ -339,9 +392,11 @@ fn review(
                 }
                 None
             }
-            Key::Char('a') => {
+            Key::Char('a') if add.is_some() => {
                 screen.redraw()?;
-                if let Err(e) = add_interests(screen, cands, session, expand) {
+                if let Some(add) = add.as_deref_mut()
+                    && let Err(e) = add(screen, cands)
+                {
                     writeln!(screen, "shlv: {e:#}")?;
                 }
                 None
@@ -366,6 +421,12 @@ fn review(
             Key::Char('?') => {
                 screen.redraw()?;
                 writeln!(screen, "{HELP}")?;
+                if add.is_some() {
+                    writeln!(screen, "{HELP_ADD}")?;
+                }
+                if cands.iter().any(|c| c.hint.is_some()) {
+                    writeln!(screen, "{HELP_HINT}")?;
+                }
                 None
             }
             Key::Char(c) => {
@@ -379,10 +440,10 @@ fn review(
                 cands[i].decision = d;
                 screen.redraw()?;
                 let line = row(screen, cands, i, first);
-                writeln!(screen, "{line}{}", mark(screen, &cands[i].decision))?;
+                writeln!(screen, "{line}{}", mark(screen, &cands[i]))?;
                 i += 1;
             }
-            // Asked again, under its interest.
+            // Asked again, under its group.
             None => shown = None,
         }
     }
@@ -395,13 +456,24 @@ fn prev_open(cands: &[Candidate], i: usize) -> Option<usize> {
         .find(|&j| cands[j].decision != Decision::Listed)
 }
 
-/// One candidate's line, up to its decision: the interest (on the first of its group), name, and
+/// What the description column shows: the description, or for a redundant tag, the suggestion.
+fn about(c: &Candidate) -> String {
+    match &c.hint {
+        Some(h) => match &h.reason {
+            Some(r) => format!("→ {}: {r}", h.into),
+            None => format!("→ {}", h.into),
+        },
+        None => c.description.clone().unwrap_or_default(),
+    }
+}
+
+/// One candidate's line, up to its decision: the group (on the first of it), name, and
 /// description, cut to the terminal's width.
 fn row(screen: &Screen, cands: &[Candidate], i: usize, first: bool) -> String {
     let s = &screen.style;
     let iw = cands
         .iter()
-        .map(|c| c.interest.chars().count())
+        .map(|c| group(c).chars().count())
         .max()
         .unwrap_or(0);
     let nw = cands
@@ -411,40 +483,41 @@ fn row(screen: &Screen, cands: &[Candidate], i: usize, first: bool) -> String {
         .unwrap_or(0)
         .min(24);
     let c = &cands[i];
-    let interest = if first { c.interest.as_str() } else { "" };
+    let g = if first { group(c) } else { "" };
     let room = screen.width().saturating_sub(iw + nw + 20).max(20);
-    let desc = c.description.as_deref().unwrap_or("");
+    let desc = about(c);
     let desc = match desc.char_indices().nth(room) {
         Some((at, _)) => format!("{}…", &desc[..at]),
-        None => desc.to_string(),
+        None => desc,
     };
     let pad = room.min(
         cands
             .iter()
-            .map(|c| c.description.as_deref().map_or(0, |d| d.chars().count()))
+            .map(|c| about(c).chars().count())
             .max()
             .unwrap_or(0),
     );
     format!(
-        "{interest:<iw$}  {}{:<nw$}{}  {}{desc:<pad$}{}  ",
+        "{g:<iw$}  {}{:<nw$}{}  {}{desc:<pad$}{}  ",
         s.tag, c.name, s.reset, s.dim, s.reset
     )
 }
 
-fn plain_mark(d: &Decision) -> String {
-    match d {
-        Decision::Undecided => String::new(),
-        Decision::Keep => "k".into(),
-        Decision::Drop => "d".into(),
-        Decision::Merge(into) => format!("m → {into}"),
-        Decision::Listed => "on the list".into(),
+fn plain_mark(c: &Candidate) -> String {
+    match (&c.decision, &c.hint) {
+        (Decision::Keep | Decision::Drop, Some(_)) => "left as is".into(),
+        (Decision::Undecided, _) => String::new(),
+        (Decision::Keep, None) => "k".into(),
+        (Decision::Drop, None) => "d".into(),
+        (Decision::Merge(into), _) => format!("m → {into}"),
+        (Decision::Listed, _) => "on the list".into(),
     }
 }
 
-fn mark(screen: &Screen, d: &Decision) -> String {
-    match d {
+fn mark(screen: &Screen, c: &Candidate) -> String {
+    match &c.decision {
         Decision::Listed => format!("{}on the list{}", screen.style.dim, screen.style.reset),
-        d => plain_mark(d),
+        _ => plain_mark(c),
     }
 }
 
@@ -491,18 +564,27 @@ fn rename(
     Ok(Some(n.name().to_string()))
 }
 
-/// Asks what to merge into: another candidate (not dropped) or an existing tag.
+/// Asks what to merge into: another candidate (not dropped) or an existing tag. For a redundant
+/// tag, an empty answer takes the suggested one.
 fn merge_target(
     screen: &mut Screen,
     cands: &[Candidate],
     i: usize,
     name_of: &impl Fn(&str) -> Result<SeedName>,
 ) -> Result<Option<Decision>> {
-    let Some(raw) = screen.line(&format!("merge {} into: ", cands[i].name))? else {
+    let hint = cands[i].hint.as_ref().map(|h| h.into.as_str());
+    let prompt = match hint {
+        Some(h) => format!("merge {} into [{h}]: ", cands[i].name),
+        None => format!("merge {} into: ", cands[i].name),
+    };
+    let Some(mut raw) = screen.line(&prompt)? else {
         return Ok(None);
     };
     if raw.is_empty() {
-        return Ok(None);
+        match hint {
+            Some(h) => raw = h.to_string(),
+            None => return Ok(None),
+        }
     }
     let target = match name_of(&raw) {
         Ok(n) => n,
@@ -516,7 +598,7 @@ fn merge_target(
         writeln!(screen, "can't merge {name} into itself")?;
         return Ok(None);
     }
-    let candidate = cands.iter().find(|c| c.name == name);
+    let candidate = cands.iter().find(|c| c.name == name && c.hint.is_none());
     match (candidate, &target) {
         (Some(c), _) if c.decision == Decision::Drop => {
             writeln!(screen, "{name} was dropped; keep it first (b goes back)")?;
@@ -556,20 +638,24 @@ enum Finish {
     Add,
 }
 
-/// The end of the list: counts, then save, discard, go back, or add interests.
-fn finish(screen: &mut Screen, cands: &[Candidate]) -> Result<Finish> {
-    let n = |f: fn(&Decision) -> bool| cands.iter().filter(|c| f(&c.decision)).count();
-    let keep = n(|d| *d == Decision::Keep);
-    let merge = n(|d| matches!(d, Decision::Merge(_)));
-    let drop = n(|d| *d == Decision::Drop);
-    let open = n(|d| *d == Decision::Undecided);
+/// The end of the list: counts, then save, discard, go back, or (with `add`) add interests.
+fn finish(screen: &mut Screen, cands: &[Candidate], add: bool) -> Result<Finish> {
+    let n = |f: &dyn Fn(&Candidate) -> bool| cands.iter().filter(|c| f(c)).count();
+    let keep = n(&|c| c.decision == Decision::Keep && c.hint.is_none());
+    let merge = n(&|c| matches!(c.decision, Decision::Merge(_)));
+    let drop = n(&|c| c.decision == Decision::Drop && c.hint.is_none());
+    let open = n(&|c| c.decision == Decision::Undecided);
     let mut what = format!("\n{keep} to keep, {merge} to merge, {drop} dropped");
     if open > 0 {
         what.push_str(&format!(", {open} undecided (left out)"));
     }
     writeln!(screen, "{what}")?;
     loop {
-        let more = screen.dim("b back  a add interests");
+        let more = screen.dim(if add {
+            "b back  a add interests"
+        } else {
+            "b back"
+        });
         write!(screen, "save? [Y/n]  {more} ")?;
         let k = screen.key()?;
         screen.redraw()?;
@@ -577,7 +663,7 @@ fn finish(screen: &mut Screen, cands: &[Candidate]) -> Result<Finish> {
             Key::Enter | Key::Char('y' | 'Y' | 'q') | Key::Eof => Finish::Save,
             Key::Char('n') | Key::Interrupt => Finish::Abort,
             Key::Char('b') => Finish::Back,
-            Key::Char('a') => Finish::Add,
+            Key::Char('a') if add => Finish::Add,
             _ => continue,
         });
     }

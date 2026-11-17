@@ -7,6 +7,7 @@ pub mod bulk;
 pub mod choose;
 pub mod config;
 pub mod db;
+pub mod draft;
 #[cfg(feature = "fetch")]
 pub mod extract;
 #[cfg(feature = "fetch")]
@@ -30,7 +31,7 @@ pub use config::Config;
 pub use proposal::{
     Decided, Diverted, Proposal, ProposalSource, ProposalState, ProposeStats, StrictTags,
 };
-pub use seed::{Candidate, Decision, Interest, SeedName, Seeded};
+pub use seed::{Candidate, Decision, Hint, Interest, SeedName, Seeded};
 pub use store::{Added, Bookmark, Edit, Edited, ListQuery, MissingBookmarks, NewBookmark, Store};
 pub use style::{Separator, StyleConfig, TagStyle};
 pub use suggest::{

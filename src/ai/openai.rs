@@ -64,12 +64,16 @@ impl OpenAi {
         } else {
             json!({"type": "json_object"})
         };
-        json!({
+        let mut body = json!({
             "model": self.model,
             "messages": messages,
             "temperature": 0,
             "response_format": format,
-        })
+        });
+        if let Some(n) = req.max_tokens {
+            body["max_tokens"] = json!(n);
+        }
+        body
     }
 
     /// POSTs `body`; returns the status and response body.

@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 use toml::Spanned;
 
 use crate::choose::{Canonical, Choice, ChooseTags, Item, NewTag, TagOption};
+use crate::draft::{DraftTag, Drafted, Redundant};
 use crate::style::{StyleConfig, TagStyle};
 
 /// Longest summary accepted, in characters.
@@ -190,6 +191,9 @@ pub struct Request {
     pub schema: Value,
     /// On a retry: the previous reply and what was wrong with it.
     pub retry: Option<(String, String)>,
+    /// Most output tokens, when the call needs a bound tighter than the transport's default (a
+    /// small model looping inside a JSON array otherwise runs until the server gives up).
+    pub max_tokens: Option<u32>,
 }
 
 /// Tokens used so far, as the API reports them.
@@ -380,6 +384,26 @@ impl Provider {
         unreachable!()
     }
 
+    /// A draft of the tag list from a sample of bookmarks (task 035): new tags for what recurs in
+    /// `items` and the list doesn't cover, and, with a list, listed tags that look redundant.
+    /// Sends the items (site, title, and a summary or the start of the page text), the list with
+    /// descriptions and aliases, the interests, the names drafted so far, and the tag style.
+    pub fn draft(&self, items: &[DraftItem], guide: &DraftGuide) -> Result<Drafted> {
+        let at = || format!("provider {} (draft)", self.name);
+        let mut req = draft_request(items, guide, &self.style);
+        for attempt in 0..2 {
+            let reply = self.llm.complete(&req).with_context(at)?;
+            match check_draft(&reply, guide, self.style.tag_style()) {
+                Ok(d) => return Ok(d),
+                Err(why) if attempt == 1 => {
+                    return Err(anyhow!("invalid reply twice: {why}")).with_context(at);
+                }
+                Err(why) => req.retry = Some((reply, why)),
+            }
+        }
+        unreachable!()
+    }
+
     /// Whether this provider can run jobs as a Message Batch (kind `anthropic`).
     pub fn supports_batches(&self) -> bool {
         self.llm.batches().is_some()
@@ -514,6 +538,7 @@ impl Job {
                 "additionalProperties": false,
             }),
             retry: None,
+            max_tokens: None,
         }
     }
 
@@ -738,6 +763,7 @@ pub fn seed_request(interests: &[String], per: usize, style: &StyleConfig) -> Re
             "additionalProperties": false,
         }),
         retry: None,
+        max_tokens: None,
     }
 }
 
@@ -800,6 +826,273 @@ pub fn check_seeds(
         ));
     }
     Ok(s)
+}
+
+/// Most characters of a summary or page text sent per bookmark in a draft.
+pub const DRAFT_TEXT: usize = 300;
+
+/// What a draft sends about one bookmark: no URL beyond the site, no note, no tags.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftItem {
+    pub site: String,
+    pub title: Option<String>,
+    /// The summary, or the start of the page text; cut to [`DRAFT_TEXT`] characters.
+    pub text: Option<String>,
+}
+
+/// What guides a draft besides the sample.
+#[derive(Debug, Clone, Copy)]
+pub struct DraftGuide<'a> {
+    /// The canonical list; empty to draft one from scratch.
+    pub list: &'a [TagOption],
+    /// Stored interests.
+    pub interests: &'a [String],
+    /// Names drafted by earlier requests, to reuse rather than coin synonyms of.
+    pub known: &'a [String],
+    /// Most new tags per request.
+    pub max: usize,
+}
+
+/// The draft request: instructions, style, guidelines, interests, list, and names drafted so far
+/// in `system`; the sample in `user`.
+pub fn draft_request(items: &[DraftItem], g: &DraftGuide, style: &StyleConfig) -> Request {
+    let max = g.max;
+    let new_tag_style = new_tag_style(&style.tag_style());
+    let listed = !g.list.is_empty();
+    let mut system = String::from(
+        "You help someone build the tag list for their bookmarks, from a sample of them: the \
+         site, the title, and sometimes a summary or the start of the page. ",
+    );
+    if listed {
+        system.push_str(&format!(
+            "They already have the tag list below. Propose only additions: up to {max} new tags \
+             for topics that recur in the sample and that no listed tag covers, each with a \
+             one-line description of what belongs under it. Never propose a listed tag, one of \
+             its aliases, or a synonym of one. Also point out listed tags that look redundant \
+             (a synonym of another tag, or so close to it that one would do) in \"redundant\", \
+             with the listed or new tag to merge each into and a short reason; leave it empty \
+             when none are. "
+        ));
+    } else {
+        system.push_str(&format!(
+            "Draft their tag list: up to {max} tags that together would tag most of these \
+             bookmarks well, each with a one-line description of what belongs under it. "
+        ));
+    }
+    system.push_str(
+        "Prefer tags that would fit several bookmarks over ones that fit a single page, and \
+         general topics over narrow ones; a page may get several tags, so tags should combine \
+         rather than overlap. ",
+    );
+    if !g.interests.is_empty() {
+        system.push_str(&format!(
+            "Their interests are: {}. Give each tag the interest it falls under in \
+             \"interest\", or \"\" for none; tags outside these interests are welcome where the \
+             sample calls for them. ",
+            g.interests.join(", ")
+        ));
+    }
+    system.push_str(&new_tag_style);
+    let tag_format = if g.interests.is_empty() {
+        "{\"name\": \"...\", \"description\": \"...\"}"
+    } else {
+        "{\"name\": \"...\", \"description\": \"...\", \"interest\": \"...\"}"
+    };
+    let redundant_format = if listed {
+        ", \"redundant\": [{\"tag\": \"...\", \"into\": \"...\", \"reason\": \"...\"}]"
+    } else {
+        ""
+    };
+    system.push_str(&format!(
+        " Reply with JSON only: {{\"tags\": [{tag_format}]{redundant_format}}}."
+    ));
+    if let Some(gl) = style.guidelines() {
+        system.push_str("\n\nThe user's guidelines for tags:\n");
+        system.push_str(gl);
+    }
+    if listed {
+        system.push_str("\n\n");
+        system.push_str(&tag_list(g.list));
+    }
+    if !g.known.is_empty() {
+        system.push_str(
+            "\n\nTags already drafted from other bookmarks of the same library; propose one of \
+             these again (exactly as written) when it fits this sample, rather than a synonym: ",
+        );
+        system.push_str(&g.known.join(", "));
+    }
+    let mut user = String::from("Bookmarks:");
+    for it in items {
+        user.push_str("\n- ");
+        user.push_str(if it.site.is_empty() { "?" } else { &it.site });
+        if let Some(t) = it.title.as_deref().filter(|t| !t.trim().is_empty()) {
+            user.push_str(": ");
+            user.push_str(&crate::html::collapse_ws(t));
+        }
+        if let Some(t) = it.text.as_deref().filter(|t| !t.trim().is_empty()) {
+            user.push_str("\n  ");
+            user.push_str(&cut(&crate::html::collapse_ws(t), DRAFT_TEXT));
+        }
+    }
+    let mut tag = json!({
+        "type": "object",
+        "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+        },
+        "required": ["name", "description"],
+        "additionalProperties": false,
+    });
+    if !g.interests.is_empty() {
+        let mut names: Vec<&str> = g.interests.iter().map(String::as_str).collect();
+        names.push("");
+        tag["properties"]["interest"] = json!({ "type": "string", "enum": names });
+        tag["required"] = json!(["name", "description", "interest"]);
+    }
+    let mut schema = json!({
+        "type": "object",
+        "properties": { "tags": { "type": "array", "items": tag } },
+        "required": ["tags"],
+        "additionalProperties": false,
+    });
+    if listed {
+        let names: Vec<&str> = g.list.iter().map(|t| t.name.as_str()).collect();
+        schema["properties"]["redundant"] = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tag": { "type": "string", "enum": names },
+                    "into": { "type": "string" },
+                    "reason": { "type": "string" },
+                },
+                "required": ["tag", "into", "reason"],
+                "additionalProperties": false,
+            },
+        });
+        schema["required"] = json!(["tags", "redundant"]);
+    }
+    Request {
+        system,
+        user,
+        schema_name: "draft",
+        schema,
+        retry: None,
+        // About 60 tokens per tag; enough for a full reply, and a looping model stops early.
+        max_tokens: Some(400 + 60 * u32::try_from(max).unwrap_or(100).min(100)),
+    }
+}
+
+/// `s` cut to `n` characters, with `…` if it was longer.
+fn cut(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => format!("{}…", s[..i].trim_end()),
+        None => s.to_string(),
+    }
+}
+
+/// Checks a draft reply: a `tags` array (a missing `redundant` means none). New names are fixed
+/// by `style` (refused ones are reported), deduplicated, and cut to `max`; names on the list (or
+/// aliases of listed tags) are left out, since a draft only adds. Interests not among those sent
+/// count as none. A redundancy needs a listed tag (an alias counts as its tag) and something to
+/// merge it into: another listed tag, a tag in this reply, or one drafted before.
+pub fn check_draft(reply: &str, g: &DraftGuide, style: TagStyle) -> Result<Drafted, String> {
+    let v: Value =
+        serde_json::from_str(strip_fences(reply)).map_err(|e| format!("not JSON ({e})"))?;
+    let arr = v
+        .get("tags")
+        .and_then(Value::as_array)
+        .ok_or("no \"tags\" array")?;
+    let listed = |n: &str| -> Option<String> {
+        g.list
+            .iter()
+            .find(|t| t.name == n || t.aliases.iter().any(|a| a == n))
+            .map(|t| t.name.clone())
+    };
+    let mut d = Drafted::default();
+    // Names already on the list: a small model sometimes echoes the list back.
+    let mut echoed = 0;
+    for t in arr {
+        let (name, description) = match t {
+            Value::String(s) => (s.as_str(), None),
+            _ => match t.get("name").and_then(Value::as_str) {
+                Some(n) => (n, t.get("description").and_then(Value::as_str)),
+                None => continue,
+            },
+        };
+        let n = style.fix(name);
+        if listed(&n).is_some() {
+            echoed += 1;
+            continue;
+        }
+        if n.is_empty() || d.tags.iter().any(|o| o.name == n) {
+            continue;
+        }
+        if d.tags.len() >= g.max {
+            break;
+        }
+        if let Err(why) = style.check(&n) {
+            d.refused.push(why);
+            continue;
+        }
+        let interest = t
+            .get("interest")
+            .and_then(Value::as_str)
+            .map(crate::store::normalize_tag)
+            .filter(|i| g.interests.contains(i));
+        d.tags.push(DraftTag {
+            name: n,
+            description: description.and_then(clean_description),
+            interest,
+        });
+    }
+    for r in v
+        .get("redundant")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(tag) = r
+            .get("tag")
+            .and_then(Value::as_str)
+            .and_then(|t| listed(&style.fix(t)))
+        else {
+            continue;
+        };
+        let Some(into) = r.get("into").and_then(Value::as_str).map(|i| style.fix(i)) else {
+            continue;
+        };
+        let into = match listed(&into) {
+            Some(l) => l,
+            None if d.tags.iter().any(|t| t.name == into) || g.known.contains(&into) => into,
+            None => continue,
+        };
+        if into == tag || d.redundant.iter().any(|o| o.tag == tag) {
+            continue;
+        }
+        d.redundant.push(Redundant {
+            tag,
+            into,
+            reason: r
+                .get("reason")
+                .and_then(Value::as_str)
+                .and_then(clean_description),
+        });
+    }
+    if echoed > 0 && d.tags.is_empty() && d.refused.is_empty() && d.redundant.is_empty() {
+        return Err(format!(
+            "every tag in \"tags\" ({echoed}) is already on the list; propose only tags that \
+             aren't, or none"
+        ));
+    }
+    Ok(d)
+}
+
+/// A description from a reply: whitespace collapsed; `None` if empty or not acceptable.
+fn clean_description(d: &str) -> Option<String> {
+    crate::tag::check_description(&crate::html::collapse_ws(d))
+        .ok()
+        .flatten()
 }
 
 /// The new_tags array: names with descriptions. Its length isn't constrained in the schema (not
@@ -1061,5 +1354,148 @@ mod tests {
             r.schema["properties"]["interests"]["items"]["properties"]["interest"]["enum"],
             json!(["nix", "audio"])
         );
+    }
+
+    fn opt(name: &str, aliases: &[&str]) -> TagOption {
+        TagOption {
+            name: name.into(),
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn checks_draft_replies() {
+        let list = [opt("javascript", &["js-lang"]), opt("css", &[])];
+        let interests = ["web".to_string(), "nix".to_string()];
+        let known = ["flake".to_string()];
+        let g = DraftGuide {
+            list: &list,
+            interests: &interests,
+            known: &known,
+            max: 3,
+        };
+        let style = TagStyle {
+            max_length: Some(12),
+            ..TagStyle::default()
+        };
+        let reply = json!({
+            "tags": [
+                {"name": "JavaScript", "description": "listed"},
+                {"name": "js-lang", "description": "an alias of a listed tag"},
+                {"name": "Web Assembly", "description": "  WebAssembly\n modules ", "interest": "Web"},
+                {"name": "a-very-long-tag-name", "description": "too long"},
+                {"name": "wasm", "description": "again", "interest": "nope"},
+                "web-assembly",
+                {"name": "nix", "description": "", "interest": "nix"},
+                {"name": "rust", "description": "over max"},
+            ],
+            "redundant": [
+                {"tag": "css", "into": "Web Assembly", "reason": "drafted"},
+                {"tag": "css", "into": "javascript", "reason": "a second time"},
+                {"tag": "js-lang", "into": "flake", "reason": "an alias, into a known name"},
+                {"tag": "javascript", "into": "javascript", "reason": "itself"},
+                {"tag": "missing", "into": "css"},
+                {"tag": "css", "into": "unknown"},
+            ],
+        })
+        .to_string();
+        let d = check_draft(&reply, &g, style).unwrap();
+        assert_eq!(
+            d.tags,
+            [
+                DraftTag {
+                    name: "web-assembly".into(),
+                    description: Some("WebAssembly modules".into()),
+                    interest: Some("web".into()),
+                },
+                DraftTag {
+                    name: "wasm".into(),
+                    description: Some("again".into()),
+                    interest: None,
+                },
+                DraftTag {
+                    name: "nix".into(),
+                    description: None,
+                    interest: Some("nix".into()),
+                },
+            ]
+        );
+        assert_eq!(d.refused.len(), 1);
+        assert!(d.refused[0].contains("max_length = 12"), "{:?}", d.refused);
+        assert_eq!(
+            d.redundant,
+            [
+                Redundant {
+                    tag: "css".into(),
+                    into: "web-assembly".into(),
+                    reason: Some("drafted".into()),
+                },
+                Redundant {
+                    tag: "javascript".into(),
+                    into: "flake".into(),
+                    reason: Some("an alias, into a known name".into()),
+                },
+            ]
+        );
+
+        // A reply that only repeats the list is sent back; an empty one is fine.
+        let echo = json!({"tags": [{"name": "css", "description": "x"}]}).to_string();
+        let why = check_draft(&echo, &g, style).unwrap_err();
+        assert!(why.contains("already on the list"), "{why}");
+        let none = check_draft("```json\n{\"tags\": []}\n```", &g, style).unwrap();
+        assert_eq!(none, Drafted::default());
+        assert!(check_draft("{\"interests\": []}", &g, style).is_err());
+        assert!(check_draft("tags", &g, style).is_err());
+    }
+
+    #[test]
+    fn draft_requests_send_sites_titles_and_text() {
+        let long = "word ".repeat(200);
+        let items = [
+            DraftItem {
+                site: "github.com".into(),
+                title: Some("  nix\n flakes ".into()),
+                text: Some(long.clone()),
+            },
+            DraftItem {
+                site: String::new(),
+                title: None,
+                text: None,
+            },
+        ];
+        let list = [opt("rust", &["rs"])];
+        let g = DraftGuide {
+            list: &list,
+            interests: &[],
+            known: &[],
+            max: 10,
+        };
+        let r = draft_request(&items, &g, &StyleConfig::default());
+        let text = format!(
+            "{}…",
+            long.trim_end()
+                .chars()
+                .take(DRAFT_TEXT)
+                .collect::<String>()
+                .trim_end()
+        );
+        assert_eq!(
+            r.user,
+            format!("Bookmarks:\n- github.com: nix flakes\n  {text}\n- ?")
+        );
+        assert!(r.system.contains("up to 10 new tags"));
+        assert!(r.system.ends_with("Tags:\n- rust (also: rs)"));
+        assert!(!r.system.contains("interest"));
+        assert_eq!(r.max_tokens, Some(1000));
+        assert_eq!(r.schema["required"], json!(["tags", "redundant"]));
+        assert!(r.schema["properties"]["tags"]["items"]["properties"]["interest"].is_null());
+
+        // From scratch: no list, nothing redundant asked for.
+        let g = DraftGuide { list: &[], ..g };
+        let r = draft_request(&items, &g, &StyleConfig::default());
+        assert!(r.system.contains("Draft their tag list: up to 10 tags"));
+        assert!(!r.system.contains("Tags:"));
+        assert!(r.schema["properties"]["redundant"].is_null());
     }
 }

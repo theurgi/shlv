@@ -18,11 +18,13 @@ use shlv::{netscape, transfer};
 #[cfg(feature = "ai")]
 mod ai_cmd;
 mod backfill_cmd;
+#[cfg(feature = "ai")]
+mod draft_cmd;
 mod edit_cmd;
 #[cfg(feature = "model")]
 mod model_cmd;
-// The interactive screen: `edit --pick`, `suggest --tag --pick`, and `tag seed` (later `tag draft`
-// and `review`).
+// The interactive screen: `edit --pick`, `suggest --tag --pick`, `tag seed`, and `tag draft` (later
+// `review`).
 mod screen;
 #[cfg(feature = "ai")]
 mod seed_cmd;
@@ -319,6 +321,11 @@ enum TagCmd {
     /// key each (keep, rename, merge, drop). Sends only the interests and the tag style
     #[cfg(feature = "ai")]
     Seed(seed_cmd::SeedArgs),
+    /// Draft the list from a sample of bookmarks with the [ai] tag provider, guided by the list
+    /// and stored interests, and go through it as `tag seed` does. Sends each sampled bookmark's
+    /// site, title, and summary
+    #[cfg(feature = "ai")]
+    Draft(draft_cmd::DraftArgs),
     /// List stored interests (saved with `tag seed --save` or pinned in [tags] interests), or
     /// add and forget saved ones
     Interests {
@@ -715,6 +722,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 print_health(&mut out, &h, &opts, store.pinned().is_some(), &style)?;
             }
+        }
+        #[cfg(feature = "ai")]
+        Cmd::Tag {
+            cmd: TagCmd::Draft(args),
+        } => {
+            out.flush()?;
+            let code = draft_cmd::run_draft(&mut store, &config, args, &mut out, &style)?;
+            out.flush()?;
+            return Ok(code);
         }
         #[cfg(feature = "ai")]
         Cmd::Tag {
@@ -1290,6 +1306,8 @@ fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) 
         TagCmd::Health { .. } => unreachable!("handled in run: it needs the config"),
         #[cfg(feature = "ai")]
         TagCmd::Seed(_) => unreachable!("handled in run: it needs the config"),
+        #[cfg(feature = "ai")]
+        TagCmd::Draft(_) => unreachable!("handled in run: it needs the config"),
         TagCmd::Interests { add, rm } => {
             if !add.is_empty() {
                 let n = store.save_interests(&add)?;

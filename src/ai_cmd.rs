@@ -578,7 +578,10 @@ fn submit_batch(
 
 /// Fetches page text for bookmarks a few at a time. Returns, in input order, the text (or
 /// `None` when the page has none) or why the fetch failed.
-fn fetch_texts(targets: &[Bookmark], jobs: usize) -> Vec<Result<Option<String>, String>> {
+pub(crate) fn fetch_texts(
+    targets: &[Bookmark],
+    jobs: usize,
+) -> Vec<Result<Option<String>, String>> {
     let fetcher = Fetcher::default();
     let mut texts: Vec<Result<Option<String>, String>> = vec![Ok(None); targets.len()];
     let mut progress = Progress::new("fetching", targets.len());

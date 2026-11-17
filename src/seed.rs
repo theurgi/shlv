@@ -75,6 +75,8 @@ pub enum Decision {
 /// A suggested tag under an interest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
+    /// The interest it falls under; empty for none (`tag draft` proposes tags outside the
+    /// interests, and redundant ones). Kept candidates are recorded under a non-empty one.
     pub interest: String,
     /// Styled; for an existing tag, its name.
     pub name: String,
@@ -82,6 +84,16 @@ pub struct Candidate {
     /// The user edited the description: it replaces a tag's current one.
     pub edited: bool,
     pub decision: Decision,
+    /// For a tag already on the list that looks redundant (`tag draft`): what it could be merged
+    /// into, and why. Keeping or dropping it leaves the tag as it is.
+    pub hint: Option<Hint>,
+}
+
+/// A suggestion to merge a listed tag into another tag or candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hint {
+    pub into: String,
+    pub reason: Option<String>,
 }
 
 /// What [`Store::apply_seed`] did.
@@ -324,6 +336,9 @@ fn save_interests(tx: &Transaction, names: &[String], now: i64) -> Result<usize>
 }
 
 fn link(tx: &Transaction, interest: &str, tag_id: i64) -> Result<()> {
+    if interest.is_empty() {
+        return Ok(());
+    }
     tx.execute(
         "INSERT OR IGNORE INTO interest_tag (interest, tag_id) VALUES (?1, ?2)",
         params![interest, tag_id],

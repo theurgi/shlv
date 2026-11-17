@@ -23,6 +23,7 @@ fn cand(interest: &str, name: &str, desc: Option<&str>, decision: Decision) -> C
         description: desc.map(str::to_string),
         edited: false,
         decision,
+        hint: None,
     }
 }
 

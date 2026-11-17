@@ -125,6 +125,41 @@ some (see [Config](config.md#tag-health)); `shlv tag seed` with no topics expand
 Interests and tags are independent: an interest can be kept as a tag or not, and nothing ties one to
 the other. Which tags were kept under which interest is recorded either way, for tag health.
 
+### Drafting the list from a sample
+
+`shlv tag draft` has the `[ai] tag` provider read a sample of your bookmarks and draft the list:
+tags for what recurs in the sample, with descriptions, grouped under your stored interests where
+they fit (others are welcome, under `other`). With a list already, it proposes only additions, and
+points at listed tags that look redundant, with what to merge each into. You go through the draft in
+the same screen as `tag seed`.
+
+```
+$ shlv tag draft --yes
+nix        flake          Nix flakes and lock files          k
+other      home-lab       servers and services run at home   k
+           photography    cameras, lenses, editing           d
+redundant  js             → javascript: a synonym            m → javascript
+```
+
+The sample (`--sample`, 200) is spread across sites: one bookmark from every site in turn, larger
+sites first, then a second from each, and so on. It is the same from run to run. For each bookmark
+it sends the site (not the full URL), the title, and the summary if there is one; `--fetch` fetches
+the pages of the rest and sends the start of their text instead. Up to 300 characters of either.
+Also sent: your list with descriptions and aliases, your stored interests, and how tags are named.
+Notes and the tags on bookmarks are not. It says all this, and where it sends it, before sending: up
+to 20 bookmarks it asks, and above that it needs `--yes` (as `summarize --all` does).
+
+A large sample goes in several requests of `--chunk` bookmarks (50), one after another; each sees
+the names drafted so far, to reuse rather than coin synonyms of, and the drafts are merged by name.
+Tags proposed by more requests come first, and `-n` (30) caps the draft. A request that fails is
+reported and the rest still count. Each request's output is capped at about 60 tokens per tag, so a
+small local model that starts repeating itself stops early instead of running until the server gives
+up.
+
+The keys are those of `tag seed`, without `a`. For a redundant tag, `m` merges it (Enter at the
+prompt takes the suggested tag) and `k` or `d` leave it as it is; to rename a listed tag, use
+`shlv tag rename`.
+
 With an `anthropic` provider, `summarize --batch` and `suggest --batch` submit one Message Batch
 instead of live requests: half the price, with results within 24 hours. Pages are fetched when
 submitting. `shlv batch status` shows submitted batches, and `shlv batch collect` applies the

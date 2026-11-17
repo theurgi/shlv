@@ -66,7 +66,7 @@ impl Anthropic {
         }
         json!({
             "model": self.model,
-            "max_tokens": MAX_TOKENS,
+            "max_tokens": req.max_tokens.unwrap_or(MAX_TOKENS),
             "system": [{
                 "type": "text",
                 "text": req.system,
@@ -294,9 +294,13 @@ fn message_text(v: &Value) -> Result<String, String> {
             return Err(format!("the model declined{cat}{why}"));
         }
         Some("max_tokens") => {
-            return Err(format!(
-                "the reply was cut off at max_tokens ({MAX_TOKENS})"
-            ));
+            // The tokens it produced are the limit it hit.
+            return Err(
+                match v.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                    Some(n) => format!("the reply was cut off at max_tokens ({n})"),
+                    None => "the reply was cut off at max_tokens".into(),
+                },
+            );
         }
         _ => {}
     }
