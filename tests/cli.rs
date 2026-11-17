@@ -1278,36 +1278,57 @@ fn import_urls_only_without_titles() {
 }
 
 #[test]
-fn import_karakeep_json() {
-    let file = fixture("karakeep.json");
-    // In full: tags and notes come in; the text note (no URL) doesn't.
+fn import_url_list() {
     let db = Db::new();
-    assert!(
-        db.ok(&["import", &file])
-            .ends_with(": 2 added, 0 updated, 0 skipped\n")
-    );
-    let v = json_lines(&db.ok(&["export"]));
-    let rust = find(&v, "https://www.rust-lang.org/");
-    assert_eq!(rust["note"], "my note");
+    std::fs::create_dir_all(&db.0).unwrap();
+    std::fs::write(
+        db.config(),
+        "[tags.rules]\n\"rust-lang.org\" = [\"rust\"]\n",
+    )
+    .unwrap();
+    db.ok(&["add", "https://lwn.net", "-t", "linux"]);
+    let file = db.0.join("urls.txt");
+    std::fs::write(
+        &file,
+        "\u{feff}# from somewhere\r\n\r\nhttps://www.rust-lang.org/\r\n  lwn.net/  \r\n\
+         https://example.org/caf%C3%A9\r\nhttps://www.rust-lang.org\r\njavascript:void(0)\r\n",
+    )
+    .unwrap();
+    let file = file.to_str().unwrap();
     assert_eq!(
-        rust["tags"],
-        serde_json::json!(["programming", "rust", "systems-programming"])
+        db.ok(&["import", file]),
+        format!(
+            "imported {file}: 2 added, 2 updated, 1 skipped\n\
+             rules matched 1 of 3 bookmarks: 1 new suggestion\n"
+        )
     );
-    assert_eq!(rust["created_at"], 1_700_000_000_000i64);
-    // Karakeep's JSON keeps percent-escapes as they are (its HTML export doesn't).
-    let cafe = find(&v, "https://example.org/caf%C3%A9");
-    assert!(cafe["title"].is_null());
-    assert_eq!(cafe["created_at"], 1_700_000_100_000i64);
-
-    let db = Db::new();
-    db.ok(&["import", "--urls-only", &file]);
     let v = json_lines(&db.ok(&["export"]));
-    assert_eq!(v.len(), 2);
-    let rust = find(&v, "https://www.rust-lang.org/");
-    assert!(rust["note"].is_null());
-    assert_eq!(rust["tags"], serde_json::json!([]));
-    assert_eq!(rust["title"], "Rust Programming Language");
-    assert_eq!(rust["created_at"], 1_700_000_000_000i64);
+    assert_eq!(v.len(), 3);
+    let cafe = find(&v, "https://example.org/caf%C3%A9");
+    assert!(cafe["title"].is_null() && cafe["tags"] == serde_json::json!([]));
+    assert_eq!(
+        find(&v, "https://lwn.net")["tags"],
+        serde_json::json!(["linux"])
+    );
+
+    // Stdin and --format; a line that isn't a URL writes nothing.
+    let db = Db::new();
+    let (ok, out, _) = db.run_stdin(&["import", "--format", "urls", "-"], "a.example\n");
+    assert!(
+        ok && out.ends_with(": 1 added, 0 updated, 0 skipped\n"),
+        "{out}"
+    );
+    let (ok, _, err) = db.run_stdin(&["import", "-"], "a.example\nb.example Title\n");
+    assert!(!ok);
+    assert_eq!(
+        err,
+        "shlv: cannot read -: line 2: not a URL: \"b.example Title\"\n"
+    );
+    assert_eq!(json_lines(&db.ok(&["export"])).len(), 1);
+    // Another app's export in one JSON object.
+    let (ok, _, err) = db.run_stdin(&["import", "-"], "{\"bookmarks\": []}\n");
+    assert!(!ok);
+    assert_eq!(err, "shlv: cannot read -: line 1: no \"url\"\n");
 }
 
 #[test]

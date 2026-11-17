@@ -1,9 +1,9 @@
-//! Import and export: JSON lines (the shape of `ls --json`) and Netscape bookmark HTML (see
-//! [`crate::netscape`]).
+//! Import and export: JSON lines (the shape of `ls --json`), Netscape bookmark HTML (see
+//! [`crate::netscape`]), and, for import only, plain lists of URLs.
 
 use std::collections::HashSet;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::proposal::{Diverted, ProposalSource, StrictTags, divert};
 use crate::store::{Put, check_url, non_empty, normalize_tag, now_ms, put, reindex_many};
@@ -49,90 +49,48 @@ pub enum Format {
     #[default]
     Json,
     Html,
+    /// One URL per line; see [`parse_urls`].
+    Urls,
 }
 
 impl Format {
     /// Netscape HTML if the text starts with its doctype (case-insensitively, after any BOM and
-    /// whitespace), else JSON.
+    /// whitespace). Otherwise JSON if the first line that isn't blank or a `#` comment starts with
+    /// `{`, `[`, or `<` (HTML without the doctype then gets JSON's hint), else a URL list.
     pub fn detect(text: &str) -> Format {
-        let head = text.trim_start_matches('\u{feff}').trim_start();
-        match head.get(..netscape::DOCTYPE.len()) {
-            Some(h) if h.eq_ignore_ascii_case(netscape::DOCTYPE) => Format::Html,
+        let text = text.trim_start_matches('\u{feff}');
+        let head = text.trim_start();
+        if head
+            .get(..netscape::DOCTYPE.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(netscape::DOCTYPE))
+        {
+            return Format::Html;
+        }
+        match url_lines(text).next() {
+            Some((_, line)) if !line.starts_with(['{', '[', '<']) => Format::Urls,
             _ => Format::Json,
         }
     }
 }
 
-/// Karakeep's JSON export: `{"bookmarks": [...], "lists": [...]}`.
-#[derive(serde::Deserialize)]
-struct KarakeepExport {
-    bookmarks: Vec<KarakeepBookmark>,
-}
-
-#[derive(serde::Deserialize)]
-struct KarakeepBookmark {
-    /// Unix seconds (Karakeep's last save of the bookmark, not its first).
-    #[serde(rename = "createdAt")]
-    created_at: Option<i64>,
-    title: Option<String>,
-    #[serde(default)]
-    tags: Vec<String>,
-    content: Option<KarakeepContent>,
-    note: Option<String>,
-}
-
-#[derive(serde::Deserialize)]
-struct KarakeepContent {
-    #[serde(rename = "type")]
-    kind: String,
-    url: Option<String>,
-}
-
-impl KarakeepExport {
-    /// Link bookmarks only: text notes have no URL.
-    fn into_items(self) -> Vec<ImportItem> {
-        self.bookmarks
-            .into_iter()
-            .filter_map(|b| {
-                let url = b.content.filter(|c| c.kind == "link")?.url?;
-                Some(ImportItem {
-                    url,
-                    title: b.title,
-                    note: b.note,
-                    tags: b.tags,
-                    created_at: b.created_at.filter(|&s| s > 0).map(|s| s * 1000),
-                    ..Default::default()
-                })
-            })
-            .collect()
-    }
-}
-
 /// Parses JSON lines: one object per line; blank lines are skipped. A whole-file JSON array of
-/// objects is accepted too, and so is Karakeep's JSON export (its link bookmarks).
+/// objects is accepted too. An object without a `url` fails, such as another app's export that
+/// wraps its bookmarks in one object.
 pub fn parse_json(text: &str) -> Result<Vec<ImportItem>> {
     let text = text.trim_start_matches('\u{feff}');
     if text.trim_start().starts_with('[') {
-        return serde_json::from_str(text).context("invalid JSON array");
-    }
-    // A JSON lines file fails the probe on its first line: no `bookmarks`, or text after the
-    // object. The probe skips values without building them; the real parse then reports errors.
-    #[derive(serde::Deserialize)]
-    struct Probe {
-        #[allow(dead_code)]
-        bookmarks: serde::de::IgnoredAny,
-    }
-    if text.trim_start().starts_with('{') && serde_json::from_str::<Probe>(text).is_ok() {
-        let export: KarakeepExport =
-            serde_json::from_str(text).context("not a Karakeep JSON export")?;
-        return Ok(export.into_items());
+        let items: Vec<ImportItem> = serde_json::from_str(text).context("invalid JSON array")?;
+        if let Some(i) = items.iter().position(|item| item.url.is_empty()) {
+            bail!("item {}: no \"url\"", i + 1);
+        }
+        return Ok(items);
     }
     let mut items = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let item = serde_json::from_str(line).with_context(|| {
+        let item: ImportItem = serde_json::from_str(line).with_context(|| {
             let hint = if line.trim_start().starts_with('<') {
                 " (HTML without the Netscape doctype? try --format html)"
             } else {
@@ -140,9 +98,39 @@ pub fn parse_json(text: &str) -> Result<Vec<ImportItem>> {
             };
             format!("line {}: not a JSON bookmark{hint}", i + 1)
         })?;
+        if item.url.is_empty() {
+            bail!("line {}: no \"url\"", i + 1);
+        }
         items.push(item);
     }
     Ok(items)
+}
+
+/// The lines of a URL list that aren't blank or `#` comments, trimmed, with 1-based numbers.
+fn url_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    text.lines()
+        .map(str::trim)
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
+        .map(|(i, line)| (i + 1, line))
+}
+
+/// Parses a URL list: one URL per line, in any form `add` takes. Blank lines and lines starting
+/// with `#` are skipped. A line with whitespace inside fails, so another kind of text file isn't
+/// read as a list of broken URLs.
+pub fn parse_urls(text: &str) -> Result<Vec<ImportItem>> {
+    url_lines(text.trim_start_matches('\u{feff}'))
+        .map(|(n, line)| {
+            if line.contains(char::is_whitespace) {
+                let shown: String = line.chars().take(60).collect();
+                bail!("line {n}: not a URL: {shown:?}");
+            }
+            Ok(ImportItem {
+                url: line.into(),
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 /// Parses `text` in `format`; see [`netscape::parse`] for `folders_as_tags`.
@@ -150,6 +138,7 @@ pub fn parse(text: &str, format: Format, folders_as_tags: bool) -> Result<Vec<Im
     match format {
         Format::Json => parse_json(text),
         Format::Html => Ok(netscape::parse(text, folders_as_tags)),
+        Format::Urls => parse_urls(text),
     }
 }
 
@@ -392,14 +381,54 @@ mod tests {
     }
 
     #[test]
-    fn karakeep_json_errors_and_json_lines() {
-        let err = parse_json("{\"bookmarks\": [{\"createdAt\": \"soon\"}]}").unwrap_err();
-        assert_eq!(err.to_string(), "not a Karakeep JSON export");
-        // A one-line JSON lines file isn't mistaken for it.
-        let items = parse_json("{\"url\": \"https://a.example/\"}\n").unwrap();
-        assert_eq!(items[0].url, "https://a.example/");
-        let items = parse_json("{\"url\": \"https://a.example/\"}\n{\"url\": \"b\"}").unwrap();
+    fn json_needs_urls() {
+        let items = parse_json("{\"url\": \"https://a.example/\"}\n\n{\"url\": \"b\"}").unwrap();
         assert_eq!(items.len(), 2);
+        // Another app's export in one object.
+        let err = parse_json("{\"bookmarks\": [{\"content\": {}}]}").unwrap_err();
+        assert_eq!(err.to_string(), "line 1: no \"url\"");
+        let err = parse_json("[{\"url\": \"a\"}, {\"title\": \"t\"}]").unwrap_err();
+        assert_eq!(err.to_string(), "item 2: no \"url\"");
+    }
+
+    #[test]
+    fn detect_formats() {
+        let html = "\u{feff}\n<!doctype NETSCAPE-Bookmark-file-1>\n";
+        assert_eq!(Format::detect(html), Format::Html);
+        for json in [
+            "{\"url\": \"a\"}",
+            " [",
+            "<DL><p>",
+            "# list\n\n{\"url\": \"a\"}",
+            "",
+        ] {
+            assert_eq!(Format::detect(json), Format::Json, "{json:?}");
+        }
+        for urls in [
+            "https://a.example/",
+            "\u{feff}# saved\r\n\r\nlwn.net\r\n",
+            "a b",
+        ] {
+            assert_eq!(Format::detect(urls), Format::Urls, "{urls:?}");
+        }
+    }
+
+    #[test]
+    fn url_lists() {
+        let text =
+            "\u{feff}# from Karakeep\r\n\r\n  https://a.example/x  \r\n#https://no/\r\nlwn.net\n";
+        let urls: Vec<_> = parse_urls(text)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.url)
+            .collect();
+        assert_eq!(urls, ["https://a.example/x", "lwn.net"]);
+        let err = parse_urls("a.example\n\nhttps://b.example/ Some title\n").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "line 3: not a URL: \"https://b.example/ Some title\""
+        );
+        assert!(parse_urls("# only comments\n").unwrap().is_empty());
     }
 
     #[test]

@@ -122,12 +122,13 @@ enum Cmd {
         #[command(flatten)]
         llm: ai_cmd::LlmArgs,
     },
-    /// Import bookmarks from a browser export (Netscape HTML) or JSON lines ("-" for stdin)
+    /// Import bookmarks: a browser export (Netscape HTML), JSON lines, or a list of URLs ("-" for
+    /// stdin)
     Import {
         file: PathBuf,
         /// Input format (default: detected from the content)
         #[arg(long, value_enum)]
-        format: Option<FormatArg>,
+        format: Option<ImportFormat>,
         /// Tag each bookmark with the names of its folders
         #[arg(long)]
         folders_as_tags: bool,
@@ -345,6 +346,14 @@ enum FormatArg {
     Html,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ImportFormat {
+    Json,
+    Html,
+    /// One URL per line; blank lines and # comments skipped
+    Urls,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum SortArg {
     Name,
@@ -558,8 +567,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             let text = read_input(&file)?;
             let format = match format {
-                Some(FormatArg::Json) => Format::Json,
-                Some(FormatArg::Html) => Format::Html,
+                Some(ImportFormat::Json) => Format::Json,
+                Some(ImportFormat::Html) => Format::Html,
+                Some(ImportFormat::Urls) => Format::Urls,
                 None => Format::detect(&text),
             };
             let name = file.display();

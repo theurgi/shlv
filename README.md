@@ -48,7 +48,7 @@ $ shlv search fts5
 | `tag proposals accept NAME`    | Add a proposed name to the list and tag its bookmarks                |
 | `tag proposals alias NAME TAG` | Make a proposed name an alias of TAG and tag its bookmarks with it   |
 | `tag proposals reject NAME`    | Remember a name: it isn't proposed again                             |
-| `import FILE`                  | Import Netscape HTML, JSON lines, or Karakeep JSON; `-` is stdin     |
+| `import FILE`                  | Import Netscape HTML, JSON lines, or a list of URLs; `-` is stdin    |
 | `export [--format html]`       | Print every bookmark as JSON lines, or HTML that browsers import     |
 | `suggest ID...\|--all`         | Suggest tags: domain rules, then the `[ai] tag` provider (`ai`)      |
 | `suggest ls [ID]`              | List pending suggestions                                             |
@@ -71,7 +71,7 @@ The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 - [Install](docs/install.md): Nix, Home Manager, Cargo, and optional features
 - [Config and tags](docs/config.md): the config file, canonical tags, domain rules, suggestions, and
   proposals
-- [Import and export](docs/import-export.md): browser bookmarks, moving from Karakeep
+- [Import and export](docs/import-export.md): browser bookmarks, URL lists, moving from another app
 - [Page titles](docs/fetch.md): `add --fetch` and `shlv fetch` (`fetch` feature)
 - [AI providers](docs/ai.md): summaries and tag suggestions from an LLM (`ai` feature)
 - [Tag classifier](docs/classifier.md): offline tag suggestions learned from your bookmarks (`model`
