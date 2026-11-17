@@ -122,6 +122,10 @@ pub struct Tags {
     /// How tags are written: rules applied wherever a tag enters, and guidelines for the AI.
     #[serde(default, skip_serializing_if = "StyleConfig::is_empty")]
     pub style: StyleConfig,
+    /// Interests pinned for `tag seed` and tag health, alongside those stored with
+    /// `tag seed --save`. Nothing ties them to tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interests: Vec<String>,
 }
 
 impl Tags {
@@ -130,6 +134,7 @@ impl Tags {
             && self.suggestions.is_default()
             && self.rules.is_empty()
             && self.style.is_empty()
+            && self.interests.is_empty()
     }
 
     /// A declared tag, alias, or rule tag that breaks `[tags.style]`: where, and the message.

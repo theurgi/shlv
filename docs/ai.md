@@ -84,6 +84,44 @@ proposals pile up, then accept the most proposed names to start the list. With `
 an empty list, `suggest` has nothing to ask the provider and says so. The classifier never proposes;
 it only chooses from the list.
 
+### Seeding the list from interests
+
+`shlv tag seed TOPIC...` starts or grows the list from a few broad interests: the `[ai] tag`
+provider expands each into candidate tags with descriptions, and you go through them one key each.
+
+```
+$ shlv tag seed nix network
+nix      nix            the Nix language and package manager  k
+         flake          Nix flakes                            k
+         nixpkgs        the package collection                m → nix
+network  wifi           wireless networking, 802.11           k
+         linux          the Linux kernel and distributions    on the list
+         reverse-proxy  Caddy, nginx, Traefik                 k
+         proxmox        Proxmox VE                            d
+```
+
+It sends only the interests and how tags are named (the separator and length from `[tags.style]`,
+and its guidelines): no bookmarks, and not your list. It says so, and where it sends them, and asks
+before sending (`--yes` skips the question). Candidates are fixed to the tag style; those already on
+the list are shown but not asked about.
+
+Keys: `k` (or Enter) keeps a candidate, `r` renames it (and keeps it), `m` merges it into a tag or
+another candidate (it becomes an alias; a tag already in use is merged as `tag merge` does), `d`
+drops it, `e` edits its description, `a` adds interests and expands them, `b` goes back, `q`
+finishes early, `?` lists the keys. At the end, Enter saves and `n` discards; Ctrl-C quits at any
+point without writing anything. Kept candidates go on the list in the database, with their
+descriptions (a tag's existing description is replaced only by one you edited). `-n` sets the most
+candidates per interest (8).
+
+On a terminal each answer is one keypress; otherwise each is a line whose first character is the
+key, so answers can be piped in. The screen draws on stderr; stdout gets the summary.
+
+`--save` stores the interests in the database, and `[tags] interests = [...]` in the config pins
+some (see [Config](config.md#tag-health)); `shlv tag seed` with no topics expands the stored ones.
+`shlv tag interests` lists them, `--add` stores more without the AI, and `--rm` forgets saved ones.
+Interests and tags are independent: an interest can be kept as a tag or not, and nothing ties one to
+the other. Which tags were kept under which interest is recorded either way, for tag health.
+
 With an `anthropic` provider, `summarize --batch` and `suggest --batch` submit one Message Batch
 instead of live requests: half the price, with results within 24 hours. Pages are fetched when
 submitting. `shlv batch status` shows submitted batches, and `shlv batch collect` applies the

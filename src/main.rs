@@ -19,6 +19,11 @@ use shlv::{netscape, transfer};
 mod ai_cmd;
 #[cfg(feature = "model")]
 mod model_cmd;
+// The interactive screen; only `tag seed` uses it so far (`review`, task 039, won't need `ai`).
+#[cfg(feature = "ai")]
+mod screen;
+#[cfg(feature = "ai")]
+mod seed_cmd;
 
 /// A fast bookmark manager.
 #[derive(Parser)]
@@ -312,6 +317,20 @@ enum TagCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Expand interests into candidate tags with the [ai] tag provider and go through them one
+    /// key each (keep, rename, merge, drop). Sends only the interests and the tag style
+    #[cfg(feature = "ai")]
+    Seed(seed_cmd::SeedArgs),
+    /// List stored interests (saved with `tag seed --save` or pinned in [tags] interests), or
+    /// add and forget saved ones
+    Interests {
+        /// Store these interests
+        #[arg(long, value_name = "INTEREST", num_args = 1..)]
+        add: Vec<String>,
+        /// Forget these saved interests (their tags stay)
+        #[arg(long, value_name = "INTEREST", num_args = 1..)]
+        rm: Vec<String>,
+    },
     /// Review names proposed for the canonical list: list (the default), accept, alias, reject
     Proposals {
         #[command(subcommand)]
@@ -426,6 +445,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     store.set_suggest_mode(config.tags.suggestions);
     store.set_rules(config.tags.rules.clone());
     store.set_style(config.tags.style.tag_style());
+    store.set_pinned_interests(&config.tags.interests);
     // The store keeps the declared list; nothing else reads it from `config`.
     if let Some(tags) = config.tags.canonical.take() {
         let stats = store.pin(tags).with_context(|| {
@@ -726,6 +746,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 print_health(&mut out, &h, &opts, store.pinned().is_some(), &style)?;
             }
+        }
+        #[cfg(feature = "ai")]
+        Cmd::Tag {
+            cmd: TagCmd::Seed(args),
+        } => {
+            out.flush()?;
+            let code = seed_cmd::run_seed(&mut store, &config, args, &mut out, &style)?;
+            out.flush()?;
+            return Ok(code);
         }
         Cmd::Tag { cmd } => {
             run_tag(&mut store, cmd, &mut out, &style).map_err(|e| pinned_hint(e, &config_path))?
@@ -1260,6 +1289,28 @@ fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) 
             }
         },
         TagCmd::Health { .. } => unreachable!("handled in run: it needs the config"),
+        #[cfg(feature = "ai")]
+        TagCmd::Seed(_) => unreachable!("handled in run: it needs the config"),
+        TagCmd::Interests { add, rm } => {
+            if !add.is_empty() {
+                let n = store.save_interests(&add)?;
+                writeln!(out, "saved {}", plural(n, "new interest"))?;
+            }
+            if !rm.is_empty() {
+                let n = store.forget_interests(&rm)?;
+                writeln!(out, "forgot {}", plural(n, "interest"))?;
+            }
+            if add.is_empty() && rm.is_empty() {
+                for i in store.interests()? {
+                    let from = match (i.saved, i.pinned) {
+                        (true, true) => "saved, pinned in config",
+                        (false, true) => "pinned in config",
+                        _ => "saved",
+                    };
+                    writeln!(out, "{}  {}({from}){}", i.name, style.dim, style.reset)?;
+                }
+            }
+        }
         TagCmd::Proposals { cmd } => run_proposals(
             store,
             cmd.unwrap_or(ProposalCmd::Ls {
@@ -1604,6 +1655,38 @@ fn print_health(
     }
     if h.style.is_empty() {
         writeln!(out, "  none")?;
+    }
+    if !h.interests.is_empty() {
+        head(
+            out,
+            "interests",
+            "(stored; tags kept under each when seeding, or named like it)",
+        )?;
+        let width = h
+            .interests
+            .iter()
+            .map(|i| i.interest.chars().count())
+            .max()
+            .unwrap_or(0);
+        for i in &h.interests {
+            write!(out, "  {:<width$}  ", i.interest)?;
+            if i.tags.is_empty() {
+                writeln!(
+                    out,
+                    "no tags{}",
+                    cmd(format!("shlv tag seed {}", i.interest))
+                )?;
+                continue;
+            }
+            let tags: Vec<String> = i.tags.iter().map(|t| tag(t)).collect();
+            writeln!(
+                out,
+                "{}, {}: {}",
+                plural(i.tags.len(), "tag"),
+                plural(i.bookmarks, "bookmark"),
+                tags.join(" ")
+            )?;
+        }
     }
     if declared {
         writeln!(

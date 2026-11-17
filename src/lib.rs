@@ -18,6 +18,7 @@ pub mod model;
 pub mod netscape;
 pub mod proposal;
 pub mod search;
+pub mod seed;
 pub mod store;
 pub mod style;
 pub mod suggest;
@@ -29,6 +30,7 @@ pub use config::Config;
 pub use proposal::{
     Decided, Diverted, Proposal, ProposalSource, ProposalState, ProposeStats, StrictTags,
 };
+pub use seed::{Candidate, Decision, Interest, SeedName, Seeded};
 pub use store::{Added, Bookmark, Edit, ListQuery, NewBookmark, Store};
 pub use style::{Separator, StyleConfig, TagStyle};
 pub use suggest::{

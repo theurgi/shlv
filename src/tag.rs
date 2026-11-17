@@ -929,6 +929,12 @@ pub(crate) fn merge_into(
         params![from_id, into_id],
     )?;
     tx.execute("DELETE FROM tag_suggestion WHERE tag_id = ?1", [from_id])?;
+    // So do the interests it was kept under.
+    tx.execute(
+        "UPDATE OR IGNORE interest_tag SET tag_id = ?2 WHERE tag_id = ?1",
+        params![from_id, into_id],
+    )?;
+    tx.execute("DELETE FROM interest_tag WHERE tag_id = ?1", [from_id])?;
     tx.execute(
         "UPDATE tag_alias SET tag_id = ?2 WHERE tag_id = ?1",
         params![from_id, into_id],
@@ -981,7 +987,7 @@ pub(crate) fn alias_target(conn: &Connection, alias: &str) -> Result<Option<(i64
 }
 
 /// A live tag's id by exact name, with an error that says when the name is an alias.
-fn require_tag(conn: &Connection, name: &str) -> Result<i64> {
+pub(crate) fn require_tag(conn: &Connection, name: &str) -> Result<i64> {
     if let Some(id) = live_tag(conn, name)? {
         return Ok(id);
     }
@@ -992,7 +998,7 @@ fn require_tag(conn: &Connection, name: &str) -> Result<i64> {
 }
 
 /// Marks a tag canonical, creating or reviving it. Returns false if it already was.
-fn mark_canonical(tx: &Transaction, name: &str, now: i64) -> Result<bool> {
+pub(crate) fn mark_canonical(tx: &Transaction, name: &str, now: i64) -> Result<bool> {
     if let Some((_, tag)) = alias_target(tx, name)? {
         bail!("{name:?} is an alias of {tag:?}; mark {tag:?} canonical instead");
     }

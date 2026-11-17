@@ -360,6 +360,26 @@ impl Provider {
         unreachable!()
     }
 
+    /// Candidate tags for each of `interests` (task 034), up to `per` each. Sends only the
+    /// interests and the tag style (the style sentence and `[tags.style] guidelines`): no
+    /// bookmarks, no list. Names are fixed by the style (refused ones are dropped with the
+    /// reason), deduplicated across interests, and grouped by interest in the order sent.
+    pub fn seed(&self, interests: &[String], per: usize) -> Result<Seeds> {
+        let at = || format!("provider {} (seed)", self.name);
+        let mut req = seed_request(interests, per, &self.style);
+        for attempt in 0..2 {
+            let reply = self.llm.complete(&req).with_context(at)?;
+            match check_seeds(&reply, interests, per, self.style.tag_style()) {
+                Ok(s) => return Ok(s),
+                Err(why) if attempt == 1 => {
+                    return Err(anyhow!("invalid reply twice: {why}")).with_context(at);
+                }
+                Err(why) => req.retry = Some((reply, why)),
+            }
+        }
+        unreachable!()
+    }
+
     /// Whether this provider can run jobs as a Message Batch (kind `anthropic`).
     pub fn supports_batches(&self) -> bool {
         self.llm.batches().is_some()
@@ -663,6 +683,125 @@ fn tag_prompt(list: &[TagOption], p: &Proposing, style: &StyleConfig) -> String 
     s
 }
 
+/// A checked seed reply: candidates per interest, and names the style refused.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Seeds {
+    /// `(interest, candidates)`, in the order the interests were sent; every interest is there,
+    /// perhaps with no candidates.
+    pub groups: Vec<(String, Vec<NewTag>)>,
+    pub refused: Vec<String>,
+}
+
+/// The seed request: the instructions and the style in `system`, the interests in `user`.
+pub fn seed_request(interests: &[String], per: usize, style: &StyleConfig) -> Request {
+    let new_tag_style = new_tag_style(&style.tag_style());
+    let mut system = format!(
+        "You help someone start the tag list for their bookmarks. They name broad interests; for \
+         each, propose up to {per} tags they are likely to need for pages they would save under \
+         it: its main subtopics, tools, and kinds of things, each with a one-line description of \
+         what belongs under it. Include the interest itself when it makes a good tag. Prefer \
+         tags that are useful on their own over narrow ones, and don't propose the same tag \
+         under two interests. {new_tag_style} Reply with JSON only: {{\"interests\": \
+         [{{\"interest\": \"...\", \"tags\": [{{\"name\": \"...\", \"description\": \
+         \"...\"}}]}}]}}, with one entry per interest, named exactly as given."
+    );
+    if let Some(g) = style.guidelines() {
+        system.push_str("\n\nThe user's guidelines for tags:\n");
+        system.push_str(g);
+    }
+    let mut user = String::from("Interests:");
+    for i in interests {
+        user.push_str("\n- ");
+        user.push_str(i);
+    }
+    Request {
+        system,
+        user,
+        schema_name: "seed",
+        schema: json!({
+            "type": "object",
+            "properties": {
+                "interests": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "interest": { "type": "string", "enum": interests },
+                            "tags": new_tags_schema(),
+                        },
+                        "required": ["interest", "tags"],
+                        "additionalProperties": false,
+                    },
+                },
+            },
+            "required": ["interests"],
+            "additionalProperties": false,
+        }),
+        retry: None,
+    }
+}
+
+/// Checks a seed reply: an `interests` array; entries for interests that weren't sent are
+/// dropped, and a reply with none of them is invalid. Names are fixed by `style`, deduplicated
+/// across interests, at most `per` each.
+pub fn check_seeds(
+    reply: &str,
+    interests: &[String],
+    per: usize,
+    style: TagStyle,
+) -> Result<Seeds, String> {
+    let v: Value =
+        serde_json::from_str(strip_fences(reply)).map_err(|e| format!("not JSON ({e})"))?;
+    let arr = v
+        .get("interests")
+        .and_then(Value::as_array)
+        .ok_or("no \"interests\" array")?;
+    let mut s = Seeds {
+        groups: interests.iter().map(|i| (i.clone(), Vec::new())).collect(),
+        refused: Vec::new(),
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut matched = false;
+    for entry in arr {
+        let Some(name) = entry.get("interest").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = crate::store::normalize_tag(name);
+        let Some(g) = s.groups.iter_mut().find(|(i, _)| *i == name) else {
+            continue;
+        };
+        matched = true;
+        let tags = entry.get("tags").and_then(new_tags_in).unwrap_or_default();
+        for t in tags {
+            let n = style.fix(&t.name);
+            if n.is_empty() || seen.contains(&n) || g.1.len() >= per {
+                continue;
+            }
+            if let Err(why) = style.check(&n) {
+                s.refused.push(why);
+                continue;
+            }
+            let description = t.description.and_then(|d| {
+                crate::tag::check_description(&crate::html::collapse_ws(&d))
+                    .ok()
+                    .flatten()
+            });
+            seen.push(n.clone());
+            g.1.push(NewTag {
+                name: n,
+                description,
+            });
+        }
+    }
+    if !matched && !interests.is_empty() {
+        return Err(format!(
+            "no entry for any of the interests sent ({})",
+            interests.join(", ")
+        ));
+    }
+    Ok(s)
+}
+
 /// The new_tags array: names with descriptions. Its length isn't constrained in the schema (not
 /// every structured-output implementation supports `maxItems`); extra names are dropped.
 fn new_tags_schema() -> Value {
@@ -683,27 +822,34 @@ fn new_tags_schema() -> Value {
 /// New names from a reply. A missing `new_tags` means none (a model in JSON mode may leave it
 /// out); entries without a name string are skipped.
 fn new_tags_of(v: &Value) -> Result<Vec<NewTag>, String> {
-    let Some(arr) = v.get("new_tags") else {
-        return Ok(Vec::new());
-    };
-    let arr = arr.as_array().ok_or("\"new_tags\" is not an array")?;
-    Ok(arr
-        .iter()
-        .filter_map(|t| {
-            // A bare string is a name without a description.
-            let (name, description) = match t {
-                Value::String(s) => (s.as_str(), None),
-                _ => (
-                    t.get("name")?.as_str()?,
-                    t.get("description").and_then(Value::as_str),
-                ),
-            };
-            Some(NewTag {
-                name: name.to_string(),
-                description: description.map(str::to_string),
+    match v.get("new_tags") {
+        Some(arr) => new_tags_in(arr).ok_or_else(|| "\"new_tags\" is not an array".into()),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The names in an array of `{"name", "description"}` objects (or bare strings); `None` if it
+/// isn't an array.
+fn new_tags_in(arr: &Value) -> Option<Vec<NewTag>> {
+    Some(
+        arr.as_array()?
+            .iter()
+            .filter_map(|t| {
+                // A bare string is a name without a description.
+                let (name, description) = match t {
+                    Value::String(s) => (s.as_str(), None),
+                    _ => (
+                        t.get("name")?.as_str()?,
+                        t.get("description").and_then(Value::as_str),
+                    ),
+                };
+                Some(NewTag {
+                    name: name.to_string(),
+                    description: description.map(str::to_string),
+                })
             })
-        })
-        .collect())
+            .collect(),
+    )
 }
 
 /// The canonical list for the prompt: `- name: description (also: aliases)`.
@@ -860,5 +1006,60 @@ mod tests {
         assert!(summary_of(&json!({"summary": " "})).is_err());
         assert!(summary_of(&json!({"summary": "x".repeat(1001)})).is_err());
         assert!(summary_of(&json!({"tags": []})).is_err());
+    }
+    #[test]
+    fn checks_seed_replies() {
+        use crate::style::Separator;
+        let sent = vec!["nix".to_string(), "audio".to_string()];
+        let style = TagStyle {
+            separator: Some(Separator::Hyphen),
+            max_length: Some(12),
+        };
+        let reply = json!({"interests": [
+            {"interest": "Nix", "tags": [
+                {"name": "Nix Flakes", "description": " flakes\n and lock files "},
+                {"name": "home_manager_modules", "description": "too long"},
+                {"name": "nixpkgs", "description": "packages"},
+                "nixos",
+            ]},
+            {"interest": "audio", "tags": [{"name": "nixpkgs", "description": "dup"}]},
+            {"interest": "cooking", "tags": [{"name": "knives", "description": "x"}]},
+        ]});
+        let s = check_seeds(&reply.to_string(), &sent, 2, style).unwrap();
+        let names = |g: &[NewTag]| g.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(s.groups[0].0, "nix");
+        assert_eq!(names(&s.groups[0].1), ["nix-flakes", "nixpkgs"]);
+        assert_eq!(
+            s.groups[0].1[0].description.as_deref(),
+            Some("flakes and lock files")
+        );
+        // A name already under another interest isn't repeated; unsent interests are dropped.
+        assert_eq!(s.groups[1], ("audio".to_string(), Vec::new()));
+        assert_eq!(s.groups.len(), 2);
+        assert_eq!(s.refused.len(), 1);
+        assert!(s.refused[0].contains("max_length = 12"));
+
+        assert!(check_seeds("{\"interests\": []}", &sent, 2, style).is_err());
+        assert!(check_seeds("{\"tags\": []}", &sent, 2, style).is_err());
+    }
+
+    #[test]
+    fn seed_requests_send_only_interests_and_style() {
+        let style = StyleConfig {
+            guidelines: Some("Prefer tool names.".into()),
+            ..StyleConfig::default()
+        };
+        let r = seed_request(&["nix".into(), "audio".into()], 5, &style);
+        assert_eq!(r.user, "Interests:\n- nix\n- audio");
+        assert!(r.system.contains("up to 5 tags"));
+        assert!(r.system.contains("words joined by hyphens"));
+        assert!(
+            r.system
+                .ends_with("guidelines for tags:\nPrefer tool names.")
+        );
+        assert_eq!(
+            r.schema["properties"]["interests"]["items"]["properties"]["interest"]["enum"],
+            json!(["nix", "audio"])
+        );
     }
 }

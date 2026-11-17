@@ -31,6 +31,10 @@ guidelines = """
 Singular nouns: plugin, not plugins.
 One concept per tag; combine tags rather than compounding them: rust + wifi, not rust-wifi.
 """
+
+# Broad interests, for `tag seed` and tag health (`tag seed --save` stores more in the database).
+[tags]
+interests = ["nix", "network", "home-lab"]
 ```
 
 The canonical list lives in the database, so `tag canonical add|rm|import`, `tag alias`,
@@ -140,6 +144,10 @@ and nothing changes until you run one. `--json` prints the report as one JSON ob
   already on the list; it sends up to 15 titles and URLs per group, with the list.
 - **Style:** names that break `[tags.style]`, a singular and a plural both present (`plugin`,
   `plugins`), and compounds of other tags (`rust-wifi` when `rust` and `wifi` exist).
+- **Interests:** with stored interests (`[tags] interests`, or saved with
+  [`tag seed --save`](ai.md#seeding-the-list-from-interests)), the tags under each and how many
+  bookmarks have one of them, and interests with no tag under them. A tag is under an interest when
+  it was kept (or merged into) while seeding that interest, or when it is named like the interest.
 
 On 100,000 bookmarks it takes about 0.1 s, and 0.4 s when the classifier also checks 25,000 gap
 bookmarks.

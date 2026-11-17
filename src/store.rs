@@ -134,6 +134,8 @@ pub struct Store {
     pub(crate) rules: DomainRules,
     pub(crate) suggest_mode: SuggestMode,
     pub(crate) style: TagStyle,
+    /// Interests pinned in config (`[tags] interests`), normalized.
+    pub(crate) pinned_interests: Vec<String>,
 }
 
 impl Store {
@@ -159,6 +161,7 @@ impl Store {
             rules: DomainRules::default(),
             suggest_mode: SuggestMode::default(),
             style: TagStyle::default(),
+            pinned_interests: Vec::new(),
         }
     }
 

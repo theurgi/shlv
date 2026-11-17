@@ -53,6 +53,8 @@ pub struct Health {
     pub rare: Vec<Rare>,
     pub gaps: Gaps,
     pub style: Vec<StyleIssue>,
+    /// How the list spreads over stored interests (saved and pinned); empty without any.
+    pub interests: Vec<InterestSpread>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -160,6 +162,19 @@ pub struct StyleIssue {
     /// The other tags involved (the singular; the compound's parts).
     pub related: Vec<String>,
     pub message: String,
+}
+
+/// The tags under one stored interest: those kept under it when seeding, and the tag it names
+/// (directly or through an alias), if any.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct InterestSpread {
+    pub interest: String,
+    pub saved: bool,
+    pub pinned: bool,
+    /// By name.
+    pub tags: Vec<String>,
+    /// Live bookmarks with at least one of them.
+    pub bookmarks: usize,
 }
 
 struct TagRow {
@@ -388,6 +403,7 @@ impl Store {
             rare,
             gaps,
             style,
+            interests: self.interest_spread()?,
         })
     }
 
@@ -488,6 +504,51 @@ impl Store {
             g.existing = known.get(&g.key).cloned();
         }
         Ok(gaps)
+    }
+
+    /// Tags and bookmarks per stored interest; see [`InterestSpread`].
+    fn interest_spread(&self) -> Result<Vec<InterestSpread>> {
+        let interests = self.interests()?;
+        if interests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut linked = self.conn.prepare(
+            "SELECT t.id, t.name FROM interest_tag it JOIN tag t ON t.id = it.tag_id \
+             WHERE it.interest = ?1 AND t.deleted_at IS NULL",
+        )?;
+        let mut named = self.conn.prepare(
+            "SELECT id, name FROM tag WHERE deleted_at IS NULL AND id = coalesce(\
+             (SELECT tag_id FROM tag_alias WHERE alias = ?1), \
+             (SELECT id FROM tag WHERE name = ?1 AND deleted_at IS NULL))",
+        )?;
+        let mut tagged = self
+            .conn
+            .prepare("SELECT bookmark_id FROM bookmark_tag WHERE tag_id = ?1")?;
+        let mut out = Vec::with_capacity(interests.len());
+        for i in interests {
+            let mut tags: Vec<(i64, String)> = linked
+                .query_map([&i.name], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .chain(named.query_map([&i.name], |r| Ok((r.get(0)?, r.get(1)?)))?)
+                .collect::<rusqlite::Result<_>>()?;
+            tags.sort_by(|a, b| a.1.cmp(&b.1));
+            tags.dedup();
+            let mut bookmarks: Vec<i64> = Vec::new();
+            for (id, _) in &tags {
+                for b in tagged.query_map([id], |r| r.get(0))? {
+                    bookmarks.push(b?);
+                }
+            }
+            bookmarks.sort_unstable();
+            bookmarks.dedup();
+            out.push(InterestSpread {
+                interest: i.name,
+                saved: i.saved,
+                pinned: i.pinned,
+                tags: tags.into_iter().map(|(_, n)| n).collect(),
+                bookmarks: bookmarks.len(),
+            });
+        }
+        Ok(out)
     }
 
     /// Every tag name and alias, to the tag it names.
