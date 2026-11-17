@@ -5,6 +5,7 @@ use std::process::{Command, ExitCode};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use shlv::config::{self, Config};
+use shlv::health::{Health, HealthOptions, StyleKind};
 use shlv::store::normalize_tag;
 use shlv::tag::{format_canonical, format_canonical_nix, format_canonical_toml, parse_canonical};
 use shlv::{
@@ -280,6 +281,36 @@ enum TagCmd {
     Canonical {
         #[command(subcommand)]
         cmd: CanonicalCmd,
+    },
+    /// Measure the tag list: redundant, too broad, rare, and badly named tags, coverage, and
+    /// bookmarks no tag fits. Advisory: it changes nothing
+    Health {
+        /// Redundant pairs: each tag on at least this share of the other's bookmarks
+        #[arg(long, value_name = "SHARE", default_value_t = 0.8, value_parser = share)]
+        redundant: f64,
+        /// Redundant pairs: together on at least this many bookmarks
+        #[arg(long, value_name = "N", default_value_t = 3)]
+        min_together: usize,
+        /// Too broad: on at least this share of all bookmarks
+        #[arg(long, value_name = "SHARE", default_value_t = 0.3, value_parser = share)]
+        broad: f64,
+        /// Rare: canonical tags on at most this many bookmarks
+        #[arg(long, value_name = "N", default_value_t = 2)]
+        rare: usize,
+        /// Gaps: smallest group of untagged bookmarks to show
+        #[arg(long, value_name = "N", default_value_t = 3)]
+        min_group: usize,
+        /// Gaps: most groups to show, by site and by title word
+        #[arg(long, value_name = "N", default_value_t = 10)]
+        groups: usize,
+        /// Ask the [ai] tag provider to name the N largest gap groups (default 5); sends up to 15
+        /// titles and URLs per group
+        #[cfg(feature = "ai")]
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "5")]
+        name_gaps: Option<usize>,
+        /// Print the report as one JSON object
+        #[arg(long)]
+        json: bool,
     },
     /// Review names proposed for the canonical list: list (the default), accept, alias, reject
     Proposals {
@@ -642,6 +673,60 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 netscape::write_footer(&mut out)?;
             }
         },
+        Cmd::Tag {
+            cmd:
+                TagCmd::Health {
+                    redundant,
+                    min_together,
+                    broad,
+                    rare,
+                    min_group,
+                    groups,
+                    #[cfg(feature = "ai")]
+                    name_gaps,
+                    json,
+                },
+        } => {
+            let opts = HealthOptions {
+                redundant,
+                min_together,
+                broad,
+                rare,
+                min_group,
+                groups,
+            };
+            // With the classifier built, untagged bookmarks it can place aren't gaps in the list:
+            // `suggest` would tag them. It uses the stored model as is (no retraining here).
+            #[cfg(feature = "model")]
+            let classifier = if shlv::model::canonical_list(&store)?.is_empty() {
+                None
+            } else {
+                Some(store.classifier(false)?)
+            };
+            #[cfg(feature = "model")]
+            let place = classifier.as_ref().map(|c| {
+                let t = config.model.threshold;
+                move |item: &shlv::choose::Item| c.probabilities(item).iter().any(|(_, p)| *p >= t)
+            });
+            #[cfg(feature = "model")]
+            let place = place
+                .as_ref()
+                .map(|f| f as &dyn Fn(&shlv::choose::Item) -> bool);
+            #[cfg(not(feature = "model"))]
+            let place = None;
+            #[allow(unused_mut)]
+            let mut h = store.health(&opts, place)?;
+            #[cfg(feature = "ai")]
+            if let Some(n) = name_gaps {
+                ai_cmd::name_gaps(&config, &store, &mut h.gaps, n)?;
+            }
+            if json {
+                serde_json::to_writer_pretty(&mut out, &h).map_err(io::Error::from)?;
+                writeln!(out)?;
+            } else {
+                print_health(&mut out, &h, &opts, store.pinned().is_some(), &style)?;
+            }
+        }
         Cmd::Tag { cmd } => {
             run_tag(&mut store, cmd, &mut out, &style).map_err(|e| pinned_hint(e, &config_path))?
         }
@@ -1174,6 +1259,7 @@ fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) 
                 out.write_all(text.as_bytes())?
             }
         },
+        TagCmd::Health { .. } => unreachable!("handled in run: it needs the config"),
         TagCmd::Proposals { cmd } => run_proposals(
             store,
             cmd.unwrap_or(ProposalCmd::Ls {
@@ -1310,6 +1396,223 @@ fn print_tag(out: &mut impl Write, t: &TagInfo, width: usize, s: &Style) -> io::
         write!(out, "  {}# {d}{}", s.dim, s.reset)?;
     }
     writeln!(out)
+}
+
+/// A share between 0 and 1, for `tag health` thresholds.
+fn share(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if (0.0..=1.0).contains(&v) => Ok(v),
+        _ => Err(format!("{s:?} is not a share between 0 and 1")),
+    }
+}
+
+fn percent(part: usize, whole: usize) -> String {
+    if whole == 0 {
+        return "0%".into();
+    }
+    format!("{:.0}%", 100.0 * part as f64 / whole as f64)
+}
+
+/// A rough age: `5 days`, `3 months`, `2 years`.
+fn age(ms: i64) -> String {
+    let days = (ms / 86_400_000).max(0) as usize;
+    match days {
+        0..=60 => plural(days, "day"),
+        61..=730 => plural(days / 30, "month"),
+        _ => plural(days / 365, "year"),
+    }
+}
+
+/// `tag health` as text: one section per measurement, with the command that acts on each line.
+fn print_health(
+    out: &mut impl Write,
+    h: &Health,
+    opts: &HealthOptions,
+    declared: bool,
+    s: &Style,
+) -> io::Result<()> {
+    let c = &h.coverage;
+    let head = |out: &mut dyn Write, title: &str, hint: &str| {
+        writeln!(out, "\n{title} {}{hint}{}", s.dim, s.reset)
+    };
+    let cmd = |c: String| format!("  {}({c}){}", s.dim, s.reset);
+    let tag = |t: &str| format!("{}{t}{}", s.tag, s.reset);
+
+    writeln!(
+        out,
+        "coverage: {} bookmarks, {} tagged ({}), {} with a canonical tag ({}); \
+         {:.1} tags per tagged bookmark",
+        c.bookmarks,
+        c.tagged,
+        percent(c.tagged, c.bookmarks),
+        c.canonical_tagged,
+        percent(c.canonical_tagged, c.bookmarks),
+        c.tags_per_tagged,
+    )?;
+    let hist = c.histogram;
+    writeln!(
+        out,
+        "  {} {}, {} canonical; bookmarks by tag count: 0: {}  1: {}  2: {}  3: {}  4+: {}",
+        c.tags,
+        if c.tags == 1 { "tag" } else { "tags" },
+        c.canonical,
+        hist[0],
+        hist[1],
+        hist[2],
+        hist[3],
+        hist[4]
+    )?;
+
+    head(
+        out,
+        "redundant",
+        &format!(
+            "(each on {} or more of the other's bookmarks: merge?)",
+            percent((opts.redundant * 100.0).round() as usize, 100)
+        ),
+    )?;
+    for r in &h.redundant {
+        writeln!(
+            out,
+            "  {} + {}  together on {} of {} and {} ({:.2} Jaccard){}",
+            tag(&r.a),
+            tag(&r.b),
+            r.together,
+            r.a_count,
+            r.b_count,
+            r.jaccard,
+            cmd(format!("shlv tag merge {} {}", r.a, r.b))
+        )?;
+    }
+    if h.redundant.is_empty() {
+        writeln!(out, "  none")?;
+    }
+
+    head(
+        out,
+        "too broad",
+        &format!(
+            "(on {} or more of all bookmarks: they don't narrow a search)",
+            percent((opts.broad * 100.0).round() as usize, 100)
+        ),
+    )?;
+    for b in &h.broad {
+        writeln!(
+            out,
+            "  {}  {} ({})",
+            tag(&b.tag),
+            b.count,
+            percent(b.count, c.bookmarks)
+        )?;
+    }
+    if h.broad.is_empty() {
+        writeln!(out, "  none")?;
+    }
+
+    head(
+        out,
+        "rare",
+        &format!("(canonical, on {} or fewer)", plural(opts.rare, "bookmark")),
+    )?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    for r in &h.rare {
+        let old = r.created_at.map_or(String::new(), |t| match age(now - t) {
+            a if a == "0 days" => ", added today".to_string(),
+            a => format!(", added {a} ago"),
+        });
+        let act = if r.pinned {
+            cmd("declared in the config".into())
+        } else {
+            cmd(format!("shlv tag canonical rm {}", r.tag))
+        };
+        writeln!(
+            out,
+            "  {}  {}{old}{act}",
+            tag(&r.tag),
+            plural(r.count, "bookmark")
+        )?;
+    }
+    if h.rare.is_empty() {
+        writeln!(out, "  none")?;
+    }
+
+    let g = &h.gaps;
+    let what = if c.canonical > 0 {
+        "without a canonical tag"
+    } else {
+        "without tags"
+    };
+    write!(out, "\ngaps: {} {what}", plural(g.bookmarks, "bookmark"))?;
+    match g.placeable {
+        Some(0) => write!(out, "; the classifier can't place any of them")?,
+        Some(p) => write!(
+            out,
+            "; the classifier could tag {p} of them{}",
+            cmd("shlv suggest --all".into())
+        )?,
+        None => {}
+    }
+    writeln!(out)?;
+    for (label, groups) in [("by site", &g.by_host), ("by title word", &g.by_word)] {
+        if groups.is_empty() {
+            continue;
+        }
+        writeln!(out, "  {label}:")?;
+        let width = groups[0].ids.len().to_string().len();
+        for gr in groups {
+            write!(
+                out,
+                "    {}{:>width$}{}  {}",
+                s.dim,
+                gr.ids.len(),
+                s.reset,
+                gr.key
+            )?;
+            if let Some(t) = &gr.existing {
+                write!(out, "  is tag {}", tag(t))?;
+            }
+            if let Some(n) = &gr.named {
+                let listed = if n.listed { " (on the list)" } else { "" };
+                write!(out, "  → {}{listed}", tag(&n.name))?;
+                if let Some(d) = &n.description {
+                    write!(out, " {}# {d}{}", s.dim, s.reset)?;
+                }
+            }
+            if let Some(e) = gr.examples.first() {
+                write!(
+                    out,
+                    "  {}e.g. {}{}",
+                    s.dim,
+                    truncate(&one_line(e), 60),
+                    s.reset
+                )?;
+            }
+            writeln!(out)?;
+        }
+    }
+
+    head(out, "style", "([tags.style] and naming guidelines)")?;
+    for i in &h.style {
+        let act = match i.kind {
+            StyleKind::Style => String::new(),
+            StyleKind::Plural => cmd(format!("shlv tag merge {} {}", i.tag, i.related[0])),
+            StyleKind::Compound => String::new(),
+        };
+        writeln!(out, "  {}{act}", i.message)?;
+    }
+    if h.style.is_empty() {
+        writeln!(out, "  none")?;
+    }
+    if declared {
+        writeln!(
+            out,
+            "\n{}tags declared in the config change there, not with these commands{}",
+            s.dim, s.reset
+        )?;
+    }
+    Ok(())
 }
 
 /// Reads a file, or stdin for "-".

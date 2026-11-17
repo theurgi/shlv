@@ -1510,3 +1510,36 @@ fn tag_style() {
         "{err}"
     );
 }
+
+#[test]
+fn tag_health_reports_and_validates_flags() {
+    let db = Db::new();
+    for i in 0..3 {
+        let url = format!("https://m{i}.example/");
+        let (ok, _, err) = db.run(&["add", &url, "-t", "ml", "-t", "machine-learning"]);
+        assert!(ok, "{err}");
+    }
+    db.run(&["add", "https://u.example/", "--title", "Untagged"]);
+    let (ok, out, err) = db.run(&["tag", "health"]);
+    assert!(ok, "{err}");
+    assert!(
+        out.starts_with("coverage: 4 bookmarks, 3 tagged (75%)"),
+        "{out}"
+    );
+    // Equal counts: the name that sorts first stays.
+    assert!(
+        out.contains("ml + machine-learning  together on 3 of 3 and 3 (1.00 Jaccard)  (shlv tag merge ml machine-learning)"),
+        "{out}"
+    );
+    assert!(out.contains("gaps: 1 bookmark without tags"), "{out}");
+    let (ok, out, _) = db.run(&["tag", "health", "--json", "--min-together", "4"]);
+    assert!(ok);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["redundant"], serde_json::json!([]));
+    assert_eq!(
+        v["coverage"]["histogram"],
+        serde_json::json!([1, 0, 3, 0, 0])
+    );
+    let (ok, _, err) = db.run(&["tag", "health", "--redundant", "1.5"]);
+    assert!(!ok && err.contains("not a share between 0 and 1"), "{err}");
+}

@@ -117,3 +117,29 @@ typing `web-dev` still finds an existing `web-dev`, and nothing is rewritten. `t
 the style to the new name, so `tag rename web-dev web-dev` gives `web_dev`. Names in the config
 (declared tags and aliases, rule tags) must already follow the style; the error gives the position
 and the fixed name. Aliases are names to type, not tags, so `max_length` doesn't apply to them.
+
+## Tag health
+
+`shlv tag health` measures the list, to keep it as small as it can be while still finding things. It
+only reports; each line names the command that would act on it (`tag merge`, `tag canonical rm`),
+and nothing changes until you run one. `--json` prints the report as one JSON object.
+
+- **Coverage:** bookmarks with any tag and with a canonical tag, tags per tagged bookmark, and how
+  many bookmarks have 0, 1, 2, 3, or 4+ tags.
+- **Redundant:** pairs where each tag is on at least `--redundant` (0.8) of the other's bookmarks,
+  together on at least `--min-together` (3): merge candidates. The tag on fewer bookmarks is named
+  first, as `tag merge` takes it.
+- **Too broad:** tags on at least `--broad` (0.3) of all bookmarks; they don't narrow a search.
+- **Rare:** canonical tags on at most `--rare` (2) bookmarks, oldest first, with their age.
+- **Gaps:** bookmarks without a canonical tag (without any tag when there is no canonical list),
+  grouped by site and by shared title words: groups of at least `--min-group` (3), at most
+  `--groups` (10) of each. A word that is already a tag or alias says so: those bookmarks only need
+  tagging. With the `model` feature, bookmarks the classifier would tag (at `[model] threshold`) are
+  counted apart and left out of the groups; `suggest --all` tags them. With the `ai` feature,
+  `--name-gaps [N]` asks the `[ai] tag` provider to name the N largest groups (5), or to pick a tag
+  already on the list; it sends up to 15 titles and URLs per group, with the list.
+- **Style:** names that break `[tags.style]`, a singular and a plural both present (`plugin`,
+  `plugins`), and compounds of other tags (`rust-wifi` when `rust` and `wifi` exist).
+
+On 100,000 bookmarks it takes about 0.1 s, and 0.4 s when the classifier also checks 25,000 gap
+bookmarks.

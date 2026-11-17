@@ -11,6 +11,7 @@ pub mod db;
 pub mod extract;
 #[cfg(feature = "fetch")]
 pub mod fetch;
+pub mod health;
 pub mod html;
 #[cfg(feature = "model")]
 pub mod model;

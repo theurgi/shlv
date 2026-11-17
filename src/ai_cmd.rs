@@ -735,3 +735,89 @@ pub fn run_batch(
     }
     Ok(code)
 }
+
+/// Bookmarks per gap group sent to the provider.
+const GROUP_SAMPLE: usize = 15;
+
+/// `tag health --name-gaps N`: asks the `[ai] tag` provider for a tag name for each of the `n`
+/// largest gap groups, sending up to [`GROUP_SAMPLE`] of each group's titles and URLs. The
+/// canonical list goes along, so the reply can say a listed tag already fits.
+pub fn name_gaps(
+    config: &Config,
+    store: &Store,
+    gaps: &mut shlv::health::Gaps,
+    n: usize,
+) -> Result<()> {
+    use shlv::health::GroupName;
+
+    let mut p = provider(config, Task::Tag)?;
+    let mut proposing = proposing(config, store)?;
+    proposing.max = 1;
+    p.set_proposing(proposing);
+    let list: Vec<shlv::choose::TagOption> = store
+        .canonical_tags()?
+        .iter()
+        .map(shlv::choose::TagOption::from)
+        .collect();
+    let mut groups: Vec<(&str, &mut shlv::health::Group)> = gaps
+        .by_host
+        .iter_mut()
+        .map(|g| ("site", g))
+        .chain(gaps.by_word.iter_mut().map(|g| ("word", g)))
+        .filter(|(_, g)| g.existing.is_none())
+        .collect();
+    groups.sort_by_key(|(_, g)| std::cmp::Reverse(g.ids.len()));
+    groups.truncate(n);
+    if groups.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "shlv: asking {} to name {}: up to {GROUP_SAMPLE} titles and URLs each",
+        describe_provider(config, &p),
+        plural(groups.len(), "gap group")
+    );
+    for (kind, g) in groups {
+        let mut lines = Vec::new();
+        for &id in g.ids.iter().take(GROUP_SAMPLE) {
+            let b = get(store, id)?;
+            lines.push(match &b.title {
+                Some(t) => format!("- {t} ({})", b.url),
+                None => format!("- {}", b.url),
+            });
+        }
+        let item = Item {
+            url: match kind {
+                "site" => format!("https://{}/", g.key),
+                _ => get(store, g.ids[0])?.url,
+            },
+            title: Some(format!(
+                "A group of {} bookmarks with no fitting tag, sharing the {kind} {:?}; one tag \
+                 for what they have in common",
+                g.ids.len(),
+                g.key
+            )),
+            note: Some(lines.join("\n")),
+            summary: None,
+            text: None,
+        };
+        match p.tag(&item, &list) {
+            Ok(a) => {
+                g.named = match (a.proposed.into_iter().next(), a.tags.into_iter().next()) {
+                    (Some(t), _) => Some(GroupName {
+                        name: t.name,
+                        description: t.description,
+                        listed: false,
+                    }),
+                    (None, Some(c)) => Some(GroupName {
+                        name: c.tag,
+                        description: None,
+                        listed: true,
+                    }),
+                    (None, None) => None,
+                };
+            }
+            Err(e) => eprintln!("shlv: cannot name gap group {:?}: {e:#}", g.key),
+        }
+    }
+    Ok(())
+}

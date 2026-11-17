@@ -412,3 +412,60 @@ fn proposals_can_be_turned_off() {
     assert!(!system(&body).contains("new_tags"));
     assert_eq!(f.ok(&["tag", "proposals"]), "");
 }
+
+#[test]
+fn health_names_the_largest_gap_groups() {
+    let f = Fixture::new(&format!("[ai]\ntag = \"local\"\n{CANONICAL}"));
+    for i in 0..3 {
+        let url = format!("https://arxiv.org/abs/{i}");
+        f.ok(&["add", &url, "--title", &format!("Paper number {i}")]);
+    }
+    f.ok(&[
+        "add",
+        "https://x.example/",
+        "--title",
+        "Async Rust",
+        "-t",
+        "rust",
+    ]);
+    // Largest groups first, sites before words of the same size: arxiv.org, then "number".
+    f.reply(json!({"tags": [], "new_tags": [
+        {"name": "Research Papers", "description": "academic papers"}]}));
+    f.reply(json!({"tags": ["python"], "new_tags": []}));
+    let (code, out, err) = f.run(&["tag", "health", "--name-gaps", "2", "--json"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("asking") && err.contains("2 gap groups"),
+        "{err}"
+    );
+    let h: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(h["gaps"]["bookmarks"], 3);
+    let site = &h["gaps"]["by_host"][0];
+    assert_eq!(site["key"], "arxiv.org");
+    assert_eq!(
+        site["named"],
+        json!({"name": "research-papers", "description": "academic papers", "listed": false})
+    );
+    let word = &h["gaps"]["by_word"][0];
+    assert_eq!(word["key"], "number");
+    assert_eq!(word["named"]["name"], "python");
+    assert_eq!(word["named"]["listed"], true);
+    assert!(h["gaps"]["by_word"][1].get("named").is_none());
+    // What was sent: the group's titles and URLs, and the list to choose from.
+    let body = chat(&f, 0);
+    let user = body["messages"][1]["content"].as_str().unwrap();
+    assert!(
+        user.contains("Paper number 2 (https://arxiv.org/abs/2)"),
+        "{user}"
+    );
+    assert!(system(&body).contains("- python: the Python language"));
+
+    // Without the flag nothing is sent.
+    let n = f.server.requests().len();
+    let out = f.ok(&["tag", "health"]);
+    assert!(
+        out.contains("gaps: 3 bookmarks without a canonical tag"),
+        "{out}"
+    );
+    assert_eq!(f.server.requests().len(), n);
+}
