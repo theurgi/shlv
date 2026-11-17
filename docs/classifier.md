@@ -29,3 +29,25 @@ provider = "fallback" # ask [ai] tag: "fallback" (when the classifier is unsure)
 
 "Unsure" means nothing reached `threshold`, or a tag that did has fewer than 50 examples. Every
 accepted or rejected suggestion is a training example the next time the model trains.
+
+## Back-filling a new tag
+
+A tag added to the list is missing from every bookmark you tagged before, and the classifier reads
+each of those as "this tag doesn't apply". `suggest --tag` finds the bookmarks that should have it:
+
+```console
+$ shlv suggest --tag wifi --all
+classifier checked 8412 bookmarks for #wifi: 23 new suggestions
+23 candidates for #wifi, 9 of them reviewed (listed first):
+...
+$ shlv suggest --tag wifi --all --pick   # y accepts, n rejects, s skips, q stops
+```
+
+It offers only that tag (no rules, no other tags) and ranks the candidates: bookmarks with canonical
+tags first, since they're the classifier's examples, then by probability. A new tag has no examples
+yet, so the classifier offers it from a probability of 0.1 rather than `threshold`: one match of its
+name or an alias scores 0.45, two words of its description 0.15. With an `[ai] tag` provider (and
+`provider` not `"never"`), the provider is asked too, with only that tag to choose and no proposals:
+about the IDs given, or with `--all` about the tagged bookmarks the classifier passed over. Its yes
+ranks as 0.5. A rejected candidate isn't offered again. Without the `model` feature, back-fill uses
+the provider alone.

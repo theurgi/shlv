@@ -57,6 +57,9 @@ the provider hasn't tagged before (`--force` sends them again), with the same `-
 failure reporting as `summarize`. When `[ai] summarize` and `[ai] tag` name the same provider, a
 bookmark without a summary gets both from one request.
 
+`suggest --tag TAG` back-fills one tag: the provider sees only that tag and proposes nothing. See
+[back-filling a new tag](classifier.md#back-filling-a-new-tag).
+
 ### Proposals
 
 The `tag` provider can also propose names that aren't on the list, with a one-line description each,

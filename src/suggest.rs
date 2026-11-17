@@ -201,6 +201,16 @@ pub struct Suggestion {
     pub confidence: Option<f64>,
 }
 
+/// A pending suggestion of a tag being back-filled, as [`Store::backfill_candidates`] ranks them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BackfillCandidate {
+    #[serde(flatten)]
+    pub suggestion: Suggestion,
+    /// The bookmark has canonical tags: the classifier trains on it, as a negative example of
+    /// this tag until it gets it.
+    pub reviewed: bool,
+}
+
 /// Strict mode is on and domain rules use tags that aren't canonical: (host, tag) pairs, in rule
 /// order. Returned before anything is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -656,6 +666,87 @@ impl Store {
         }
         tx.commit()?;
         Ok(picked.into_iter().map(|(_, n)| n).collect())
+    }
+
+    /// The canonical tag `name` (a tag or an alias) stands for, for back-filling it. Fails if
+    /// it's unknown or not on the canonical list: tags are only back-filled once they're on it.
+    pub fn backfill_tag(&self, name: &str) -> Result<String> {
+        let looked = self.lookup(name)?;
+        let row: Option<(String, bool)> = match resolve_tag(&self.conn, &looked)? {
+            Some(id) => Some(self.conn.query_row(
+                "SELECT name, canonical FROM tag WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?),
+            None => None,
+        };
+        match row {
+            Some((tag, true)) => Ok(tag),
+            Some((tag, false)) => bail!(
+                "{tag:?} isn't on the canonical list; add it first: shlv tag canonical add {tag}"
+            ),
+            None => bail!("no tag {looked:?}"),
+        }
+    }
+
+    /// Back-fill candidates for canonical tag `tag`: its pending suggestions (on the given
+    /// bookmarks, or all), reviewed bookmarks first since they're the classifier's examples and
+    /// count against the tag until they get it, then by confidence. A suggestion without one
+    /// (the LLM's) ranks as 0.5.
+    pub fn backfill_candidates(
+        &self,
+        tag: &str,
+        ids: Option<&[i64]>,
+    ) -> Result<Vec<BackfillCandidate>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT s.bookmark_id, b.url, b.title, t.name, s.source, s.confidence, \
+             EXISTS (SELECT 1 FROM bookmark_tag bt JOIN tag u ON u.id = bt.tag_id \
+                     WHERE bt.bookmark_id = s.bookmark_id AND u.canonical) AS reviewed \
+             FROM tag_suggestion s JOIN bookmark b ON b.id = s.bookmark_id \
+             JOIN tag t ON t.id = s.tag_id \
+             WHERE {PENDING} AND t.name = ?1 AND b.deleted_at IS NULL \
+             ORDER BY reviewed DESC, coalesce(s.confidence, 0.5) DESC, s.bookmark_id DESC"
+        ))?;
+        let wanted: Option<HashSet<i64>> = ids.map(|i| i.iter().copied().collect());
+        let mut rows = stmt.query([tag])?;
+        let mut v = Vec::new();
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            if wanted.as_ref().is_some_and(|w| !w.contains(&id)) {
+                continue;
+            }
+            let source: String = r.get(4)?;
+            v.push(BackfillCandidate {
+                suggestion: Suggestion {
+                    id,
+                    url: r.get(1)?,
+                    title: r.get(2)?,
+                    tag: r.get(3)?,
+                    source: Source::parse(&source)?,
+                    confidence: r.get(5)?,
+                },
+                reviewed: r.get(6)?,
+            });
+        }
+        Ok(v)
+    }
+
+    /// Reviewed bookmarks (with canonical tags) that `tag` hasn't been offered for: not tagged
+    /// with it, and no suggestion of it pending or rejected. Newest first. With an LLM, these are
+    /// the ones worth asking about beyond the classifier's candidates.
+    pub fn backfill_unoffered(&self, tag: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT b.id FROM bookmark b WHERE b.deleted_at IS NULL \
+             AND EXISTS (SELECT 1 FROM bookmark_tag bt JOIN tag u ON u.id = bt.tag_id \
+                         WHERE bt.bookmark_id = b.id AND u.canonical) \
+             AND NOT EXISTS (SELECT 1 FROM bookmark_tag bt JOIN tag t ON t.id = bt.tag_id \
+                             WHERE bt.bookmark_id = b.id AND t.name = ?1) \
+             AND NOT EXISTS (SELECT 1 FROM tag_suggestion s JOIN tag t ON t.id = s.tag_id \
+                             WHERE s.bookmark_id = b.id AND t.name = ?1) \
+             ORDER BY b.id DESC",
+        )?;
+        let ids = stmt.query_map([tag], |r| r.get(0))?;
+        Ok(ids.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The pending suggestions `accept`/`reject` act on: (tag id, name), sorted by name.

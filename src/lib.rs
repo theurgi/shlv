@@ -34,7 +34,8 @@ pub use seed::{Candidate, Decision, Interest, SeedName, Seeded};
 pub use store::{Added, Bookmark, Edit, Edited, ListQuery, MissingBookmarks, NewBookmark, Store};
 pub use style::{Separator, StyleConfig, TagStyle};
 pub use suggest::{
-    DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source, SuggestMode, Suggestion,
+    BackfillCandidate, DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source,
+    SuggestMode, Suggestion,
 };
 pub use tag::{
     CanonicalEntry, DeclaredEntry, DeclaredTags, ImportStats, NonCanonicalTags, Pinned, Retagged,

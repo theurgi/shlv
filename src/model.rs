@@ -414,6 +414,18 @@ impl Classifier {
             .collect()
     }
 
+    /// The classifier narrowed to one tag of its list (for back-filling it), or `None` if the
+    /// tag isn't on it.
+    pub fn only(&self, tag: &str) -> Option<Classifier> {
+        let i = self.list.iter().position(|t| t.name == tag)?;
+        let list = &self.list[i..=i];
+        Some(Classifier {
+            list: list.to_vec(),
+            lexical: Lexical::new(list),
+            trained: vec![self.trained[i].clone()],
+        })
+    }
+
     /// Whether a tag's probability comes only from the lexical match (it has no examples).
     pub fn is_cold(&self, tag: &str) -> bool {
         self.list
@@ -671,7 +683,34 @@ pub struct ModelStats {
     pub sure: HashSet<i64>,
 }
 
+/// Back-fill offers a tag from this probability up, below `[model] threshold`: a tag new to the
+/// list has no examples, and the lexical score of one name match is 0.45, of two description
+/// words 0.15. One description word (0.05, about as often right) is left out.
+pub const BACKFILL_MIN: f64 = 0.1;
+
 impl crate::Store {
+    /// Back-fills canonical tag `tag` ([`crate::Store::backfill_tag`]): runs the classifier for
+    /// that tag alone on the given bookmarks (or all) and offers it from [`BACKFILL_MIN`] up, the
+    /// way [`crate::Store::apply_model`] offers tags (auto mode applies it only from
+    /// `config.auto_threshold`). Bookmarks with the tag, or that rejected it, are skipped. Rank
+    /// the result with [`crate::Store::backfill_candidates`].
+    pub fn backfill_model(
+        &mut self,
+        tag: &str,
+        ids: Option<&[i64]>,
+        classifier: &Classifier,
+        config: &crate::config::ModelConfig,
+    ) -> Result<ModelStats> {
+        let Some(one) = classifier.only(tag) else {
+            bail!("{tag:?} isn't on the classifier's canonical list");
+        };
+        let config = crate::config::ModelConfig {
+            threshold: BACKFILL_MIN,
+            ..*config
+        };
+        self.apply_model(ids, &one, &config)
+    }
+
     /// Runs the classifier on the given bookmarks (or all) and offers its tags at or above
     /// `config.threshold` as source `model`, with their probability, in one transaction. In auto
     /// mode only tags at or above `config.auto_threshold` are applied; the others wait.

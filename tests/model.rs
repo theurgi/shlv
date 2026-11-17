@@ -225,3 +225,193 @@ fn cli_train_status_eval() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A small library with canonical tags, then `music` added to the list: two reviewed bookmarks
+/// and two unreviewed ones mention it.
+fn backfill_store() -> Store {
+    let mut s = Store::open_in_memory().unwrap();
+    for (url, title, tags) in [
+        ("https://a.com/1", "Rust async book", vec!["rust"]),
+        (
+            "https://b.com/2",
+            "Music theory for programmers",
+            vec!["rust"],
+        ),
+        ("https://c.com/3", "Lisbon guide", vec!["travel"]),
+        (
+            "https://d.com/4",
+            "Best albums and songs of 2024",
+            vec!["travel"],
+        ),
+        ("https://e.com/5", "Music festivals in Europe", vec![]),
+        ("https://f.com/6", "New songs and albums this week", vec![]),
+        ("https://g.com/7", "Pasta recipe", vec![]),
+    ] {
+        s.add(&NewBookmark {
+            url: url.into(),
+            title: Some(title.into()),
+            tags: tags.into_iter().map(String::from).collect(),
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    s.add_canonical(&["rust".into(), "travel".into(), "music".into()])
+        .unwrap();
+    s.describe_tag("music", "songs, albums, and musicians")
+        .unwrap();
+    s
+}
+
+fn ranked(s: &Store, tag: &str) -> Vec<(i64, bool, Option<f64>)> {
+    s.backfill_candidates(tag, None)
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.suggestion.id, c.reviewed, c.suggestion.confidence))
+        .collect()
+}
+
+#[test]
+fn backfills_a_new_tag() {
+    let mut s = backfill_store();
+    let config = shlv::config::ModelConfig::default();
+    let c = s.classifier(true).unwrap();
+    // music has no examples: only its lexical score, below the usual threshold of 0.5.
+    assert!(c.is_cold("music"));
+    let st = s.backfill_model("music", None, &c, &config).unwrap();
+    assert_eq!((st.checked, st.pending, st.applied), (7, 4, 0));
+    // Only music is offered, reviewed bookmarks first, then by score (a name match, 0.45, over
+    // two description words, 0.15).
+    assert!(s.pending(None).unwrap().iter().all(|p| p.tag == "music"));
+    assert_eq!(
+        ranked(&s, "music"),
+        [
+            (2, true, Some(0.45)),
+            (4, true, Some(0.15)),
+            (5, false, Some(0.45)),
+            (6, false, Some(0.15)),
+        ]
+    );
+    // Narrowed to ids.
+    let some = s.backfill_candidates("music", Some(&[4, 6, 7])).unwrap();
+    assert_eq!(
+        some.iter().map(|c| c.suggestion.id).collect::<Vec<_>>(),
+        [4, 6]
+    );
+
+    // Accepted and rejected ones aren't offered again; the LLM would be asked about the
+    // reviewed bookmark the classifier passed over.
+    s.accept(2, &["music".into()]).unwrap();
+    s.reject(4, &["music".into()]).unwrap();
+    assert_eq!(s.backfill_unoffered("music").unwrap(), [3, 1]);
+    let c = s.classifier(true).unwrap();
+    let st = s.backfill_model("music", None, &c, &config).unwrap();
+    assert_eq!(st.pending, 0);
+    let ids: Vec<i64> = ranked(&s, "music").iter().map(|r| r.0).collect();
+    assert_eq!(ids, [5, 6]);
+
+    // Only canonical tags are back-filled; aliases resolve to theirs.
+    s.add_alias("tunes", "music").unwrap();
+    assert_eq!(s.backfill_tag("tunes").unwrap(), "music");
+    s.add(&NewBookmark {
+        url: "https://h.com/8".into(),
+        tags: vec!["misc".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let e = s.backfill_tag("misc").unwrap_err().to_string();
+    assert!(e.contains("isn't on the canonical list"), "{e}");
+    assert!(s.backfill_tag("nope").is_err());
+}
+
+#[test]
+fn cli_backfill() {
+    let dir = std::env::temp_dir().join(format!("shlv-backfill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("shlv.db");
+    {
+        let mut s = Store::open(&db).unwrap();
+        let mem = backfill_store();
+        for b in mem
+            .list(&shlv::ListQuery {
+                tags: vec![],
+                limit: usize::MAX,
+            })
+            .unwrap()
+            .into_iter()
+            .rev()
+        {
+            s.add(&NewBookmark {
+                url: b.url,
+                title: b.title,
+                tags: b.tags,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        s.add_canonical(&["rust".into(), "travel".into(), "music".into()])
+            .unwrap();
+        s.describe_tag("music", "songs, albums, and musicians")
+            .unwrap();
+    }
+    let (ok, out, err) = shlv(&db, &["suggest", "--tag", "music", "--all"]);
+    assert!(ok, "{err}");
+    assert_eq!(
+        out,
+        "classifier checked 7 bookmarks for #music: 4 new suggestions\n\
+         4 candidates for #music, 2 of them reviewed (listed first):\n\
+         2  Music theory for programmers  https://b.com/2  #music (model 0.45)\n\
+         4  Best albums and songs of 2024  https://d.com/4  #music (model 0.15)\n\
+         5  Music festivals in Europe  https://e.com/5  #music (model 0.45)\n\
+         6  New songs and albums this week  https://f.com/6  #music (model 0.15)\n\
+         (shlv suggest --tag music --pick ... to go through them, or suggest accept/reject ID \
+         music)\n"
+    );
+    // Go through them: accept, reject, skip, then stop.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_shlv"))
+        .args(["suggest", "--tag", "music", "--all", "--pick"])
+        .env("SHLV_DB", &db)
+        .env("SHLV_CONFIG", "/nonexistent")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"y\nn\ns\nq\n")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    let (out, err) = (
+        String::from_utf8(o.stdout).unwrap(),
+        String::from_utf8(o.stderr).unwrap(),
+    );
+    assert!(o.status.success(), "{err}");
+    assert_eq!(
+        out,
+        "classifier checked 7 bookmarks for #music: 0 new suggestions\n\
+         #music: 1 accepted, 1 rejected, 2 still pending\n"
+    );
+    assert!(err.contains("#music (model 0.45, reviewed)?"), "{err}");
+    assert!(err.contains("stopped"), "{err}");
+    let (_, out, _) = shlv(&db, &["show", "2"]);
+    assert!(out.contains("tags:     music rust"), "{out}");
+    // The rejected one isn't offered again; the skipped one still is.
+    let (_, out, _) = shlv(&db, &["suggest", "--tag", "music", "4", "5"]);
+    assert_eq!(
+        out,
+        "classifier checked 2 bookmarks for #music: 0 new suggestions\n\
+         1 candidate for #music, 0 of them reviewed (listed first):\n\
+         5  Music festivals in Europe  https://e.com/5  #music (model 0.45)\n\
+         (shlv suggest --tag music --pick ... to go through them, or suggest accept/reject ID \
+         music)\n"
+    );
+    let (ok, _, err) = shlv(&db, &["suggest", "--tag", "rock", "--all"]);
+    assert!(!ok && err.contains("no tag \"rock\""), "{err}");
+    let (ok, _, err) = shlv(&db, &["suggest", "--pick", "--all"]);
+    assert!(!ok && err.contains("--tag"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

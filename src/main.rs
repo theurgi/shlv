@@ -17,10 +17,12 @@ use shlv::{netscape, transfer};
 
 #[cfg(feature = "ai")]
 mod ai_cmd;
+mod backfill_cmd;
 mod edit_cmd;
 #[cfg(feature = "model")]
 mod model_cmd;
-// The interactive screen: `edit --pick` and `tag seed` (later `tag draft` and `review`).
+// The interactive screen: `edit --pick`, `suggest --tag --pick`, and `tag seed` (later `tag draft`
+// and `review`).
 mod screen;
 #[cfg(feature = "ai")]
 mod seed_cmd;
@@ -113,6 +115,13 @@ enum Cmd {
         /// Suggest tags for every bookmark (rules: one transaction)
         #[arg(long)]
         all: bool,
+        /// Back-fill one canonical tag: offer only TAG (classifier and [ai] tag provider, no
+        /// rules) and list its candidates, reviewed bookmarks first
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// With --tag, go through the candidates one key each: y accepts, n rejects
+        #[arg(long, requires = "tag")]
+        pick: bool,
         #[cfg(feature = "ai")]
         #[command(flatten)]
         llm: ai_cmd::LlmArgs,
@@ -723,8 +732,37 @@ fn run(cli: Cli) -> Result<ExitCode> {
             cmd: None,
             ids,
             all,
+            tag: Some(tag),
+            pick,
             #[cfg(feature = "ai")]
             llm,
+        } => {
+            let b = backfill_cmd::Backfill {
+                tag: &tag,
+                ids: &ids,
+                all,
+                pick,
+            };
+            let code = backfill_cmd::run(
+                &mut store,
+                &config,
+                b,
+                #[cfg(feature = "ai")]
+                &llm,
+                &mut out,
+                &style,
+            )?;
+            out.flush()?;
+            return Ok(code);
+        }
+        Cmd::Suggest {
+            cmd: None,
+            ids,
+            all,
+            tag: None,
+            #[cfg(feature = "ai")]
+            llm,
+            ..
         } => {
             // The classifier runs whenever it's built and there's a canonical list to choose from.
             #[cfg(feature = "model")]
@@ -784,6 +822,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                         all,
                         &llm,
                         sure.as_ref(),
+                        None,
                         &mut out,
                     )?
                 }

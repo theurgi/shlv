@@ -267,6 +267,12 @@ pub struct LlmArgs {
     pub batch: bool,
 }
 
+/// The `[ai] tag` provider for back-filling one tag: it only says whether the tag fits, and
+/// proposes nothing.
+pub fn backfill_provider(config: &Config) -> Result<Option<Provider>> {
+    for_task(config, Task::Tag)
+}
+
 /// The `[ai] tag` provider, if one is configured, set to propose new names as `[ai] proposals`
 /// says (see [`proposing`]).
 pub fn tag_provider(config: &Config, store: &Store) -> Result<Option<Provider>> {
@@ -328,7 +334,8 @@ fn record(
 
 /// The LLM layer of `suggest`: asks the `[ai] tag` provider to choose from the canonical list,
 /// and offers its choices like the other layers (source `llm`, no confidence). New names it
-/// proposes become proposals for the list; with an empty list, that is all it does.
+/// proposes become proposals for the list; with an empty list, that is all it does. With `only`,
+/// the list is that one tag (back-filling it).
 #[allow(clippy::too_many_arguments)]
 pub fn run_suggest_llm(
     store: &mut Store,
@@ -338,6 +345,7 @@ pub fn run_suggest_llm(
     all: bool,
     args: &LlmArgs,
     skip: Option<&std::collections::HashSet<i64>>,
+    only: Option<&str>,
     out: &mut impl Write,
 ) -> Result<ExitCode> {
     use shlv::Source;
@@ -346,6 +354,7 @@ pub fn run_suggest_llm(
     let list: Vec<TagOption> = store
         .canonical_tags()?
         .iter()
+        .filter(|t| only.is_none_or(|o| t.name == o))
         .map(TagOption::from)
         .collect();
     if list.is_empty() && !provider.proposes() {

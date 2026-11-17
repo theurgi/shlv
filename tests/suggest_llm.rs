@@ -469,3 +469,66 @@ fn health_names_the_largest_gap_groups() {
     );
     assert_eq!(f.server.requests().len(), n);
 }
+
+#[test]
+#[cfg(feature = "model")]
+fn backfill_asks_about_reviewed_bookmarks_the_classifier_passed_over() {
+    let f = Fixture::new(&format!(
+        "[ai]\ntag = \"local\"\nproposals = 3\n{CANONICAL}"
+    ));
+    f.ok(&[
+        "add",
+        &f.url("/p/tokio?1"),
+        "--title",
+        "Tokio runtime",
+        "-t",
+        "rust",
+    ]);
+    f.ok(&[
+        "add",
+        &f.url("/p/tokio?2"),
+        "--title",
+        "Async Rust",
+        "-t",
+        "rust",
+    ]);
+    f.ok(&["add", &f.url("/p/tokio?3"), "--title", "Tokio"]);
+    f.reply(json!({"tags": ["async"]}));
+    let (code, out, err) = f.run(&["suggest", "--tag", "async", "--all"]);
+    assert_eq!(code, 0, "{err}");
+    // The classifier found 2 by name; the provider was asked only about 1 (reviewed, passed
+    // over), with only the tag on offer and no proposals.
+    assert!(
+        err.contains("suggesting tags for 1 bookmark with provider local"),
+        "{err}"
+    );
+    assert_eq!(f.offered(0), json!(["async"]));
+    let chat = f
+        .server
+        .requests()
+        .into_iter()
+        .find(|r| r.path == "/v1/chat/completions")
+        .unwrap();
+    assert!(
+        chat.json()["response_format"]["json_schema"]["schema"]["properties"]
+            .get("proposed")
+            .is_none()
+    );
+    // The LLM's yes ranks as 0.5, above a name match (0.45); both are reviewed.
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines[..2],
+        [
+            "classifier checked 3 bookmarks for #async: 1 new suggestion",
+            "llm: 1 bookmark sent, 0 failed: 1 new suggestion",
+        ],
+        "{out}"
+    );
+    assert_eq!(
+        lines[2],
+        "2 candidates for #async, 2 of them reviewed (listed first):"
+    );
+    assert!(lines[3].starts_with("1  Tokio runtime") && lines[3].ends_with("#async (llm)"));
+    assert!(lines[4].starts_with("2  Async Rust") && lines[4].ends_with("#async (model 0.45)"));
+    assert_eq!(f.server.requests().len(), 2, "one page fetch, one chat");
+}

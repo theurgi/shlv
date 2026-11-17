@@ -255,7 +255,7 @@ fn pick(screen: &mut Screen, store: &Store, ids: &[i64], marks: &str) -> Result<
 }
 
 /// One bookmark on one line, cut to fit the terminal so it can be redrawn in place.
-fn row(screen: &Screen, b: &Bookmark, width: usize) -> String {
+pub(crate) fn row(screen: &Screen, b: &Bookmark, width: usize) -> String {
     let s = &screen.style;
     let mut text = String::new();
     if let Some(t) = &b.title {
