@@ -102,6 +102,59 @@ per line, with the bookmark ids. Each decision is one command:
 
 Removing a proposed name from a bookmark with `edit -t -NAME` withdraws it for that bookmark.
 
+## Review
+
+`shlv review` goes through bookmarks in batches of 30 (`-n N`), one screen each: title, URL, the
+tags it has, and the pending suggestions with their source and confidence, all checked.
+
+```console
+$ shlv review
+batch 1: 30 of 812 to review, spread across domains, untagged first
+[1/30] 214  Tokio: an asynchronous runtime for Rust
+      https://github.com/tokio-rs/tokio
+  1 [x] #code  rule
+  2 [x] #rust  model 0.82
+  Enter save  1-9 toggle  t add  s skip  o open  q end batch  ? help
+```
+
+One key each: Enter saves (accepting every checked suggestion, so it's "accept all" until you toggle
+one), a digit checks or unchecks a tag, `t` adds a tag, `s` skips the bookmark for a later batch,
+`o` opens it, `q` ends the batch, and Ctrl-C stops at once. `t` takes a canonical tag by name,
+alias, or prefix (Tab completes; several matches are listed), a pending proposal by name, or, after
+a `y`, a new name, which becomes a proposal for that bookmark. Each bookmark's decisions are saved
+in one transaction when you press Enter: checked suggestions become tags, unchecked ones are
+rejected, an unchecked tag is removed, and the bookmark is marked reviewed so later batches skip it.
+
+Tag each bookmark completely. A tag missing from a reviewed bookmark tells the
+[classifier](classifier.md) that it doesn't apply, and an unchecked suggestion is a rejection it
+learns from. A bookmark with no tags asks for a second Enter.
+
+Batches start with bookmarks without canonical tags, spread across domains (one per host per round,
+hosts nothing was reviewed from first), to find the vocabulary. With the classifier built, once 100
+bookmarks are reviewed, a batch is the bookmarks the classifier is least sure about instead (the tag
+whose probability is nearest 0.5 decides; scored on a random 2,000 of those left). Filters narrow a
+review to pending suggestions, on reviewed bookmarks too, least confident first: `--tag TAG`,
+`--source rule|model|llm`, and `--below P` (the bookmark's most confident matching suggestion is
+below P; an `llm` one counts as 0.5). Filters see the suggestions there are, so run `suggest --all`
+first to have them everywhere.
+
+Before a batch, its bookmarks get suggestions from domain rules, the classifier (feature `model`),
+and the `[ai] tag` provider (feature `ai`) for the ones the classifier wasn't sure about and the
+provider hasn't seen, as `[model] provider` says. Without AI, review works with rules and the
+classifier, and new names come only from what you type. After a batch:
+
+1. **Proposals:** the names proposed for the batch's bookmarks, with how many bookmarks each is on:
+   `a` adds it to the list (its bookmarks get the tag), `l` makes it an alias of a canonical tag,
+   `r` rejects it, `s` leaves it for `tag proposals`.
+2. **Back-fill:** each tag just added is offered on the bookmarks reviewed before it existed, as
+   [`suggest --tag`](classifier.md#back-filling-a-new-tag) does, and you answer y/n for each
+   candidate. It needs the classifier or an `[ai] tag` provider.
+3. **Retrain:** the classifier trains on the new decisions, so the next batch's suggestions are
+   better.
+4. **Progress:** a table of every batch so far: bookmarks reviewed and skipped, names proposed, tags
+   added, and how many of the classifier's suggestions were accepted. When proposals taper off and
+   acceptance rises, the list has settled; stop when you like. `review --history` prints the table.
+
 ## Tag style
 
 Without `[tags.style]`, tag names are only normalized: lowercase, a leading `#` dropped, spaces

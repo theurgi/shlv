@@ -28,38 +28,39 @@ $ shlv search fts5
 1  SQLite FTS5  https://www.sqlite.org/fts5.html  #search  #sqlite
 ```
 
-| Command                        | What it does                                                         |
-| ------------------------------ | -------------------------------------------------------------------- |
-| `add URL [-t TAG]...`          | Add a bookmark, or update it if the URL is already saved             |
-| `ls [-t TAG]... [-n N]`        | List bookmarks, newest first                                         |
-| `search QUERY...`              | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`       |
-| `show ID`                      | Show one bookmark in full                                            |
-| `edit ID...\|- [-t ±TAG]...`   | Change tags (or title, note) of bookmarks; `-` reads ids from stdin  |
-| `rm ID\|URL...`                | Delete bookmarks                                                     |
-| `open ID`                      | Open a bookmark with `$BROWSER` or the system opener                 |
-| `tag ls [--sort count]`        | Tags with bookmark counts; `*` marks canonical, `=` lists aliases    |
-| `tag rename OLD NEW`           | Rename a tag                                                         |
-| `tag merge FROM INTO`          | Retag FROM's bookmarks as INTO; FROM becomes an alias                |
-| `tag alias ALIAS TAG`          | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)         |
-| `tag canonical add\|rm\|ls`    | Mark, unmark, or list canonical tags                                 |
-| `tag canonical import FILE`    | Add a canonical list: one tag per line, aliases after it             |
-| `tag canonical export`         | Print the canonical list in that format (`--toml`/`--nix`: config)   |
-| `tag proposals [ls]`           | Names proposed for the list, most bookmarks first                    |
-| `tag proposals accept NAME`    | Add a proposed name to the list and tag its bookmarks                |
-| `tag proposals alias NAME TAG` | Make a proposed name an alias of TAG and tag its bookmarks with it   |
-| `tag proposals reject NAME`    | Remember a name: it isn't proposed again                             |
-| `tag health`                   | Measure the list: redundant, broad, rare, misnamed tags, and gaps    |
-| `import FILE`                  | Import Netscape HTML, JSON lines, or a list of URLs; `-` is stdin    |
-| `export [--format html]`       | Print every bookmark as JSON lines, or HTML that browsers import     |
-| `suggest ID...\|--all`         | Suggest tags: domain rules, then the `[ai] tag` provider (`ai`)      |
-| `suggest ls [ID]`              | List pending suggestions                                             |
-| `suggest accept ID [TAG]...`   | Accept a bookmark's suggestions (`--all` accepts every one)          |
-| `suggest reject ID [TAG]...`   | Reject suggestions; they aren't offered again for that bookmark      |
-| `config path\|show`            | Print the config file path, or the effective config                  |
-| `fetch ID...\|--all`           | Set titles from the pages (`--all`: bookmarks without one) (`fetch`) |
-| `summarize ID...\|--all`       | Summarize pages with the `[ai] summarize` provider (`ai`)            |
-| `batch status\|collect`        | Check on or apply Message Batches from `--batch` (`ai`)              |
-| `model train\|status\|eval`    | Train, inspect, or measure the tag classifier (`model`)              |
+| Command                        | What it does                                                          |
+| ------------------------------ | --------------------------------------------------------------------- |
+| `add URL [-t TAG]...`          | Add a bookmark, or update it if the URL is already saved              |
+| `ls [-t TAG]... [-n N]`        | List bookmarks, newest first                                          |
+| `search QUERY...`              | Words, `"phrases"`, `#tag`, `tag:x`, `site:host`, `AND/OR/NOT`        |
+| `show ID`                      | Show one bookmark in full                                             |
+| `edit ID...\|- [-t ±TAG]...`   | Change tags (or title, note) of bookmarks; `-` reads ids from stdin   |
+| `rm ID\|URL...`                | Delete bookmarks                                                      |
+| `open ID`                      | Open a bookmark with `$BROWSER` or the system opener                  |
+| `tag ls [--sort count]`        | Tags with bookmark counts; `*` marks canonical, `=` lists aliases     |
+| `tag rename OLD NEW`           | Rename a tag                                                          |
+| `tag merge FROM INTO`          | Retag FROM's bookmarks as INTO; FROM becomes an alias                 |
+| `tag alias ALIAS TAG`          | Make ALIAS resolve to TAG on input (`--rm ALIAS` removes it)          |
+| `tag canonical add\|rm\|ls`    | Mark, unmark, or list canonical tags                                  |
+| `tag canonical import FILE`    | Add a canonical list: one tag per line, aliases after it              |
+| `tag canonical export`         | Print the canonical list in that format (`--toml`/`--nix`: config)    |
+| `tag proposals [ls]`           | Names proposed for the list, most bookmarks first                     |
+| `tag proposals accept NAME`    | Add a proposed name to the list and tag its bookmarks                 |
+| `tag proposals alias NAME TAG` | Make a proposed name an alias of TAG and tag its bookmarks with it    |
+| `tag proposals reject NAME`    | Remember a name: it isn't proposed again                              |
+| `tag health`                   | Measure the list: redundant, broad, rare, misnamed tags, and gaps     |
+| `review [-n N]`                | Review bookmarks in batches, one key per decision; see docs/config.md |
+| `import FILE`                  | Import Netscape HTML, JSON lines, or a list of URLs; `-` is stdin     |
+| `export [--format html]`       | Print every bookmark as JSON lines, or HTML that browsers import      |
+| `suggest ID...\|--all`         | Suggest tags: domain rules, then the `[ai] tag` provider (`ai`)       |
+| `suggest ls [ID]`              | List pending suggestions                                              |
+| `suggest accept ID [TAG]...`   | Accept a bookmark's suggestions (`--all` accepts every one)           |
+| `suggest reject ID [TAG]...`   | Reject suggestions; they aren't offered again for that bookmark       |
+| `config path\|show`            | Print the config file path, or the effective config                   |
+| `fetch ID...\|--all`           | Set titles from the pages (`--all`: bookmarks without one) (`fetch`)  |
+| `summarize ID...\|--all`       | Summarize pages with the `[ai] summarize` provider (`ai`)             |
+| `batch status\|collect`        | Check on or apply Message Batches from `--batch` (`ai`)               |
+| `model train\|status\|eval`    | Train, inspect, or measure the tag classifier (`model`)               |
 
 `ls`, `search`, `tag ls`, `tag proposals ls`, and `suggest ls` take `--json` for one JSON object per
 line. `-n 0` shows every result.

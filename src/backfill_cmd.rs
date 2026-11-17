@@ -37,7 +37,7 @@ pub fn run(
         store,
         config,
         &tag,
-        b.ids,
+        scope,
         b.all,
         #[cfg(feature = "ai")]
         llm,
@@ -46,21 +46,23 @@ pub fn run(
     let candidates = store.backfill_candidates(&tag, scope)?;
     if b.pick {
         out.flush()?;
-        pick(store, &tag, &candidates, out)?;
+        pick(store, &mut Screen::open(), &tag, &candidates, out)?;
     } else {
         list(store, &tag, &candidates, out, style)?;
     }
     Ok(code)
 }
 
-/// Offers `tag` with every layer there is: the classifier, then the provider.
+/// Offers `tag` with every layer there is: the classifier on `scope` (the given bookmarks, or
+/// all), then the provider on `scope`, or with `unoffered`, on reviewed bookmarks the classifier
+/// passed over.
 #[allow(unused_variables, unused_mut)]
-fn offer(
+pub(crate) fn offer(
     store: &mut Store,
     config: &Config,
     tag: &str,
-    ids: &[i64],
-    all: bool,
+    scope: Option<&[i64]>,
+    unoffered: bool,
     #[cfg(feature = "ai")] llm: &crate::ai_cmd::LlmArgs,
     out: &mut impl Write,
 ) -> Result<ExitCode> {
@@ -83,7 +85,7 @@ fn offer(
     #[cfg(feature = "model")]
     {
         let classifier = store.classifier(true)?;
-        let s = store.backfill_model(tag, (!all).then_some(ids), &classifier, &config.model)?;
+        let s = store.backfill_model(tag, scope, &classifier, &config.model)?;
         let what = match store.suggest_mode() {
             shlv::SuggestMode::Confirm => plural(s.pending, "new suggestion"),
             shlv::SuggestMode::Auto => format!(
@@ -102,10 +104,10 @@ fn offer(
     if let Some(p) = provider {
         // With --all, only reviewed bookmarks the classifier passed over: they're the examples
         // that teach it, and the rest get the tag offered as they're reviewed.
-        let targets = if all {
+        let targets = if unoffered {
             store.backfill_unoffered(tag)?
         } else {
-            ids.to_vec()
+            scope.unwrap_or_default().to_vec()
         };
         out.flush()?;
         return crate::ai_cmd::run_suggest_llm(
@@ -162,11 +164,11 @@ const HELP: &str = "\
 /// batch added.
 pub(crate) fn pick(
     store: &mut Store,
+    screen: &mut Screen,
     tag: &str,
     candidates: &[BackfillCandidate],
     out: &mut impl Write,
 ) -> Result<()> {
-    let mut screen = Screen::open();
     if candidates.is_empty() {
         writeln!(out, "no candidates for #{tag}")?;
         return Ok(());
@@ -186,7 +188,7 @@ pub(crate) fn pick(
             i += 1;
             continue;
         };
-        let line = crate::edit_cmd::row(&screen, &b, width);
+        let line = crate::edit_cmd::row(screen, &b, width);
         let mut why = c.suggestion.source.as_str().to_string();
         if let Some(p) = c.suggestion.confidence {
             why.push_str(&format!(" {p:.2}"));

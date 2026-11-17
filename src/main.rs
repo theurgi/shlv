@@ -23,8 +23,9 @@ mod draft_cmd;
 mod edit_cmd;
 #[cfg(feature = "model")]
 mod model_cmd;
-// The interactive screen: `edit --pick`, `suggest --tag --pick`, `tag seed`, and `tag draft` (later
-// `review`).
+// The interactive screen: `edit --pick`, `suggest --tag --pick`, `tag seed`, `tag draft`, and
+// `review`.
+mod review_cmd;
 mod screen;
 #[cfg(feature = "ai")]
 mod seed_cmd;
@@ -97,6 +98,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
+    /// Review bookmarks in batches: accept, toggle, or add tags one key each, then decide the
+    /// names proposed, back-fill new tags, and retrain
+    Review(review_cmd::ReviewArgs),
     /// Suggest tags for bookmarks (domain rules from config), and review the suggestions
     #[command(
         args_conflicts_with_subcommands = true,
@@ -862,6 +866,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     }
                 }
             }
+            out.flush()?;
+            return Ok(code);
+        }
+        Cmd::Review(args) => {
+            out.flush()?;
+            let code = review_cmd::run(&mut store, &config, args, &mut out, &style)?;
             out.flush()?;
             return Ok(code);
         }
@@ -1736,7 +1746,10 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn plural(n: usize, word: &str) -> String {
-    match (n, word.ends_with('s')) {
+    let es = ['s', 'x'].iter().any(|c| word.ends_with(*c))
+        || word.ends_with("ch")
+        || word.ends_with("sh");
+    match (n, es) {
         (1, _) => format!("1 {word}"),
         (_, true) => format!("{n} {word}es"),
         _ => format!("{n} {word}s"),

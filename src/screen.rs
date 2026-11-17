@@ -1,4 +1,4 @@
-//! The interactive screen (task 034, reused by `edit --pick`, `tag draft`, and `review`): a
+//! The interactive screen (task 034, reused by `edit --pick`, `suggest --tag --pick`, `tag draft`, and `review`): a
 //! plain terminal prompt loop, no TUI library.
 //!
 //! On a terminal, answers are single keypresses: the terminal is put in non-canonical mode with
@@ -112,8 +112,6 @@ impl Screen {
         })
     }
 
-    // Only `tag seed` asks for text so far.
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     /// Reads a line of text after `prompt`, with the terminal in its usual mode (echo, line
     /// editing, Ctrl-C). `None` at the end of input; the text is trimmed.
     pub fn line(&mut self, prompt: &str) -> io::Result<Option<String>> {
@@ -138,6 +136,80 @@ impl Screen {
         } else {
             writeln!(self.out)
         }
+    }
+
+    /// Reads a tag name after `prompt`, showing what `matches` returns for the text so far and
+    /// completing their common prefix on Tab. On a terminal it edits in place (Backspace,
+    /// Ctrl-U; Esc or Ctrl-C cancels); otherwise it reads a line. `None` if cancelled or at the
+    /// end of input; the text is trimmed.
+    pub fn complete(
+        &mut self,
+        prompt: &str,
+        initial: &str,
+        matches: impl Fn(&str) -> Vec<String>,
+    ) -> io::Result<Option<String>> {
+        if !self.keys() {
+            let line = self.line(prompt);
+            writeln!(self.out)?;
+            return line;
+        }
+        let mut buf = initial.to_string();
+        loop {
+            let found = matches(&buf);
+            let hint = if buf.is_empty() || found.is_empty() {
+                String::new()
+            } else {
+                let mut h: Vec<&str> = found.iter().take(6).map(String::as_str).collect();
+                if found.len() > 6 {
+                    h.push("…");
+                }
+                format!("  {}", h.join(" "))
+            };
+            let room = self
+                .width()
+                .saturating_sub(prompt.chars().count() + buf.chars().count());
+            let hint: String = hint.chars().take(room.saturating_sub(1)).collect();
+            let back = hint.chars().count();
+            write!(self.out, "\r\x1b[2K{prompt}{buf}{}", self.dim(&hint))?;
+            if back > 0 {
+                write!(self.out, "\x1b[{back}D")?;
+            }
+            match self.key()? {
+                Key::Enter => {
+                    writeln!(self.out)?;
+                    return Ok(Some(buf.trim().to_string()));
+                }
+                Key::Interrupt | Key::Eof | Key::Char('\x1b') => {
+                    write!(self.out, "\r\x1b[2K")?;
+                    return Ok(None);
+                }
+                Key::Char('\x7f' | '\x08') => {
+                    buf.pop();
+                }
+                Key::Char('\x15') => buf.clear(),
+                Key::Char('\t') => {
+                    if let Some(p) = common_prefix(&found)
+                        && p.len() > buf.len()
+                    {
+                        buf = p;
+                    }
+                }
+                Key::Char(c) if !c.is_control() => buf.push(c),
+                Key::Char(_) => {}
+            }
+        }
+    }
+
+    /// Erases the `n` lines above the cursor and the current one, so a block can be redrawn.
+    /// On a terminal; otherwise it starts a new line and the block is printed again below.
+    pub fn erase_up(&mut self, n: usize) -> io::Result<()> {
+        if !self.keys() {
+            return writeln!(self.out);
+        }
+        if n > 0 {
+            write!(self.out, "\x1b[{n}A")?;
+        }
+        write!(self.out, "\r\x1b[J")
     }
 }
 
@@ -178,7 +250,6 @@ impl Raw {
         stty(self.tty.as_ref(), &[&self.saved]);
     }
 
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     fn raw(&self) {
         stty(self.tty.as_ref(), RAW);
     }
@@ -205,4 +276,33 @@ fn stty(tty: Option<&File>, args: &[&str]) -> Option<String> {
     o.status
         .success()
         .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// The longest prefix all of `names` share, if there are any.
+fn common_prefix(names: &[String]) -> Option<String> {
+    let first = names.first()?;
+    let mut end = first.len();
+    for n in &names[1..] {
+        end = first
+            .char_indices()
+            .zip(n.chars())
+            .find(|((_, a), b)| a != b)
+            .map_or(end.min(n.len()), |((i, _), _)| i.min(end));
+    }
+    Some(first[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn common_prefix() {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::common_prefix(&v(&["rust", "rustc", "ruby"])),
+            Some("ru".into())
+        );
+        assert_eq!(super::common_prefix(&v(&["web"])), Some("web".into()));
+        assert_eq!(super::common_prefix(&v(&["a", "b"])), Some("".into()));
+        assert_eq!(super::common_prefix(&[]), None);
+    }
 }

@@ -56,4 +56,5 @@ name or an alias scores 0.45, two words of its description 0.15. With an `[ai] t
 `provider` not `"never"`), the provider is asked too, with only that tag to choose and no proposals:
 about the IDs given, or with `--all` about the tagged bookmarks the classifier passed over. Its yes
 ranks as 0.5. A rejected candidate isn't offered again. Without the `model` feature, back-fill uses
-the provider alone.
+the provider alone. [`shlv review`](config.md#review) runs the same back-fill, on reviewed
+bookmarks, for each tag added after a batch.

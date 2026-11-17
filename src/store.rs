@@ -557,6 +557,7 @@ impl Store {
             "DELETE FROM tag_proposal_bookmark WHERE bookmark_id = ?1",
             [id],
         )?;
+        tx.execute("DELETE FROM review_bookmark WHERE bookmark_id = ?1", [id])?;
         tx.execute("DELETE FROM bookmark_fts WHERE rowid = ?1", [id])?;
         tx.commit()?;
         Ok(true)

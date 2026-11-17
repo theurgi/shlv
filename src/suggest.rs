@@ -404,7 +404,7 @@ pub(crate) fn reject_applied(
 
 /// Pending rows that are still news: the bookmark doesn't carry the tag yet (a user may have
 /// added it by hand since).
-const PENDING: &str = "s.state = 'pending' AND NOT EXISTS (SELECT 1 FROM bookmark_tag bt \
+pub(crate) const PENDING: &str = "s.state = 'pending' AND NOT EXISTS (SELECT 1 FROM bookmark_tag bt \
      WHERE bt.bookmark_id = s.bookmark_id AND bt.tag_id = s.tag_id)";
 
 impl Store {
@@ -794,7 +794,7 @@ fn pending_tags(conn: &Connection, bookmark: i64) -> Result<Vec<(i64, String)>> 
 /// Moves pending suggestions matching `filter` (on `tag_suggestion`) into `bookmark_tag`, keeping
 /// source and confidence. Returns how many tags were applied; rows for tags a bookmark already
 /// has are dropped without counting.
-fn accept_rows(
+pub(crate) fn accept_rows(
     tx: &Transaction,
     filter: &str,
     args: impl rusqlite::Params + Clone,

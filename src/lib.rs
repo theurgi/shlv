@@ -18,6 +18,7 @@ pub mod html;
 pub mod model;
 pub mod netscape;
 pub mod proposal;
+pub mod review;
 pub mod search;
 pub mod seed;
 pub mod store;
