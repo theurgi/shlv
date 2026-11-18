@@ -1,6 +1,15 @@
 {
   description = "shlv: a fast, resource-efficient bookmarking app";
 
+  # CI pushes its builds here, so installs download shlv instead of compiling it (task 049). Nix asks
+  # before using it unless you're a trusted user; see docs/install.md to add it system-wide.
+  nixConfig = {
+    extra-substituters = [ "https://shlv.cachix.org" ];
+    extra-trusted-public-keys = [
+      "shlv.cachix.org-1:6n2xlDaLnUZNrzzJnnJ/31eoqdlbDKuDG83yGPfS3zo="
+    ];
+  };
+
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     # Builds the dependencies as their own derivation, so they're cached apart from shlv (task 049).

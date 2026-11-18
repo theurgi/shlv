@@ -21,4 +21,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      # Pulls from the public `shlv` cache, and pushes what this run builds when the token is set
+      # (not for pull requests from forks, which get no secrets). See task 049.
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: shlv
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - run: nix flake check -L
