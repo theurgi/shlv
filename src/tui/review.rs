@@ -17,14 +17,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use shlv::review::{BatchRecord, BatchStats, Decision, ReviewFilter};
 use shlv::store::normalize_tag;
-use shlv::{
-    BackfillCandidate, Bookmark, Proposal, ProposalState, RuleCandidate, Source, Suggestion,
-};
+use shlv::{Bookmark, Proposal, ProposalState, RuleCandidate, Source, Suggestion};
 
 use super::app::{App, draw_line_input};
 use super::form::{Field, Form, FormKey, draw_form};
 use super::input::Input;
-use super::worker::Job;
+use super::pick::{Picked, Picker};
+use super::worker::{Job, Output};
 
 pub fn keys() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -181,9 +180,7 @@ struct Backfill {
     tag: String,
     scope: Vec<i64>,
     /// None while the worker offers the tag.
-    candidates: Option<Vec<BackfillCandidate>>,
-    said: Vec<Option<&'static str>>,
-    cursor: usize,
+    picker: Option<Picker>,
 }
 
 #[derive(Default)]
@@ -361,10 +358,11 @@ impl App {
     }
 
     /// A review job finished on the worker.
-    pub(super) fn review_report(&mut self, job: Job, result: Result<(String, Vec<i64>), String>) {
+    pub(super) fn review_report(&mut self, job: Job, result: Result<(String, Output), String>) {
         let phase = std::mem::take(&mut self.review.phase);
         match (job, phase, result) {
-            (Job::ReviewBatch { .. }, Phase::Picking, Ok((order, ids))) => {
+            (Job::ReviewBatch { .. }, Phase::Picking, Ok((order, out))) => {
+                let Output::Ids(ids) = out else { return };
                 if ids.is_empty() {
                     self.say(if self.review.filter.is_empty() {
                         "every bookmark is reviewed"
@@ -381,14 +379,13 @@ impl App {
                 if let Err(e) = result {
                     b.notes.push(format!("back-filling #{tag} failed: {e}"));
                 }
-                match self.candidates(&f.tag, &f.scope) {
-                    Ok(c) => {
-                        f.said = vec![None; c.len()];
-                        if c.is_empty() {
+                match self.picker(&f.tag, Some(&f.scope)) {
+                    Ok(p) => {
+                        if p.is_empty() {
                             b.notes.push(format!("no back-fill candidates for #{tag}"));
                             return self.next_backfill(b, f.tags);
                         }
-                        f.candidates = Some(c);
+                        f.picker = Some(p);
                         self.review.phase = Phase::Backfill(b, f);
                     }
                     Err(e) => {
@@ -881,7 +878,7 @@ impl App {
         };
         self.send_job(Job::Backfill {
             tag: tag.clone(),
-            scope: scope.clone(),
+            scope: Some(scope.clone()),
         });
         self.review.phase = Phase::Backfill(
             b,
@@ -889,76 +886,24 @@ impl App {
                 tags,
                 tag,
                 scope,
-                candidates: None,
-                said: Vec::new(),
-                cursor: 0,
+                picker: None,
             },
         );
     }
 
-    /// The candidates for a tag being back-filled, reviewed bookmarks first.
-    fn candidates(&self, tag: &str, scope: &[i64]) -> Result<Vec<BackfillCandidate>> {
-        let mut c = self.store.backfill_candidates(tag, Some(scope))?;
-        for x in &mut c {
-            x.reviewed = x.reviewed || self.store.is_reviewed(x.suggestion.id)?;
-        }
-        Ok(c)
-    }
-
-    fn backfill_key(&mut self, k: KeyEvent, b: Batch, mut f: Backfill) {
-        let Some(list) = &f.candidates else {
+    fn backfill_key(&mut self, k: KeyEvent, mut b: Batch, mut f: Backfill) {
+        let Some(mut p) = f.picker.take() else {
             // Still offering on the worker.
             self.review.phase = Phase::Backfill(b, f);
             return;
         };
-        let n = list.len();
-        let c = &list[f.cursor];
-        let (id, tags) = (c.suggestion.id, [f.tag.clone()]);
-        match k.code {
-            KeyCode::Char('j') | KeyCode::Down => f.cursor = (f.cursor + 1).min(n - 1),
-            KeyCode::Char('k') | KeyCode::Up => f.cursor = f.cursor.saturating_sub(1),
-            KeyCode::Char('y') | KeyCode::Enter => match self.store.accept(id, &tags) {
-                Ok(_) => {
-                    f.said[f.cursor] = Some("accepted");
-                    f.cursor = (f.cursor + 1).min(n - 1);
-                }
-                Err(e) => self.warn(format!("{e:#}")),
-            },
-            KeyCode::Char('n') => match self.store.reject(id, &tags) {
-                Ok(_) => {
-                    f.said[f.cursor] = Some("rejected");
-                    f.cursor = (f.cursor + 1).min(n - 1);
-                }
-                Err(e) => self.warn(format!("{e:#}")),
-            },
-            KeyCode::Char('s') => {
-                f.said[f.cursor] = Some("skipped");
-                f.cursor = (f.cursor + 1).min(n - 1);
-            }
-            KeyCode::Char('o') => {
-                if let Ok(Some(bm)) = self.store.get(id) {
-                    self.request_open(bm.url);
-                }
-            }
-            KeyCode::Char('q') | KeyCode::Esc => return self.done_backfill(b, f),
-            _ => {}
+        if self.pick_key(&mut p, k) == Picked::Done {
+            b.notes.push(p.summary());
+            self.tags_changed();
+            return self.next_backfill(b, f.tags);
         }
-        if f.said.iter().all(Option::is_some) {
-            return self.done_backfill(b, f);
-        }
+        f.picker = Some(p);
         self.review.phase = Phase::Backfill(b, f);
-    }
-
-    fn done_backfill(&mut self, mut b: Batch, f: Backfill) {
-        let count = |w: &str| f.said.iter().filter(|s| **s == Some(w)).count();
-        let (a, r) = (count("accepted"), count("rejected"));
-        let left = f.said.len() - a - r;
-        b.notes.push(format!(
-            "#{}: {a} accepted, {r} rejected, {left} still pending",
-            f.tag
-        ));
-        self.tags_changed();
-        self.next_backfill(b, f.tags);
     }
 
     /// Retrains the classifier on the batch's decisions, then finishes the batch.
@@ -1159,7 +1104,7 @@ impl App {
             },
             Phase::Proposals(_, p) if p.aliasing.is_some() => "",
             Phase::Proposals(..) => "a add to the list · l alias · r reject · s skip · q done",
-            Phase::Backfill(_, f) if f.candidates.is_none() => return None,
+            Phase::Backfill(_, f) if f.picker.is_none() => return None,
             Phase::Backfill(..) => "y it has the tag · n it doesn't · s skip · o open · q done",
         })
     }
@@ -1290,7 +1235,7 @@ impl App {
 
     fn backfill_lines(&self, b: &Batch, f: &Backfill) -> Vec<Line<'static>> {
         let mut l = batch_header(b);
-        let Some(list) = &f.candidates else {
+        let Some(p) = &f.picker else {
             l.push(Line::from(format!("  Offering #{} on reviewed bookmarks…", f.tag)).dim());
             return l;
         };
@@ -1299,30 +1244,11 @@ impl App {
                 "  Back-fill: #{} on which of {} reviewed bookmarks? (it didn't exist when they \
                  were reviewed)",
                 f.tag,
-                list.len()
+                p.len()
             ))
             .bold(),
         );
-        for (i, c) in list.iter().enumerate() {
-            let s = &c.suggestion;
-            let title = s.title.as_deref().unwrap_or(&s.url);
-            let mut why = s.source.as_str().to_string();
-            if let Some(p) = s.confidence {
-                why.push_str(&format!(" {p:.2}"));
-            }
-            if c.reviewed {
-                why.push_str(", reviewed");
-            }
-            let mut spans = vec![
-                Span::styled(format!("  {:>6}  ", s.id), Style::new().fg(Color::Yellow)),
-                Span::raw(one_line(title)),
-                Span::raw(format!("  ({why})")).dim(),
-            ];
-            if let Some(said) = f.said[i] {
-                spans.push(Span::raw(format!("  {said}")).fg(Color::Green));
-            }
-            l.push(selected(Line::from(spans), i == f.cursor));
-        }
+        l.extend(p.lines());
         l
     }
 
@@ -1604,7 +1530,7 @@ impl App {
             Phase::Picking => "picking",
             Phase::Deciding(_) => "deciding",
             Phase::Proposals(..) => "proposals",
-            Phase::Backfill(_, f) if f.candidates.is_none() => "offering",
+            Phase::Backfill(_, f) if f.picker.is_none() => "offering",
             Phase::Backfill(..) => "backfill",
             Phase::Training(_) => "training",
         }

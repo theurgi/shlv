@@ -19,6 +19,7 @@ use super::bookmarks::Bookmarks;
 use super::input::{Edited, Input};
 use super::review::Review;
 use super::rules::Rules;
+use super::tags::Tags;
 use super::worker::{Job, OpenStore, Report, Worker};
 
 /// The views, switched with `1`-`6` or `:name`.
@@ -69,7 +70,7 @@ impl View {
         match self {
             View::Bookmarks => "",
             View::Review => "",
-            View::Tags => "The tag list, edits, proposals, health, and back-fill: task 045.",
+            View::Tags => "",
             View::Rules => "",
             View::Bootstrap => "Interests, tag seed, and tag draft: task 046.",
             View::Status => "Classifier, background jobs, and config: task 046.",
@@ -94,6 +95,8 @@ pub enum Tone {
 struct Running {
     job: Job,
     step: String,
+    /// The view that sent it, which gets the result.
+    owner: View,
 }
 
 pub struct App {
@@ -103,6 +106,7 @@ pub struct App {
     pub bookmarks: Bookmarks,
     pub rules: Rules,
     pub review: Review,
+    pub tags: Tags,
     help: bool,
     command: Option<Input>,
     message: Option<(String, Tone)>,
@@ -128,6 +132,7 @@ impl App {
             bookmarks: Bookmarks::default(),
             rules: Rules::default(),
             review: Review::default(),
+            tags: Tags::default(),
             help: false,
             command: None,
             message: None,
@@ -178,7 +183,14 @@ impl App {
         }
         let step = job.describe();
         let n = self.worker.send(job.clone());
-        self.jobs.insert(n, Running { job, step });
+        self.jobs.insert(
+            n,
+            Running {
+                job,
+                step,
+                owner: self.view,
+            },
+        );
         self.batch.0 += 1;
     }
 
@@ -210,11 +222,11 @@ impl App {
                 running.step = text;
                 return;
             }
-            Report::Done { job, text, ids } => (job, Ok((text, ids))),
+            Report::Done { job, text, out } => (job, Ok((text, out))),
             Report::Failed { job, error } => (job, Err(error)),
         };
         let (n, result) = result;
-        let Some(Running { job, .. }) = self.jobs.remove(&n) else {
+        let Some(Running { job, owner, .. }) = self.jobs.remove(&n) else {
             return;
         };
         self.batch.1 += 1;
@@ -226,6 +238,7 @@ impl App {
             (job @ (Job::FetchTitle { .. } | Job::Summarize { .. }), Err(e)) => {
                 self.warn(format!("{} failed: {e}", job.describe()));
             }
+            (job, result) if owner == View::Tags => self.tags_report(job, result),
             (job, result) => self.review_report(job, result),
         }
     }
@@ -254,6 +267,7 @@ impl App {
         self.tag_names = None;
         self.rules_changed();
         self.queue_changed();
+        self.tags_view_changed();
     }
 
     /// Shows a view, loading what it lists if it hasn't yet.
@@ -263,6 +277,7 @@ impl App {
         match v {
             View::Rules => self.rules_enter(),
             View::Review => self.review_enter(),
+            View::Tags => self.tags_enter(),
             _ => {}
         }
     }
@@ -273,6 +288,7 @@ impl App {
             View::Bookmarks => self.bookmarks_hint(),
             View::Rules => self.rules_hint(),
             View::Review => self.review_hint(),
+            View::Tags => self.tags_hint(),
             _ => None,
         }
     }
@@ -294,6 +310,7 @@ impl App {
                 View::Bookmarks => self.bookmarks_paste(text),
                 View::Rules => self.rules_paste(text),
                 View::Review => self.review_paste(text),
+                View::Tags => self.tags_paste(text),
                 _ => {}
             }
         }
@@ -326,6 +343,7 @@ impl App {
             View::Bookmarks => self.bookmarks_key(k),
             View::Rules => self.rules_key(k),
             View::Review => self.review_key(k),
+            View::Tags => self.tags_key(k),
             _ => false,
         };
         if taken {
@@ -390,6 +408,7 @@ impl App {
             View::Bookmarks => self.draw_bookmarks(f, body),
             View::Rules => self.draw_rules(f, body),
             View::Review => self.draw_review(f, body),
+            View::Tags => self.draw_tags(f, body),
             v => f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),
@@ -427,6 +446,7 @@ impl App {
             View::Bookmarks => left.extend(self.bookmarks_status()),
             View::Rules => left.extend(self.rules_status()),
             View::Review => left.extend(self.review_status()),
+            View::Tags => left.extend(self.tags_status()),
             _ => {}
         }
         let mut right = Vec::new();
@@ -457,6 +477,7 @@ impl App {
             draw_line_input(f, area, ":", input);
         } else if (self.view == View::Bookmarks && self.draw_bookmarks_prompt(f, area))
             || (self.view == View::Review && self.draw_review_prompt(f, area))
+            || (self.view == View::Tags && self.draw_tags_prompt(f, area))
         {
             // The view drew what is being typed.
         } else if let Some((text, tone)) = self.message.as_ref().filter(|(t, _)| !t.is_empty()) {
@@ -495,6 +516,7 @@ impl App {
             View::Bookmarks => section(self.view.title(), &super::bookmarks::keys()),
             View::Rules => section(self.view.title(), &super::rules::keys()),
             View::Review => section(self.view.title(), &super::review::keys()),
+            View::Tags => section(self.view.title(), &super::tags::keys()),
             v => section(v.title(), &[("", v.placeholder())]),
         }
         lines.pop();

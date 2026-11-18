@@ -17,8 +17,10 @@ mod app;
 mod bookmarks;
 mod form;
 mod input;
+mod pick;
 mod review;
 mod rules;
+mod tags;
 #[cfg(test)]
 mod tests;
 // Its jobs need the `fetch` or `ai` feature; the default build has the plumbing only.

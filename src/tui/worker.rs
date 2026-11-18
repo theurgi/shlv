@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use shlv::Store;
 use shlv::config::Config;
+use shlv::health::{Health, HealthOptions};
 use shlv::review::ReviewFilter;
 
 /// Opens the worker's own store, configured as the UI's is.
@@ -28,9 +29,15 @@ pub enum Job {
     /// Pick the next review batch and run the suggestion layers on it: rules, the classifier,
     /// the `[ai] tag` provider. Done with the batch's ids, and how they were ordered.
     ReviewBatch { filter: ReviewFilter, size: usize },
-    /// Offer one tag on bookmarks (`suggest --tag`): the classifier, the provider.
+    /// Offer one tag (`suggest --tag`): the classifier, the provider; on the given bookmarks, or
+    /// all of them.
     #[cfg_attr(not(any(feature = "model", feature = "ai")), allow(dead_code))]
-    Backfill { tag: String, scope: Vec<i64> },
+    Backfill {
+        tag: String,
+        scope: Option<Vec<i64>>,
+    },
+    /// Measure the tag list (`tag health`).
+    Health,
     /// Retrain the classifier (feature `model`).
     #[cfg_attr(not(feature = "model"), allow(dead_code))]
     Train,
@@ -45,23 +52,34 @@ impl Job {
             Job::ReviewBatch { .. } => "picking a batch".into(),
             Job::Backfill { tag, .. } => format!("back-filling #{tag}"),
             Job::Train => "training the classifier".into(),
+            Job::Health => "measuring the tag list".into(),
         }
     }
 }
 
+/// What a job made, besides a message.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum Output {
+    #[default]
+    Nothing,
+    /// Bookmarks: those a review batch picked.
+    Ids(Vec<i64>),
+    Health(Box<Health>),
+}
+
 /// What the worker says about a job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Report {
     /// A step of a job, for the status line.
     Progress {
         job: u64,
         text: String,
     },
-    /// The job is done: what it did, and the bookmarks it picked (a review batch).
+    /// The job is done: what it did, and what it made.
     Done {
         job: u64,
         text: String,
-        ids: Vec<i64>,
+        out: Output,
     },
     Failed {
         job: u64,
@@ -139,7 +157,7 @@ fn work(open: OpenStore, jobs: Receiver<(u64, Job)>, reports: Sender<Report>) {
                 error: format!("cannot open the database: {e}"),
             },
             Ok((store, config)) => match run(&mut ctx, store, config, &job, &progress) {
-                Ok((text, ids)) => Report::Done { job: n, text, ids },
+                Ok((text, out)) => Report::Done { job: n, text, out },
                 Err(e) => Report::Failed {
                     job: n,
                     error: format!("{e:#}"),
@@ -193,7 +211,7 @@ fn run(
     config: &Config,
     job: &Job,
     progress: &dyn Fn(String),
-) -> Result<(String, Vec<i64>)> {
+) -> Result<(String, Output)> {
     let mut out = Lines {
         progress,
         line: Vec::new(),
@@ -216,7 +234,7 @@ fn run(
             if !store.edit(*id, &edit)? {
                 anyhow::bail!("bookmark {id} is gone");
             }
-            Ok((format!("title: {title}"), vec![*id]))
+            Ok((format!("title: {title}"), Output::Nothing))
         }
         #[cfg(feature = "ai")]
         Job::Summarize { id, url } => {
@@ -238,13 +256,13 @@ fn run(
             if !store.set_summary(*id, Some(&summary))? {
                 anyhow::bail!("bookmark {id} is gone");
             }
-            Ok(("summarized".into(), vec![*id]))
+            Ok(("summarized".into(), Output::Nothing))
         }
         Job::ReviewBatch { filter, size } => {
             store.reload_rules()?;
             let queue = store.review_queue(filter)?;
             if queue.is_empty() {
-                return Ok((String::new(), Vec::new()));
+                return Ok((String::new(), Output::Ids(Vec::new())));
             }
             progress(format!("ordering {} bookmarks", queue.len()));
             let (ids, order) = crate::review_cmd::choose(store, config, &queue, filter, *size)?;
@@ -252,7 +270,7 @@ fn run(
             crate::review_cmd::offer(store, config, &ids, &mut out)?;
             Ok((
                 format!("{} of {} to review, {order}", ids.len(), queue.len()),
-                ids,
+                Output::Ids(ids),
             ))
         }
         #[cfg(any(feature = "model", feature = "ai"))]
@@ -261,7 +279,7 @@ fn run(
                 store,
                 config,
                 tag,
-                Some(scope),
+                scope.as_deref(),
                 true,
                 #[cfg(feature = "ai")]
                 &crate::ai_cmd::LlmArgs {
@@ -273,7 +291,7 @@ fn run(
                 },
                 &mut out,
             )?;
-            Ok((format!("offered #{tag}"), Vec::new()))
+            Ok((format!("offered #{tag}"), Output::Nothing))
         }
         #[cfg(feature = "model")]
         Job::Train => {
@@ -284,10 +302,31 @@ fn run(
                     crate::plural(t.examples, "example"),
                     t.millis
                 ),
-                Vec::new(),
+                Output::Nothing,
             ))
+        }
+        Job::Health => {
+            progress("measuring the tag list".into());
+            let h = health(store, config)?;
+            Ok((String::new(), Output::Health(Box::new(h))))
         }
         #[allow(unreachable_patterns)]
         _ => anyhow::bail!("this build can't do that"),
     }
+}
+
+/// `tag health` with its default thresholds; with the classifier built and a canonical list,
+/// bookmarks it can place aren't gaps.
+#[allow(unused_variables)]
+fn health(store: &mut Store, config: &Config) -> Result<Health> {
+    let opts = HealthOptions::default();
+    #[cfg(feature = "model")]
+    if !shlv::model::canonical_list(store)?.is_empty() {
+        let c = store.classifier(false)?;
+        let t = config.model.threshold;
+        let place =
+            move |item: &shlv::choose::Item| c.probabilities(item).iter().any(|(_, p)| *p >= t);
+        return store.health(&opts, Some(&place));
+    }
+    store.health(&opts, None)
 }

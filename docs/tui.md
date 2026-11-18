@@ -113,6 +113,37 @@ The **queue** lists pending suggestions, newest bookmark first: `y` `n` accept o
 `N` all of a bookmark's, `f` cycles the source (rule, model, llm), `<` `>` lower or raise the
 confidence they must be below, `o` opens. It shows at most 5000.
 
+## Tags
+
+The tag list and what `shlv tag` does to it, in three tabs (`Tab` cycles them).
+
+**List:** every tag with its bookmark count, `*` for canonical tags, `pinned` for tags the config
+declares, `=` its aliases, `#` its description. `/` filters as you type (names and aliases); `s`
+sorts by name or count.
+
+| Key     | Action                                                                  |
+| ------- | ----------------------------------------------------------------------- |
+| `Enter` | The tag's bookmarks, in Bookmarks                                       |
+| `r`     | Rename                                                                  |
+| `m`     | Merge into another tag (`Tab` completes); the old name becomes an alias |
+| `a` `A` | Add an alias, remove one                                                |
+| `e`     | Describe: what belongs under the tag, for the tagging layers            |
+| `c`     | Mark or unmark canonical                                                |
+| `b`     | Back-fill: offer the tag on every bookmark, then `y` `n` `s` each one   |
+
+Edits the config pins (renaming a declared tag, say) are refused with the reason on the message
+line. Back-fill runs the classifier and the `[ai] tag` provider on the worker, as
+`shlv suggest --tag TAG --all --pick` does.
+
+**Names proposed:** `a` adds a name to the canonical list and tags its bookmarks, `l` makes it an
+alias of a tag, `r` rejects it for good.
+
+**Health** measures the list on the worker (as `shlv tag health`) and puts each finding's fix one
+key away: `m` (or `M`, the other way) merges a redundant pair, and `m` a plural into its singular;
+`c` unmarks a too broad or rare tag; `b` back-fills a rare one; `t` tags a group of uncovered
+bookmarks (by site or title word); `r` renames a badly named tag. `Enter` shows the bookmarks behind
+a finding. After a fix, health measures again.
+
 ## Rules
 
 Domain rules (see [config](config.md)): each host and tag, how many bookmarks the rule tagged or

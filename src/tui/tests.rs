@@ -478,7 +478,7 @@ fn switches_views_and_runs_commands() {
     let mut app = db.app();
     press(&mut app, "3");
     assert_eq!(app.view, View::Tags);
-    assert!(text(&mut app).contains("task 045"));
+    assert!(text(&mut app).contains("Names proposed"));
     press(&mut app, ":bookmarks<Enter>");
     assert_eq!(app.view, View::Bookmarks);
     press(&mut app, ":rev<Enter>");
@@ -1087,5 +1087,203 @@ fn review_backfills_new_tags() {
     );
     assert!(m.contains("classifier retrained on"), "{m}");
     assert_eq!(tags(&db, "https://a.com/1"), ["music"]);
+    assert_eq!(tags(&db, "https://b.com/2"), ["music"]);
+}
+
+fn pin_rust(s: &mut Store) {
+    let map: std::collections::BTreeMap<String, shlv::DeclaredEntry> = [(
+        "rust".to_string(),
+        shlv::DeclaredEntry {
+            aliases: vec!["rs".to_string()],
+            description: None,
+        },
+    )]
+    .into_iter()
+    .collect();
+    s.pin(shlv::DeclaredTags::new(map).unwrap()).unwrap();
+}
+
+#[test]
+fn tags_list_edits() {
+    let db = Db::new();
+    three(&db);
+    db.store().describe_tag("python", "the language").unwrap();
+    let mut app = db.app_with(Config::default(), pin_rust);
+    press(&mut app, "3");
+    let t = text(&mut app);
+    assert!(t.contains(" * #rust    2  pinned  = rs"), "{t}");
+    assert!(t.contains("   #python  1  # the language"), "{t}");
+    // Filter as you type, by name or alias.
+    press(&mut app, "/w");
+    assert!(text(&mut app).contains("1 of 3 tags  /w"));
+    press(&mut app, "<Esc>/rs<Enter>");
+    let t = text(&mut app);
+    assert!(t.contains("#rust") && !t.contains("#web"), "{t}");
+    // Pinned tags refuse to be renamed; the form stays open with the reason.
+    press(&mut app, "r<C-u>rustlang<Enter>");
+    assert!(
+        message(&app).contains("cannot rename pinned tag rust"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, "<Esc><Esc>");
+    // web: rename, alias, describe, canonical, then merge into rust.
+    press(&mut app, "/web<Enter>r<C-u>www<Enter>");
+    assert_eq!(message(&app), "renamed #web to #www (1 bookmarks)");
+    press(&mut app, "<Esc>/www<Enter>");
+    press(&mut app, "aw3<Enter>");
+    assert_eq!(message(&app), "w3 is an alias of #www");
+    press(&mut app, "eweb pages<Enter>");
+    assert_eq!(message(&app), "described #www");
+    press(&mut app, "c");
+    assert_eq!(message(&app), "#www is canonical");
+    assert!(text(&mut app).contains(" * #www  1  = w3  # web pages"));
+    press(&mut app, "A<Enter>");
+    assert_eq!(message(&app), "removed alias w3 (of #www)");
+    press(&mut app, "mru<Tab><Enter>");
+    assert!(
+        message(&app).starts_with("merged #www into #rust (1 bookmarks)"),
+        "{}",
+        message(&app)
+    );
+    let s = db.store();
+    assert!(s.tag_info("www").unwrap().unwrap().name == "rust");
+    drop(s);
+    // Enter shows the tag's bookmarks.
+    press(&mut app, "<Esc>s");
+    assert_eq!(message(&app), "sorted by count");
+    press(&mut app, "g<Enter>");
+    assert_eq!(app.view, View::Bookmarks);
+    assert_eq!(app.bookmarks.query, "#rust");
+    assert_eq!(app.bookmarks.ids.len(), 2);
+}
+
+#[test]
+fn tags_proposals() {
+    let db = Db::new();
+    three(&db);
+    {
+        let mut s = db.store();
+        s.add_canonical(&["rust".to_string(), "python".to_string()])
+            .unwrap();
+        s.set_strict_tags(shlv::StrictTags::Propose);
+        for (url, tag) in [
+            ("https://d.example/", "golang"),
+            ("https://e.example/", "py"),
+            ("https://f.example/", "junk"),
+        ] {
+            s.add(&NewBookmark {
+                url: url.into(),
+                tags: vec![tag.into()],
+                ..Default::default()
+            })
+            .unwrap();
+        }
+    }
+    let mut app = db.app();
+    press(&mut app, "3<Tab>");
+    let t = text(&mut app);
+    assert!(t.contains("3 names proposed"), "{t}");
+    assert!(t.contains("#golang  on 1 bookmark  (user)"), "{t}");
+    // By name: golang, junk, py.
+    press(&mut app, "a");
+    assert_eq!(
+        message(&app),
+        "added #golang to the list; tagged 1 bookmark"
+    );
+    assert!(text(&mut app).contains("2 names proposed"));
+    press(&mut app, "r");
+    assert_eq!(message(&app), "rejected junk: it won't be proposed again");
+    press(&mut app, "lpyt<Tab><Enter>");
+    assert_eq!(
+        message(&app),
+        "py is an alias of #python; tagged 1 bookmark"
+    );
+    assert!(text(&mut app).contains("No names proposed"));
+    assert_eq!(tags(&db, "https://e.example/"), ["python"]);
+}
+
+#[test]
+fn tags_health_fixes() {
+    let db = Db::new();
+    let mut items: Vec<(String, &[&str])> = Vec::new();
+    for i in 0..3 {
+        items.push((
+            format!("https://m{i}.example/"),
+            &["ml", "machine-learning"],
+        ));
+    }
+    for i in 0..3 {
+        items.push((format!("https://blog.site/{i}"), &[]));
+    }
+    let items: Vec<(&str, &str, &[&str])> =
+        items.iter().map(|(u, t)| (u.as_str(), "", *t)).collect();
+    db.seed(&items);
+    let mut app = db.app();
+    press(&mut app, "3<Tab><Tab>");
+    app.finish_jobs();
+    let t = text(&mut app);
+    assert!(t.contains("Redundant"), "{t}");
+    assert!(
+        t.contains("#ml + #machine-learning  together on 3 of 3 and 3"),
+        "{t}"
+    );
+    assert!(t.contains("m merge the first into the second"), "{t}");
+    assert!(t.contains("Uncovered bookmarks, by site"), "{t}");
+    // Merge the pair; health measures again.
+    press(&mut app, "m");
+    assert!(
+        message(&app).starts_with("merged #ml into #machine-learning"),
+        "{}",
+        message(&app)
+    );
+    app.finish_jobs();
+    let t = text(&mut app);
+    assert!(!t.contains("Redundant"), "{t}");
+    // Tag the uncovered blog.site bookmarks.
+    let mut found = false;
+    for _ in 0..10 {
+        if text(&mut app).contains("t tag them") {
+            found = true;
+            break;
+        }
+        press(&mut app, "j");
+    }
+    assert!(found, "{}", text(&mut app));
+    press(&mut app, "t<C-u>blog<Enter>");
+    assert!(
+        message(&app).starts_with("tagged 3 bookmarks: #blog on 3"),
+        "{}",
+        message(&app)
+    );
+    assert_eq!(tags(&db, "https://blog.site/1"), ["blog"]);
+}
+
+#[cfg(feature = "model")]
+#[test]
+fn tags_backfill() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://a.com/1", "Jazz albums", &["music"]),
+        ("https://b.com/2", "Music theory for programmers", &[]),
+        ("https://c.com/3", "Gardening", &[]),
+    ]);
+    db.store().add_canonical(&["music".to_string()]).unwrap();
+    let mut app = db.app();
+    press(&mut app, "3/music<Enter>b");
+    app.finish_jobs();
+    let t = text(&mut app);
+    assert!(t.contains("Back-fill: #music on which of"), "{t}");
+    assert!(t.contains("Music theory for programmers"), "{t}");
+    press(&mut app, "y");
+    // Whatever else is offered: stop.
+    if !message(&app).starts_with("#music:") {
+        press(&mut app, "q");
+    }
+    assert!(
+        message(&app).starts_with("#music: 1 accepted"),
+        "{}",
+        message(&app)
+    );
     assert_eq!(tags(&db, "https://b.com/2"), ["music"]);
 }
