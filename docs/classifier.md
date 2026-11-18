@@ -33,8 +33,12 @@ auto_threshold = 0.9 # with suggestions = "auto", apply only from here up; the r
 provider = "fallback" # ask [ai] tag: "fallback" (when the classifier is unsure), "always", "never"
 ```
 
-"Unsure" means nothing reached `threshold`, or a tag that did has no examples yet. Every accepted or
-rejected suggestion is a training example the next time the model trains.
+"Unsure" means nothing reached `threshold`, or a tag that did has no examples yet. One example is
+enough: requiring more (up to the 100 at which the lexical guess stops counting) sent more bookmarks
+to the provider without making the offers on the rest more precise
+([measured](../experiments/tag-models/RESULTS.md#provider-fallback-when-is-the-classifier-sure-task-041)
+on 200 to 5k bookmarks). Every accepted or rejected suggestion is a training example the next time
+the model trains.
 
 ## Back-filling a new tag
 

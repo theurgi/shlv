@@ -220,6 +220,48 @@ as "about 85%", but a 0.97 doesn't mean 97%. Two likely causes, neither tested h
 wrong). Real libraries have both. `shlv model eval` now prints this ECE and table, so a user sees it
 on their own data.
 
+### Provider fallback: when is the classifier sure? (task 041)
+
+Run 2026-11-18, same subsets. Under `[model] provider = "fallback"`, `suggest` skips the provider
+for a bookmark the classifier is sure about: some tag reaches `threshold` (0.5), and every such tag
+has at least _min_ training examples. The code has always used 1 (`Classifier::is_cold`); 023 had
+described `FULL_AT` (100). "To provider" is the share of the 10,085 test bookmarks the provider is
+asked about; precision is over offered choices on the bookmarks the rule calls sure; "held" is the
+bookmarks with an offer that the rule sends to the provider anyway, and their offers' precision.
+Means over 5 subsets; ± is a 95% binomial half-width on the first subset.
+
+| train | min ex. | to provider | sure | P@0.5 sure    | P@0.5 held (n) |
+| ----- | ------- | ----------- | ---- | ------------- | -------------- |
+| 200   | 1       | 0.90        | 1039 | 0.776 ± 0.025 | - (2)          |
+| 200   | 25      | 0.99        | 104  | 0.862 ± 0.051 | 0.766 (936)    |
+| 200   | 50, 100 | 1.00        | 0    | -             | 0.776 (1040)   |
+| 500   | 1       | 0.89        | 1114 | 0.786 ± 0.022 | - (0)          |
+| 500   | 50      | 0.97        | 306  | 0.833 ± 0.043 | 0.768 (809)    |
+| 500   | 100     | 1.00        | 0    | -             | 0.786 (1114)   |
+| 1,000 | 1       | 0.85        | 1559 | 0.758 ± 0.021 | - (0)          |
+| 1,000 | 50      | 0.88        | 1200 | 0.757 ± 0.025 | 0.764 (359)    |
+| 1,000 | 100     | 0.95        | 554  | 0.795 ± 0.036 | 0.743 (1005)   |
+| 2,000 | 1       | 0.76        | 2424 | 0.728 ± 0.017 | - (0)          |
+| 2,000 | 100     | 0.83        | 1694 | 0.722 ± 0.021 | 0.739 (730)    |
+| 5,000 | 1       | 0.64        | 3642 | 0.696 ± 0.013 | - (0)          |
+| 5,000 | 100     | 0.67        | 3292 | 0.688 ± 0.014 | 0.762 (350)    |
+| 40k   | any     | 0.47        | 5390 | 0.662 ± 0.011 | - (0)          |
+
+(`tag-models small` prints every rule: 1, 10, 25, 50, 100.)
+
+- **A stricter rule buys no precision.** Where it still leaves a useful number of sure bookmarks,
+  their precision is within the margin of the loose rule's (1k: 0.795 ± 0.036 against 0.758; 2k, 5k:
+  equal or lower), and the bookmarks it holds back are offered tags about as precise as the rest
+  (0.74-0.79). Only at 200 bookmarks with 25 examples is the sure set clearly more precise (0.86),
+  and then it is 1% of bookmarks.
+- **It costs provider calls**, most in small libraries: with 100 examples, every bookmark goes to
+  the provider below about 1k bookmarks, and 5-10 points more at 1k-2k.
+- **Most provider calls come from "nothing reached 0.5"**, not from the rule: 90% of bookmarks at
+  200, 64% at 5k, 47% at 40k under the loosest rule.
+
+**Kept: one example.** It still matters for a new library: with nothing tagged, every offer is a
+lexical guess the user hasn't confirmed, so the provider is asked about every bookmark.
+
 ## Reproducing
 
 ```sh
@@ -231,5 +273,5 @@ LLAMA_CPP_BASE_URL=http://host/v1 cargo run --release -- run laya-choice OUT  # 
 LLAMA_CPP_BASE_URL=http://host/v1 LLM_MODEL=Sharp-MiniCPM5-2B cargo run --release -- run llm OUT
 cargo run --release -- eval OUT                 # every candidate on its own items
 SAMPLE_ONLY=1 cargo run --release -- eval OUT   # every candidate on the 300-bookmark sample
-cargo run --release -- small OUT                # task 038: the shipped classifier at 200..5k bookmarks
+cargo run --release -- small OUT                # tasks 038, 041: the shipped classifier at 200..5k bookmarks
 ```

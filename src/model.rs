@@ -429,7 +429,10 @@ impl Classifier {
         })
     }
 
-    /// Whether a tag's probability comes only from the lexical match (it has no examples).
+    /// Whether a tag's probability comes only from the lexical match (it has no examples). A tag
+    /// that isn't cold counts toward "sure" for the provider fallback even below [`FULL_AT`]: 041
+    /// measured stricter rules on 200-5k bookmarks and they sent more bookmarks to the provider
+    /// without raising the precision of the rest.
     pub fn is_cold(&self, tag: &str) -> bool {
         self.list
             .iter()
@@ -682,7 +685,8 @@ pub struct ModelStats {
     /// Tags applied (auto mode, at or above `auto_threshold`).
     pub applied: usize,
     /// Bookmarks the classifier was sure about: a tag at or above the threshold, and every such
-    /// tag trained on enough examples. The provider fallback skips these.
+    /// tag has at least one example (see [`Classifier::is_cold`]). The provider fallback skips
+    /// these.
     pub sure: HashSet<i64>,
 }
 

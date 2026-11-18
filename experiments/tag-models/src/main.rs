@@ -4,7 +4,7 @@
 //! tag-models prep DATA_DIR OUT_DIR       # dataset.jsonl from the HetRec files, time-ordered
 //! tag-models run CANDIDATE OUT_DIR       # predictions/CANDIDATE.jsonl
 //! tag-models eval OUT_DIR                # metrics table (Markdown) for every predictions file
-//! tag-models small OUT_DIR               # task 038: the shipped classifier on 200..5k bookmarks
+//! tag-models small OUT_DIR               # tasks 038, 041: the shipped classifier on 200..5k bookmarks
 //! ```
 //!
 //! Candidates: `lexical` (zero-shot), `nb-few`, `lr-few`, `nb`, `lr` (hashed tokens, trained on
@@ -946,6 +946,60 @@ fn lex_features(lex: &[f64]) -> Vec<u32> {
 /// Bootstrap resamples of the test set.
 const BOOT: usize = 400;
 
+/// Task 041: "sure" rules for `[model] provider = "fallback"`. A bookmark is sure when some tag
+/// reaches `threshold` (0.5) and every such tag has at least this many training examples. 1 is
+/// what `Classifier::is_cold` does; `FULL_AT` (100) is what 023 described.
+const SURE_AT: &[usize] = &[1, 10, 25, 50, 100];
+
+/// One sure rule's counts over the test split.
+#[derive(Default, Clone, Copy)]
+struct Sure {
+    /// Bookmarks with at least one choice at or above 0.5.
+    likely: f64,
+    /// Bookmarks the rule calls sure (the provider skips them).
+    sure: f64,
+    /// Offered choices (≥0.5) on sure bookmarks, and how many are right.
+    n5: f64,
+    tp5: f64,
+    /// Sure bookmarks whose top choice is right.
+    hit1: f64,
+    /// Bookmarks with a likely tag that the rule doesn't call sure: offered choices, right.
+    held_n5: f64,
+    held_tp5: f64,
+}
+
+fn sure_rules(scores: &[Vec<f64>], truth: &[Vec<bool>], counts: &[usize]) -> Vec<Sure> {
+    SURE_AT
+        .iter()
+        .map(|&at| {
+            let mut s = Sure::default();
+            for (sc, tr) in scores.iter().zip(truth) {
+                let likely: Vec<usize> = (0..sc.len()).filter(|&t| sc[t] >= 0.5).collect();
+                if likely.is_empty() {
+                    continue;
+                }
+                s.likely += 1.0;
+                let right = likely.iter().filter(|&&t| tr[t]).count() as f64;
+                let n = likely.len() as f64;
+                if likely.iter().all(|&t| counts[t] >= at) {
+                    s.sure += 1.0;
+                    s.n5 += n;
+                    s.tp5 += right;
+                    let top = likely
+                        .iter()
+                        .copied()
+                        .max_by(|&a, &b| sc[a].total_cmp(&sc[b]));
+                    s.hit1 += f64::from(u8::from(top.is_some_and(|t| tr[t])));
+                } else {
+                    s.held_n5 += n;
+                    s.held_tp5 += right;
+                }
+            }
+            s
+        })
+        .collect()
+}
+
 fn options(tags: &[Tag]) -> Vec<shlv::choose::TagOption> {
     tags.iter()
         .map(|t| shlv::choose::TagOption {
@@ -1166,6 +1220,7 @@ fn small(out: &Path) -> Result<()> {
         size: usize,
         tags_at_50: usize,
         blends: Vec<(&'static str, Small)>,
+        sure: Vec<Sure>,
     }
     let mut runs: Vec<Run> = Vec::new();
     let cold = score_small(&lexical, &truth, &vec![0; tags.len()]);
@@ -1261,6 +1316,7 @@ fn small(out: &Path) -> Result<()> {
                 "blend differs from Classifier"
             );
         }
+        let sure = sure_rules(&shipped, &truth, &counts);
         let blends = BLENDS
             .iter()
             .map(|&(name, at, cap, st)| (name, score_small(&blend(at, cap, st), &truth, &counts)))
@@ -1273,6 +1329,7 @@ fn small(out: &Path) -> Result<()> {
                 .filter(|&&n| n >= shlv::model::FULL_AT)
                 .count(),
             blends,
+            sure,
         });
     }
     let sizes: Vec<usize> = {
@@ -1444,6 +1501,49 @@ fn small(out: &Path) -> Result<()> {
             print!(" {} | {} |", p(a[1], a[0]), p(a[3], a[2]));
         }
         println!();
+    }
+
+    println!("\n### Provider fallback: sure rules (shipped, mean over subsets)\n");
+    println!(
+        "A bookmark is sure when a tag reaches 0.5 and every such tag has at least `min ex.` \
+         training examples; the provider is asked about the rest. Precision is over offered \
+         choices (≥0.5); ± is a binomial 95% half-width on the first subset. held: bookmarks \
+         with an offer that the rule sends to the provider anyway.\n"
+    );
+    println!(
+        "| train | min ex. | to provider | sure | P@0.5 sure | ± | P@1 sure | P@0.5 held | held |"
+    );
+    println!("|---|---|---|---|---|---|---|---|---|");
+    let div = |a: f64, b: f64| if b > 0.0 { a / b } else { f64::NAN };
+    let mean_or_nan = |v: &[f64]| if v.is_empty() { f64::NAN } else { mean(v) };
+    for &size in &sizes {
+        let rs: Vec<&Run> = runs.iter().filter(|r| r.size == size).collect();
+        for (k, at) in SURE_AT.iter().enumerate() {
+            let col = |f: &dyn Fn(&Sure) -> f64| -> Vec<f64> {
+                rs.iter()
+                    .map(|r| f(&r.sure[k]))
+                    .filter(|x| !x.is_nan())
+                    .collect()
+            };
+            let sure = mean(&col(&|s| s.sure));
+            let p5 = col(&|s| div(s.tp5, s.n5));
+            let first = rs[0].sure[k];
+            let p0 = div(first.tp5, first.n5);
+            println!(
+                "| {size} | {at} | {:.3} | {sure:.0} | {}{} | ±{} | {} | {} | {:.0} |",
+                1.0 - sure / n_test as f64,
+                f3(mean_or_nan(&p5)),
+                if p5.is_empty() {
+                    String::new()
+                } else {
+                    range(&p5)
+                },
+                f3(1.96 * (p0 * (1.0 - p0) / first.n5).sqrt()),
+                f3(mean_or_nan(&col(&|s| div(s.hit1, s.sure)))),
+                f3(mean_or_nan(&col(&|s| div(s.held_tp5, s.held_n5)))),
+                mean(&col(&|s| s.likely - s.sure)),
+            );
+        }
     }
 
     println!("\n### Cold-start blend sweep (mean over subsets)\n");

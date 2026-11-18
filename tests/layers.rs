@@ -39,7 +39,7 @@ const TOPICS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// A database with 120 examples per tag (past `FULL_AT`, so the classifier trusts them), plus a declared-free
+/// A database with 120 examples per tag (past `FULL_AT`, so the lexical score no longer counts), plus a declared-free
 /// canonical list that also has an untrained tag, `music`.
 fn fixture(path: &Path) {
     let mut s = Store::open(path).unwrap();
@@ -175,6 +175,22 @@ fn thresholds_and_modes() {
     };
     let st = s.apply_model(Some(&[id5]), &c, &low).unwrap();
     assert!(!st.sure.contains(&id5));
+
+    // One example is enough, though the probability is still mostly the lexical guess (041:
+    // requiring `FULL_AT` examples sent more bookmarks to the provider without making the rest
+    // more precise).
+    s.add(&NewBookmark {
+        url: "https://example.com/album".into(),
+        title: Some("an album review".into()),
+        tags: vec!["music".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    s.train_model().unwrap();
+    let c = s.classifier(false).unwrap();
+    assert!(!c.is_cold("music"));
+    let st = s.apply_model(Some(&[id5]), &c, &low).unwrap();
+    assert!(st.sure.contains(&id5));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

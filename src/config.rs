@@ -97,8 +97,8 @@ impl ModelConfig {
 pub enum ProviderUse {
     /// For every bookmark `suggest` handles.
     Always,
-    /// Only where the classifier is unsure: nothing at or above `threshold`, or its likeliest
-    /// tags have too few examples to trust.
+    /// Only where the classifier is unsure: nothing at or above `threshold`, or a tag that
+    /// reached it has no examples yet.
     #[default]
     Fallback,
     /// Never; the classifier and rules only.
