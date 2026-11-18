@@ -117,6 +117,32 @@ impl std::fmt::Display for MissingBookmarks {
 
 impl std::error::Error for MissingBookmarks {}
 
+/// One of a bookmark's tags and where it came from; see [`Store::tag_sources`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagSource {
+    pub tag: String,
+    /// `user`, or the layer that applied it: `rule`, `model`, `llm`.
+    pub source: String,
+    pub confidence: Option<f64>,
+}
+
+/// A deleted bookmark as it was, for [`Store::undelete`].
+#[derive(Debug, Clone)]
+pub struct Deleted {
+    pub bookmark: Bookmark,
+    tags: Vec<TagSource>,
+    suggestions: Vec<KeptSuggestion>,
+}
+
+#[derive(Debug, Clone)]
+struct KeptSuggestion {
+    tag: String,
+    source: String,
+    confidence: Option<f64>,
+    state: String,
+    updated_at: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ListQuery {
     /// Only bookmarks with all of these tags.
@@ -614,6 +640,38 @@ impl Store {
         limit: usize,
         mut f: impl FnMut(Bookmark) -> Result<()>,
     ) -> Result<()> {
+        self.search_ids_each(query, limit, |id| {
+            f(self.get(id)?.context("bookmark vanished during search")?)
+        })
+    }
+
+    /// The ids of the bookmarks [`Store::search`] would return, in its order. Cheaper than
+    /// loading the rows when only some of them are shown (the TUI loads the visible ones).
+    pub fn search_ids(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
+        let mut ids = Vec::new();
+        self.search_ids_each(query, limit, |id| {
+            ids.push(id);
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// The ids of all live bookmarks, newest first (the order of [`Store::list`]).
+    pub fn list_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id FROM bookmark WHERE deleted_at IS NULL ORDER BY created_at DESC, id DESC",
+        )?;
+        Ok(stmt
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    fn search_ids_each(
+        &self,
+        query: &str,
+        limit: usize,
+        mut f: impl FnMut(i64) -> Result<()>,
+    ) -> Result<()> {
         let q = search::parse(query);
         let filtered = !q.tags.is_empty() || !q.sites.is_empty();
         let mut args = Vec::new();
@@ -656,10 +714,116 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let mut rows = stmt.query(params_from_iter(args)).map_err(invalid)?;
         while let Some(row) = rows.next().map_err(invalid)? {
-            let id = row.get(0)?;
-            f(self.get(id)?.context("bookmark vanished during search")?)?;
+            f(row.get(0)?)?;
         }
         Ok(())
+    }
+
+    /// A bookmark's tags with the layer that applied each (`user`, `rule`, `model`, `llm`) and
+    /// its confidence, by tag name.
+    pub fn tag_sources(&self, id: i64) -> Result<Vec<TagSource>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT t.name, bt.source, bt.confidence FROM bookmark_tag bt \
+             JOIN tag t ON t.id = bt.tag_id WHERE bt.bookmark_id = ?1 ORDER BY t.name",
+        )?;
+        Ok(stmt
+            .query_map([id], |r| {
+                Ok(TagSource {
+                    tag: r.get(0)?,
+                    source: r.get(1)?,
+                    confidence: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Like [`Store::delete`], but first takes what [`Store::undelete`] needs to bring the
+    /// bookmark back: its fields, tags (with sources), and suggestions (pending and rejected).
+    /// Returns `None` if there's no live bookmark with that id.
+    pub fn delete_keeping(&mut self, id: i64) -> Result<Option<Deleted>> {
+        let Some(bookmark) = self.get(id)? else {
+            return Ok(None);
+        };
+        let tags = self.tag_sources(id)?;
+        let suggestions = self
+            .conn
+            .prepare_cached(
+                "SELECT t.name, s.source, s.confidence, s.state, s.updated_at \
+                 FROM tag_suggestion s JOIN tag t ON t.id = s.tag_id WHERE s.bookmark_id = ?1",
+            )?
+            .query_map([id], |r| {
+                Ok(KeptSuggestion {
+                    tag: r.get(0)?,
+                    source: r.get(1)?,
+                    confidence: r.get(2)?,
+                    state: r.get(3)?,
+                    updated_at: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if !self.delete(id)? {
+            return Ok(None);
+        }
+        Ok(Some(Deleted {
+            bookmark,
+            tags,
+            suggestions,
+        }))
+    }
+
+    /// Brings back a bookmark deleted with [`Store::delete_keeping`]: same id and uid, its
+    /// fields, tags, and suggestions; tags since renamed or merged are found through their
+    /// aliases, tags gone since are dropped. Proposals and review history aren't kept. Fails if
+    /// its URL has been bookmarked again meanwhile; returns false if it isn't deleted.
+    pub fn undelete(&mut self, d: &Deleted) -> Result<bool> {
+        let b = &d.bookmark;
+        let now = now_ms();
+        let tx = self.conn.transaction()?;
+        let norm: Option<String> = tx
+            .query_row(
+                "SELECT url_norm FROM bookmark WHERE id = ?1 AND deleted_at IS NOT NULL",
+                [b.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(norm) = norm else {
+            return Ok(false);
+        };
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM bookmark WHERE url_norm = ?1 AND deleted_at IS NULL)",
+            [&norm],
+            |r| r.get(0),
+        )?;
+        if taken {
+            bail!("{} has been bookmarked again", b.url);
+        }
+        tx.execute(
+            "UPDATE bookmark SET title = ?2, note = ?3, summary = ?4, deleted_at = NULL, \
+             updated_at = ?5 WHERE id = ?1",
+            params![b.id, b.title, b.note, b.summary, now],
+        )?;
+        for t in &d.tags {
+            if let Some(tag_id) = resolve_tag(&tx, &t.tag)? {
+                tx.execute(
+                    "INSERT OR IGNORE INTO bookmark_tag (bookmark_id, tag_id, source, confidence) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![b.id, tag_id, t.source, t.confidence],
+                )?;
+            }
+        }
+        for s in &d.suggestions {
+            if let Some(tag_id) = resolve_tag(&tx, &s.tag)? {
+                tx.execute(
+                    "INSERT OR IGNORE INTO tag_suggestion \
+                     (bookmark_id, tag_id, source, confidence, state, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![b.id, tag_id, s.source, s.confidence, s.state, s.updated_at],
+                )?;
+            }
+        }
+        reindex(&tx, b.id)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// The largest bookmark id ever used (0 if none), e.g. to size an id column.

@@ -1,7 +1,10 @@
 # shlv
 
-A fast, resource-efficient bookmark manager for the command line. Bookmarks live in a single SQLite
+A fast, resource-efficient bookmark manager for the terminal. Bookmarks live in a single SQLite
 database with full-text search. Everything works offline.
+
+`shlv` on its own opens a keyboard-driven TUI: search as you type, open, add, edit, tag, and delete;
+see [The TUI](docs/tui.md). The commands below are for scripts and integrations.
 
 ## Install
 
@@ -81,6 +84,7 @@ The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 ## Documentation
 
 - [Install](docs/install.md): Nix, Home Manager, Cargo, and optional features
+- [The TUI](docs/tui.md): the keys and views of bare `shlv`
 - [Config and tags](docs/config.md): the config file, canonical tags, domain rules, suggestions,
   proposals, and tag health
 - [Import and export](docs/import-export.md): browser bookmarks, URL lists, moving from another app
@@ -102,7 +106,7 @@ binary and database on tmpfs, in a VM where starting a process takes about 4.4 m
 | `add` (new URL)            | 5.4 ms |
 | `export` (100k, JSON)      | 0.2 s  |
 | `import` (100k, JSON)      | 1.9 s  |
-| Release binary             | 3.9 MB |
+| Release binary             | 5.1 MB |
 | Database size per bookmark | 723 B  |
 
 ## Development

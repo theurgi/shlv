@@ -33,7 +33,10 @@ pub use proposal::{
     Decided, Diverted, Proposal, ProposalSource, ProposalState, ProposeStats, StrictTags,
 };
 pub use seed::{Candidate, Decision, Hint, Interest, SeedName, Seeded};
-pub use store::{Added, Bookmark, Edit, Edited, ListQuery, MissingBookmarks, NewBookmark, Store};
+pub use store::{
+    Added, Bookmark, Deleted, Edit, Edited, ListQuery, MissingBookmarks, NewBookmark, Store,
+    TagSource,
+};
 pub use style::{Separator, StyleConfig, TagStyle};
 pub use suggest::{
     BackfillCandidate, DomainRules, NonCanonicalRuleTags, OfferStats, RuleStats, Source,

@@ -29,13 +29,15 @@ mod review_cmd;
 mod screen;
 #[cfg(feature = "ai")]
 mod seed_cmd;
+mod tui;
 
 /// A fast bookmark manager.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Without one, `shlv` on a terminal opens the TUI.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -421,7 +423,20 @@ enum SortArg {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+    let result = match cli.cmd {
+        Some(cmd) => run(cmd),
+        None if io::stdin().is_terminal() && io::stdout().is_terminal() => run_tui(),
+        // Without a terminal, bare `shlv` is a usage error, as before the TUI.
+        None => {
+            use clap::CommandFactory;
+            Cli::command()
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .get_matches();
+            unreachable!("clap exits without a subcommand")
+        }
+    };
+    match result {
         Ok(code) => code,
         Err(e) => {
             if e.downcast_ref::<io::Error>()
@@ -436,18 +451,20 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<ExitCode> {
-    let stdout = io::stdout();
-    let style = Style::detect(stdout.is_terminal());
-    let mut out = BufWriter::new(stdout.lock());
-    if let Cmd::Config { cmd } = cli.cmd {
-        run_config(cmd, &mut out)?;
-        out.flush()?;
-        return Ok(ExitCode::SUCCESS);
-    }
+/// The database, opened and configured the way every command needs it.
+pub(crate) struct Opened {
+    pub store: Store,
+    pub config: Config,
+    pub config_path: PathBuf,
+    /// What syncing the declared list did, for the user.
+    pub notes: Vec<String>,
+}
+
+/// Opens the database and applies the config to it: every command that opens the database
+/// reads the config, since a declared canonical list has to be synced and pinned before anything
+/// reads or writes tags.
+pub(crate) fn open_store() -> Result<Opened> {
     let mut store = Store::open_default()?;
-    // Every command that opens the database reads the config: a declared canonical list has to
-    // be synced and pinned before anything reads or writes tags.
     let config_path = config::default_path()?;
     let mut config = Config::load(&config_path)?;
     store.set_strict_tags(config.strict_tags);
@@ -455,6 +472,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     store.set_rules(config.tags.rules.clone());
     store.set_style(config.tags.style.tag_style());
     store.set_pinned_interests(&config.tags.interests);
+    let mut notes = Vec::new();
     // The store keeps the declared list; nothing else reads it from `config`.
     if let Some(tags) = config.tags.canonical.take() {
         let stats = store.pin(tags).with_context(|| {
@@ -465,11 +483,57 @@ fn run(cli: Cli) -> Result<ExitCode> {
         })?;
         for (from, into, n) in stats.iter().flat_map(|s| &s.merged) {
             let n = plural(*n, "bookmark");
-            eprintln!(
-                "shlv: merged tag {from} into {into} ({n}): {} declares it an alias",
+            notes.push(format!(
+                "merged tag {from} into {into} ({n}): {} declares it an alias",
                 config_path.display()
-            );
+            ));
         }
+    }
+    Ok(Opened {
+        store,
+        config,
+        config_path,
+        notes,
+    })
+}
+
+/// Runs the classifier on a bookmark just added, as `add` does: offline and fast, with the
+/// stored model (`suggest` retrains it; `add` doesn't wait for that). Returns whether it ran:
+/// it needs the `model` feature and a canonical list.
+pub(crate) fn classify_added(store: &mut Store, config: &Config, id: i64) -> Result<bool> {
+    #[cfg(feature = "model")]
+    if !shlv::model::canonical_list(store)?.is_empty() {
+        let classifier = store.classifier(false)?;
+        store.apply_model(Some(&[id]), &classifier, &config.model)?;
+        return Ok(true);
+    }
+    let _ = (store, config, id);
+    Ok(false)
+}
+
+/// Bare `shlv` on a terminal.
+fn run_tui() -> Result<ExitCode> {
+    tui::run(open_store()?)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn run(cmd: Cmd) -> Result<ExitCode> {
+    let stdout = io::stdout();
+    let style = Style::detect(stdout.is_terminal());
+    let mut out = BufWriter::new(stdout.lock());
+    if let Cmd::Config { cmd } = cmd {
+        run_config(cmd, &mut out)?;
+        out.flush()?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Opened {
+        mut store,
+        config,
+        config_path,
+        notes,
+    } = open_store()?;
+    for note in notes {
+        eprintln!("shlv: {note}");
     }
     let limit = |n: usize| if n == 0 { usize::MAX } else { n };
     let all = ListQuery {
@@ -477,7 +541,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
         limit: usize::MAX,
     };
 
-    match cli.cmd {
+    match cmd {
         Cmd::Add {
             url,
             tags,
@@ -508,18 +572,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             write!(out, "{verb} ")?;
             print_line(&mut out, &b, 0, &style)?;
             print_diverted(&mut out, &added.diverted, &style)?;
-            // The classifier runs on new bookmarks too: offline and fast, with the stored model
-            // (`suggest` retrains it; `add` doesn't wait for that).
-            #[cfg(feature = "model")]
-            let model_ran = if shlv::model::canonical_list(&store)?.is_empty() {
-                false
-            } else {
-                let classifier = store.classifier(false)?;
-                store.apply_model(Some(&[added.id]), &classifier, &config.model)?;
-                true
-            };
-            #[cfg(not(feature = "model"))]
-            let model_ran = false;
+            let model_ran = classify_added(&mut store, &config, added.id)?;
             if !store.rules().is_empty() || model_ran {
                 let pending = store.pending(Some(added.id))?;
                 if !pending.is_empty() {
