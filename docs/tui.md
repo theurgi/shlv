@@ -10,8 +10,8 @@ a first proposal and may change.
 
 ## Screen
 
-The top line lists the views; `1`-`6` switch between them. Only Bookmarks is built so far; Review,
-Tags, Rules, Bootstrap, and Status are placeholders. The bar at the bottom shows the view, the
+The top line lists the views; `1`-`6` switch between them. Bookmarks and Rules are built so far;
+Review, Tags, Bootstrap, and Status are placeholders. The bar at the bottom shows the view, the
 search, the position in the list, marked bookmarks, and running background jobs; the line below it
 is for messages and prompts.
 
@@ -76,6 +76,27 @@ it returns, so a terminal browser gets the terminal. A browser command that stay
 browser closes keeps the TUI waiting too; point `$BROWSER` at one that returns (`xdg-open`,
 `firefox` with a window already open).
 
+## Rules
+
+Domain rules (see [config](config.md)): each host and tag, how many bookmarks the rule tagged or
+suggested the tag for (pending ones in parentheses), and `pinned` for rules from `[tags.rules]` in
+the config. Below them, **offered** rules: sites where you have tagged at least 3 bookmarks alike,
+and that tag is on 80% of the site's tagged bookmarks. Subdomains count toward their site when more
+than one of them does (`a.bandcamp.com` and `b.bandcamp.com` make `bandcamp.com`).
+
+| Key      | Action                                                             |
+| -------- | ------------------------------------------------------------------ |
+| `j` `k`  | Down, up (`g` `G`: top, bottom)                                    |
+| `Enter`  | The site's bookmarks with the tag, in Bookmarks (`site:host #tag`) |
+| `a`      | Add a rule: a host (or a URL on it) and tags; `Tab` completes tags |
+| `dd`     | Remove a rule and the pending suggestions only it made             |
+| `y`      | Create the offered rule                                            |
+| `n`      | Decline the offered rule; it isn't offered again                   |
+| `Ctrl-l` | Reload                                                             |
+
+A new rule runs on the bookmarks already on its site, so they get its tags as suggestions (or as
+tags, with `suggestions = "auto"`). Rules pinned in config can't be removed here.
+
 ## Background jobs
 
 Fetching titles and summarizing run on a worker thread with its own database connection, one job at
@@ -89,4 +110,6 @@ On the 100k benchmark library (release build, binary and database on tmpfs): the
 about 11 ms after start, over the cost of the terminal itself (`script` running `shlv` and `q`: 37.5
 ms, running `true`: 26.1 ms). Listing keeps only ids (100k in 6 ms) and reads the rows on screen. A
 search key costs what `shlv search` does over all results: 6 ms for `rust async`, 50 ms for `rust`
-(51k hits), 80 ms for `r`; keys typed faster than that are handled together, with one search.
+(51k hits), 80 ms for `r`; keys typed faster than that are handled together, with one search. The
+Rules view lists rules in about 6 ms; spotting rules to offer reads every tag of the library, about
+95 ms, when the view is first shown and after changes.

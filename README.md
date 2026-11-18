@@ -52,6 +52,8 @@ $ shlv search fts5
 | `tag proposals alias NAME TAG` | Make a proposed name an alias of TAG and tag its bookmarks with it    |
 | `tag proposals reject NAME`    | Remember a name: it isn't proposed again                              |
 | `tag health`                   | Measure the list: redundant, broad, rare, misnamed tags, and gaps     |
+| `rule add HOST TAG...`         | Suggest TAGs for bookmarks on HOST; `rule rm HOST [TAG]...` removes   |
+| `rule ls`                      | Domain rules (saved and from config) with what each tagged            |
 | `review [-n N]`                | Review bookmarks in batches, one key per decision; see docs/config.md |
 | `import FILE`                  | Import Netscape HTML, JSON lines, or a list of URLs; `-` is stdin     |
 | `export [--format html]`       | Print every bookmark as JSON lines, or HTML that browsers import      |
@@ -65,8 +67,8 @@ $ shlv search fts5
 | `batch status\|collect`        | Check on or apply Message Batches from `--batch` (`ai`)               |
 | `model train\|status\|eval`    | Train, inspect, or measure the tag classifier (`model`)               |
 
-`ls`, `search`, `tag ls`, `tag proposals ls`, and `suggest ls` take `--json` for one JSON object per
-line. `-n 0` shows every result.
+`ls`, `search`, `tag ls`, `tag proposals ls`, `rule ls`, and `suggest ls` take `--json` for one JSON
+object per line. `-n 0` shows every result.
 
 To tag many bookmarks at once, pipe a search into `edit`, which reads ids from the start of each
 line (or `--json`); `--pick` goes through them one key each to choose some:

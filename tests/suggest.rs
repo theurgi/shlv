@@ -283,7 +283,7 @@ fn strict_mode_checks_every_rule_tag() {
     );
     assert_eq!(
         e.to_string(),
-        "[tags.rules] uses tags that aren't canonical (strict_tags is on): rust (docs.rs), \
+        "domain rules use tags that aren't canonical (strict_tags is on): rust (docs.rs), \
          node (nodejs.org)"
     );
     assert!(s.apply_rules(None).is_err());

@@ -17,6 +17,7 @@ use shlv::config::Config;
 
 use super::bookmarks::Bookmarks;
 use super::input::{Edited, Input};
+use super::rules::Rules;
 use super::worker::{Job, OpenStore, Report, Worker};
 
 /// The views, switched with `1`-`6` or `:name`.
@@ -68,7 +69,7 @@ impl View {
             View::Bookmarks => "",
             View::Review => "Review batches and the suggestions queue: task 044.",
             View::Tags => "The tag list, edits, proposals, health, and back-fill: task 045.",
-            View::Rules => "Domain rules: task 043.",
+            View::Rules => "",
             View::Bootstrap => "Interests, tag seed, and tag draft: task 046.",
             View::Status => "Classifier, background jobs, and config: task 046.",
         }
@@ -99,6 +100,7 @@ pub struct App {
     pub config: Config,
     pub view: View,
     pub bookmarks: Bookmarks,
+    pub rules: Rules,
     help: bool,
     command: Option<Input>,
     message: Option<(String, Tone)>,
@@ -120,6 +122,7 @@ impl App {
             config,
             view: View::Bookmarks,
             bookmarks: Bookmarks::default(),
+            rules: Rules::default(),
             help: false,
             command: None,
             message: None,
@@ -233,6 +236,24 @@ impl App {
     /// Tags may have changed: completion reloads them.
     pub(super) fn tags_changed(&mut self) {
         self.tag_names = None;
+        self.rules_changed();
+    }
+
+    /// Shows a view, loading what it lists if it hasn't yet.
+    pub(super) fn switch(&mut self, v: View) {
+        self.view = v;
+        self.message = None;
+        if v == View::Rules {
+            self.rules_enter();
+        }
+    }
+
+    /// A view's hint for the bottom line while it is in the middle of something.
+    fn view_hint(&self) -> Option<&'static str> {
+        match self.view {
+            View::Rules => self.rules_hint(),
+            _ => None,
+        }
     }
 
     /// Handles a terminal event.
@@ -247,8 +268,12 @@ impl App {
     fn paste(&mut self, text: &str) {
         if let Some(c) = &mut self.command {
             c.insert(text);
-        } else if self.view == View::Bookmarks {
-            self.bookmarks_paste(text);
+        } else {
+            match self.view {
+                View::Bookmarks => self.bookmarks_paste(text),
+                View::Rules => self.rules_paste(text),
+                _ => {}
+            }
         }
     }
 
@@ -266,7 +291,12 @@ impl App {
             return;
         }
         // A view in the middle of something (typing a search, a form) takes every key.
-        if self.view == View::Bookmarks && self.bookmarks_key(k) {
+        let taken = match self.view {
+            View::Bookmarks => self.bookmarks_key(k),
+            View::Rules => self.rules_key(k),
+            _ => false,
+        };
+        if taken {
             return;
         }
         if !k.modifiers.difference(KeyModifiers::SHIFT).is_empty() {
@@ -276,10 +306,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char(':') => self.command = Some(Input::default()),
-            KeyCode::Char(c @ '1'..='6') => {
-                self.view = View::ALL[c as usize - '1' as usize];
-                self.message = None;
-            }
+            KeyCode::Char(c @ '1'..='6') => self.switch(View::ALL[c as usize - '1' as usize]),
             _ => {}
         }
     }
@@ -312,10 +339,7 @@ impl App {
             "q" | "q!" | "quit" | "qa" | "wq" | "x" => self.quit = true,
             "help" | "h" => self.help = true,
             name => match View::by_name(name) {
-                Some(v) => {
-                    self.view = v;
-                    self.message = None;
-                }
+                Some(v) => self.switch(v),
                 None => self.warn(format!("unknown command :{text} (? lists the keys)")),
             },
         }
@@ -332,6 +356,7 @@ impl App {
         self.draw_header(f, header);
         match self.view {
             View::Bookmarks => self.draw_bookmarks(f, body),
+            View::Rules => self.draw_rules(f, body),
             v => f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),
@@ -365,8 +390,10 @@ impl App {
             format!(" {} ", self.view.title()),
             Style::new().add_modifier(Modifier::BOLD),
         )];
-        if self.view == View::Bookmarks {
-            left.extend(self.bookmarks_status());
+        match self.view {
+            View::Bookmarks => left.extend(self.bookmarks_status()),
+            View::Rules => left.extend(self.rules_status()),
+            _ => {}
         }
         let mut right = Vec::new();
         if let Some(r) = self.jobs.values().next() {
@@ -396,6 +423,8 @@ impl App {
             draw_line_input(f, area, ":", input);
         } else if self.view == View::Bookmarks && self.draw_bookmarks_prompt(f, area) {
             // The view drew its prompt or hint.
+        } else if let Some(hint) = self.view_hint() {
+            f.render_widget(Line::from(hint).dim(), area);
         } else if let Some((text, tone)) = &self.message {
             let style = match tone {
                 Tone::Info => Style::new(),
@@ -428,6 +457,7 @@ impl App {
         );
         match self.view {
             View::Bookmarks => section(self.view.title(), &super::bookmarks::keys()),
+            View::Rules => section(self.view.title(), &super::rules::keys()),
             v => section(v.title(), &[("", v.placeholder())]),
         }
         lines.pop();

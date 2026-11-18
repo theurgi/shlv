@@ -543,6 +543,7 @@ impl Store {
         tx.execute("DELETE FROM tag_proposal WHERE id = ?1", [id])?;
         forget_declared(&tx, forget)?;
         tx.commit()?;
+        self.reload_rules()?;
         Ok(Decided {
             tag: target,
             tagged,

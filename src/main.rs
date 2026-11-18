@@ -100,6 +100,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TagCmd,
     },
+    /// Domain rules: bookmarks on a host get tags suggested (list, add, remove)
+    Rule {
+        #[command(subcommand)]
+        cmd: RuleCmd,
+    },
     /// Review bookmarks in batches: accept, toggle, or add tags one key each, then decide the
     /// names proposed, back-fill new tags, and retrain
     Review(review_cmd::ReviewArgs),
@@ -681,8 +686,9 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                         bad.0.join(" ")
                     ),
                     _ if let Some(bad) = e.downcast_ref::<NonCanonicalRuleTags>() => anyhow!(
-                        "nothing imported: {}: {bad}\n\
-                         hint: make the tags canonical, change the rules, or pass --no-rules",
+                        "nothing imported: {bad}\n\
+                         hint: make the tags canonical, change the rules ([tags.rules] in {}, or \
+                         `shlv rule rm`), or pass --no-rules",
                         config_path.display()
                     ),
                     _ => e.context(format!("cannot import {name}")),
@@ -800,6 +806,9 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
         }
         Cmd::Tag { cmd } => {
             run_tag(&mut store, cmd, &mut out, &style).map_err(|e| pinned_hint(e, &config_path))?
+        }
+        Cmd::Rule { cmd } => {
+            run_rule(&mut store, cmd, &mut out, &style).map_err(|e| pinned_hint(e, &config_path))?
         }
         Cmd::Suggest {
             cmd: None,
@@ -1152,7 +1161,8 @@ fn print_model_stats(
 fn rules_hint(e: anyhow::Error, config: &Path) -> anyhow::Error {
     match e.downcast_ref::<NonCanonicalRuleTags>() {
         Some(bad) => anyhow!(
-            "{}: {bad}\nhint: make the tags canonical, or change the rules",
+            "{bad}\nhint: make the tags canonical, or change the rules ([tags.rules] in {}, or \
+             `shlv rule rm`)",
             config.display()
         ),
         None => e,
@@ -1253,6 +1263,87 @@ fn print_suggested(out: &mut impl Write, group: &[Suggestion], s: &Style) -> io:
             write!(out, " {c:.2}")?;
         }
         write!(out, "){}", s.reset)?;
+    }
+    Ok(())
+}
+
+/// `shlv rule`: domain rules saved in the database, with those pinned in config.
+#[derive(Subcommand)]
+enum RuleCmd {
+    /// List the rules: host, tag, what each tagged (pending in parentheses); # pinned marks
+    /// rules from [tags.rules] in the config
+    Ls {
+        /// One JSON object per line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Suggest TAGs for bookmarks on HOST or its subdomains, and run the rules on the ones
+    /// already saved
+    Add {
+        /// A host (github.com) or a URL on it
+        host: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+    /// Remove HOST's rule for TAGs, or all its saved rules; drops the pending suggestions
+    /// they made
+    Rm { host: String, tags: Vec<String> },
+}
+
+fn run_rule(store: &mut Store, cmd: RuleCmd, out: &mut impl Write, style: &Style) -> Result<()> {
+    match cmd {
+        RuleCmd::Ls { json } => {
+            let list = store.rule_list()?;
+            if json {
+                for r in &list {
+                    serde_json::to_writer(&mut *out, r).map_err(io::Error::from)?;
+                    writeln!(out)?;
+                }
+                return Ok(());
+            }
+            let width = list.iter().map(|r| r.host.len()).max().unwrap_or(0);
+            for r in &list {
+                let pending = if r.pending > 0 {
+                    format!(" ({} pending)", r.pending)
+                } else {
+                    String::new()
+                };
+                let pinned = if r.pinned { "  # pinned" } else { "" };
+                let pinned = format!("{}{pinned}{}", style.dim, style.reset);
+                writeln!(
+                    out,
+                    "{:width$}  {}#{}{}  {}{pending}{pinned}",
+                    r.host,
+                    style.tag,
+                    r.tag,
+                    style.reset,
+                    plural(r.tagged, "bookmark"),
+                )?;
+            }
+        }
+        RuleCmd::Add { host, tags } => {
+            let added = store.add_rule(&host, &tags)?;
+            let host = &added.host;
+            if !added.existing.is_empty() {
+                let t: Vec<String> = added.existing.iter().map(|t| format!("#{t}")).collect();
+                writeln!(out, "{host} already gets {}", t.join(" "))?;
+            }
+            if !added.added.is_empty() {
+                let t: Vec<String> = added.added.iter().map(|t| format!("#{t}")).collect();
+                writeln!(out, "added rule {host} → {}", t.join(" "))?;
+                let s = store.apply_rules_on(host)?;
+                print_rule_stats(out, &s, store.suggest_mode())?;
+            }
+        }
+        RuleCmd::Rm { host, tags } => {
+            let r = store.remove_rule(&host, &tags)?;
+            let t: Vec<String> = r.removed.iter().map(|t| format!("#{t}")).collect();
+            write!(out, "removed rule {} → {}", r.host, t.join(" "))?;
+            if r.dropped > 0 {
+                write!(out, "; dropped {}", plural(r.dropped, "pending suggestion"))?;
+            }
+            writeln!(out)?;
+        }
     }
     Ok(())
 }

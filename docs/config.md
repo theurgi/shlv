@@ -70,6 +70,15 @@ and tags must be normalized, like declared names (`github.com`, not `GitHub.com`
 tagging layers, the [classifier](classifier.md) and the [`[ai] tag` provider](ai.md), add their
 suggestions to the same list.
 
+Rules also live in the database: `rule add HOST TAG...` saves one (a URL works as the host, and
+aliases resolve to their tags) and runs the rules on the host's bookmarks; `rule rm HOST [TAG...]`
+removes rules and the pending suggestions only they made; `rule ls` lists every rule with how many
+bookmarks it tagged or suggested a tag for. The TUI's Rules view does the same, and offers a rule
+where you have tagged several bookmarks of one site alike (at least 3, and 80% of the site's tagged
+bookmarks; `bandcamp.com` counts its artists' subdomains together). Rules in `[tags.rules]` are
+pinned: they apply alongside the saved ones, `rule rm` refuses them, and removing one from the
+config removes it. A tag renamed or merged in shlv takes its saved rules along.
+
 ## Proposals
 
 A tag outside the canonical list can be a _proposal_ for the list: a name with an optional

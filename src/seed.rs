@@ -168,9 +168,10 @@ impl Store {
     pub fn forget_interests(&mut self, names: &[String]) -> Result<usize> {
         let names: Vec<String> = names.iter().map(|n| normalize_interest(n)).collect();
         if let Some(p) = names.iter().find(|n| self.pinned_interests.contains(n)) {
-            return Err(crate::tag::pinned(format!(
-                "cannot forget interest {p}: it is pinned in config ([tags] interests)"
-            )));
+            return Err(crate::tag::pinned_by(
+                format!("cannot forget interest {p}"),
+                "[tags] interests",
+            ));
         }
         let tx = self.conn.transaction()?;
         let mut n = 0;
@@ -286,6 +287,7 @@ impl Store {
         s.saved = save_interests(&tx, save, now)?;
         forget_declared(&tx, forget)?;
         tx.commit()?;
+        self.reload_rules()?;
         Ok(s)
     }
 }

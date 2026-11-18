@@ -299,7 +299,10 @@ fn pinned_interests_are_expanded_and_reported() {
         "home-lab  (pinned in config)\n"
     );
     let e = f.run(&["tag", "interests", "--rm", "home-lab"], "").2;
-    assert!(e.contains("pinned in config"), "{e}");
+    assert!(
+        e.contains("pinned by [tags] interests in the config"),
+        "{e}"
+    );
 }
 
 #[test]

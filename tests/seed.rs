@@ -60,7 +60,11 @@ fn interests_saved_pinned_and_forgotten() {
     );
     assert_eq!(s.forget_interests(&strings(&["nix", "none"])).unwrap(), 1);
     let e = s.forget_interests(&strings(&["audio"])).unwrap_err();
-    assert!(e.to_string().contains("pinned in config"), "{e}");
+    assert!(
+        e.to_string()
+            .contains("pinned by [tags] interests in the config"),
+        "{e}"
+    );
 }
 
 #[test]

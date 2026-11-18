@@ -507,26 +507,26 @@ impl std::fmt::Display for NonCanonicalTags {
 
 impl std::error::Error for NonCanonicalTags {}
 
-/// An edit refused because the declared list pins the tag, alias, or description it would change
-/// (see [`Store::pin`]). The message says what was refused; callers add where the list is
-/// declared.
+/// An edit refused because config pins what it would change: a tag, alias, or description of
+/// the declared list (see [`Store::pin`]), an interest, or a domain rule. The message says what
+/// was refused and the config key that pins it; callers add where the config is.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Pinned(pub String);
+pub struct Pinned(pub String, pub &'static str);
 
 impl std::fmt::Display for Pinned {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: it is pinned by [tags.canonical] in the config",
-            self.0
-        )
+        write!(f, "{}: it is pinned by {} in the config", self.0, self.1)
     }
 }
 
 impl std::error::Error for Pinned {}
 
 pub(crate) fn pinned(what: String) -> anyhow::Error {
-    Pinned(what).into()
+    pinned_by(what, "[tags.canonical]")
+}
+
+pub(crate) fn pinned_by(what: String, key: &'static str) -> anyhow::Error {
+    Pinned(what, key).into()
 }
 
 impl Store {
@@ -615,6 +615,7 @@ impl Store {
             None => {}
         }
         free_name(&tx, &new)?;
+        crate::rules::rename_rule_tag(&tx, &old, &new)?;
         tx.execute(
             "UPDATE tag SET name = ?2, updated_at = ?3 WHERE id = ?1",
             params![id, new, now],
@@ -623,6 +624,7 @@ impl Store {
         touch_many(&tx, &bookmarks, now)?;
         forget_declared(&tx, forget)?;
         tx.commit()?;
+        self.reload_rules()?;
         Ok(Retagged {
             tag: new,
             bookmarks: bookmarks.len(),
@@ -654,6 +656,7 @@ impl Store {
         })?;
         forget_declared(&tx, forget)?;
         tx.commit()?;
+        self.reload_rules()?;
         Ok(Retagged { tag, bookmarks })
     }
 
@@ -901,6 +904,7 @@ impl Store {
 
         meta_set(&tx, DECLARED_HASH, &hash)?;
         tx.commit()?;
+        self.reload_rules()?;
         Ok(Some(stats))
     }
 }
@@ -952,6 +956,10 @@ pub(crate) fn merge_into(
         "UPDATE tag SET deleted_at = ?2, updated_at = ?2, canonical = 0 WHERE id = ?1",
         params![from_id, now],
     )?;
+    let into: String = tx.query_row("SELECT name FROM tag WHERE id = ?1", [into_id], |r| {
+        r.get(0)
+    })?;
+    crate::rules::rename_rule_tag(tx, from, &into)?;
     touch_many(tx, &bookmarks, now)?;
     Ok(bookmarks.len())
 }

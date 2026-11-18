@@ -13,11 +13,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Paragraph, Wrap};
 use shlv::store::normalize_tag;
 use shlv::{Bookmark, Deleted, Edit, NewBookmark};
 
-use super::app::{App, centered, draw_line_input, edited};
+use super::app::{App, draw_line_input};
+use super::form::{Field, Form, FormKey, draw_form};
 use super::input::{Edited, Input};
 #[cfg(feature = "fetch")]
 use super::worker::Job;
@@ -94,13 +95,7 @@ enum Mode {
     Delete,
     /// Going through the current bookmark's pending suggestions; the one selected.
     Suggest(usize),
-    Form(Form),
-}
-
-struct Form {
-    kind: FormKind,
-    fields: Vec<Field>,
-    focus: usize,
+    Form(Form<FormKind>),
 }
 
 enum FormKind {
@@ -115,39 +110,6 @@ enum FormKind {
         ids: Vec<i64>,
         old: Option<Vec<String>>,
     },
-}
-
-struct Field {
-    label: &'static str,
-    input: Input,
-    tags: bool,
-}
-
-impl Field {
-    fn line(label: &'static str, text: &str) -> Field {
-        Field {
-            label,
-            input: Input::new(text),
-            tags: false,
-        }
-    }
-
-    fn tags(label: &'static str, text: &str) -> Field {
-        Field {
-            tags: true,
-            ..Field::line(label, text)
-        }
-    }
-
-    fn height(&self, focused: bool) -> u16 {
-        if self.input.is_multiline() {
-            5
-        } else if self.tags && focused {
-            2
-        } else {
-            1
-        }
-    }
 }
 
 impl Bookmarks {
@@ -503,6 +465,7 @@ impl App {
             self.say("no pending suggestions");
             return;
         }
+        self.tags_changed();
         let verb = if accept { "accepted" } else { "rejected" };
         self.say(format!("{verb} {}", hashed(&done)));
     }
@@ -533,6 +496,7 @@ impl App {
                         let verb = if c == 'y' { "accepted" } else { "rejected" };
                         self.say(format!("{verb} #{}", s.tag));
                         self.bookmarks.forget(&[id]);
+                        self.tags_changed();
                     }
                     Err(e) => self.warn(format!("{e:#}")),
                 }
@@ -571,11 +535,7 @@ impl App {
         self.bookmarks.mode = Mode::Form(Form {
             fields: vec![
                 Field::line("Title", &title),
-                Field {
-                    label: "Note",
-                    input: Input::multiline(&note),
-                    tags: false,
-                },
+                Field::multiline("Note", &note),
             ],
             kind: FormKind::Edit { id, title, note },
             focus: 0,
@@ -611,34 +571,17 @@ impl App {
         });
     }
 
-    fn form_key(&mut self, k: KeyEvent, mut form: Form) {
-        let alt = k.modifiers.contains(KeyModifiers::ALT);
-        let n = form.fields.len();
-        match k.code {
-            KeyCode::Esc => return,
-            KeyCode::Enter if !alt => {
-                if self.submit(&form) {
-                    return;
-                }
-            }
-            KeyCode::Down => form.focus = (form.focus + 1) % n,
-            KeyCode::Up | KeyCode::BackTab => form.focus = (form.focus + n - 1) % n,
-            KeyCode::Tab if form.fields[form.focus].tags => {
-                let names = self.tag_names().to_vec();
-                if !form.fields[form.focus].input.complete(&names) {
-                    self.say("no tag starts that way");
-                }
-            }
-            KeyCode::Tab => form.focus = (form.focus + 1) % n,
-            _ => {
-                edited(&mut form.fields[form.focus].input, k);
-            }
+    fn form_key(&mut self, k: KeyEvent, mut form: Form<FormKind>) {
+        match self.form_input(&mut form, k) {
+            FormKey::Cancel => return,
+            FormKey::Submit if self.submit(&form) => return,
+            _ => {}
         }
         self.bookmarks.mode = Mode::Form(form);
     }
 
     /// Saves a form; returns false (keeping it open) if that failed.
-    fn submit(&mut self, form: &Form) -> bool {
+    fn submit(&mut self, form: &Form<FormKind>) -> bool {
         let text = |i: usize| form.fields[i].input.text().to_string();
         let r = match &form.kind {
             FormKind::Add => self.add(text(0), text(1), &text(2)),
@@ -822,10 +765,7 @@ impl App {
                 FormKind::Edit { .. } => {
                     "Enter saves · Alt-Enter new line · ↑↓ field · Esc cancels"
                 }
-                _ if form.fields[form.focus].tags => {
-                    "Enter saves · Tab completes · ↑↓ field · Esc cancels"
-                }
-                _ => "Enter saves · Tab next field · Esc cancels",
+                _ => form.hint(),
             },
         };
         f.render_widget(Line::from(hint).dim(), area);
@@ -850,7 +790,15 @@ impl App {
             self.draw_detail(f, d);
         }
         if let Mode::Form(form) = &self.bookmarks.mode {
-            draw_form(f, area, form);
+            let title = match &form.kind {
+                FormKind::Add => "Add a bookmark".to_string(),
+                FormKind::Edit { id, .. } => format!("Edit {id}"),
+                FormKind::Tags { ids, .. } => match ids[..] {
+                    [id] => format!("Tags of {id}"),
+                    _ => format!("Tags of {} bookmarks", ids.len()),
+                },
+            };
+            draw_form(f, area, &title, form);
         }
     }
 
@@ -1023,95 +971,6 @@ impl App {
     }
 }
 
-fn draw_form(f: &mut Frame, area: Rect, form: &Form) {
-    let title = match &form.kind {
-        FormKind::Add => " Add a bookmark ".to_string(),
-        FormKind::Edit { id, .. } => format!(" Edit {id} "),
-        FormKind::Tags { ids, .. } => match ids[..] {
-            [id] => format!(" Tags of {id} "),
-            _ => format!(" Tags of {} bookmarks ", ids.len()),
-        },
-    };
-    let heights: Vec<u16> = form
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(i, fl)| fl.height(i == form.focus))
-        .collect();
-    let width = 76.min(area.width.saturating_sub(2)).max(20);
-    let box_area = centered(area, width, heights.iter().sum::<u16>() + 2);
-    f.render_widget(Clear, box_area);
-    let block = Block::bordered().title(title);
-    let inner = block.inner(box_area);
-    f.render_widget(block, box_area);
-    let rows = Layout::vertical(heights.iter().map(|&h| Constraint::Length(h))).split(inner);
-    let label_width = form
-        .fields
-        .iter()
-        .map(|fl| fl.label.len())
-        .max()
-        .unwrap_or(0)
-        + 2;
-    for (i, (field, &row)) in form.fields.iter().zip(rows.iter()).enumerate() {
-        let focused = i == form.focus;
-        let label = format!("{:<label_width$}", format!("{}:", field.label));
-        let label_style = if focused {
-            Style::new().bold()
-        } else {
-            Style::new().add_modifier(Modifier::DIM)
-        };
-        if field.input.is_multiline() {
-            // The label on its own line, then the text, scrolled to keep the cursor in view.
-            let [head, body] =
-                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(row);
-            f.render_widget(Line::styled(label, label_style), head);
-            let line = field.input.cursor_line() as u16;
-            let scroll = line.saturating_sub(body.height.saturating_sub(1));
-            f.render_widget(
-                Paragraph::new(field.input.text().to_string()).scroll((scroll, 0)),
-                body,
-            );
-            if focused {
-                let col = (field.input.cursor_col() as u16).min(body.width.saturating_sub(1));
-                f.set_cursor_position((body.x + col, body.y + line - scroll));
-            }
-            continue;
-        }
-        let [line_area, rest] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(row);
-        let [l, input_area] =
-            Layout::horizontal([Constraint::Length(label_width as u16), Constraint::Min(1)])
-                .areas(line_area);
-        f.render_widget(Line::styled(label, label_style), l);
-        if focused {
-            draw_line_input(f, input_area, "", &field.input);
-        } else {
-            f.render_widget(Line::from(field.input.text().to_string()), input_area);
-        }
-        if focused && field.tags && rest.height > 0 {
-            let hint = match field.input.completions() {
-                Some((names, i)) => {
-                    let mut spans = Vec::new();
-                    for (j, n) in names.iter().enumerate() {
-                        let style = if j == i {
-                            Style::new()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::REVERSED)
-                        } else {
-                            Style::new().fg(Color::Cyan)
-                        };
-                        spans.push(Span::styled(n.clone(), style));
-                        spans.push(Span::raw(" "));
-                    }
-                    Line::from(spans)
-                }
-                None => Line::from(format!("{:label_width$}Tab completes", "")).dim(),
-            };
-            f.render_widget(hint, rest);
-        }
-    }
-}
-
 /// `rule`, `model 0.82`: where a tag came from.
 fn source(source: &str, confidence: Option<f64>) -> String {
     match confidence {
@@ -1136,4 +995,18 @@ fn host(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     host.strip_prefix("www.").unwrap_or(host)
+}
+
+impl App {
+    /// Switches to the Bookmarks view showing a search's results (a jump from another view).
+    pub(super) fn show_bookmarks(&mut self, query: &str) {
+        self.switch(super::app::View::Bookmarks);
+        self.bookmarks.mode = Mode::Normal;
+        self.search(query);
+    }
+
+    /// Bookmarks changed elsewhere (tags, suggestions): rows are read again when drawn.
+    pub(super) fn bookmarks_changed(&mut self) {
+        self.bookmarks.rows.clear();
+    }
 }

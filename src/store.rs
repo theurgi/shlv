@@ -189,7 +189,12 @@ pub struct Store {
     strict_tags: StrictTags,
     /// The declared list, once [`Store::pin`] has synced it.
     pub(crate) pinned: Option<crate::tag::DeclaredTags>,
+    /// The rules in effect: `pinned_rules` and `saved_rules` together.
     pub(crate) rules: DomainRules,
+    /// Rules from config; see [`Store::set_rules`].
+    pub(crate) pinned_rules: DomainRules,
+    /// Rules saved in the database, as last read; see [`Store::reload_rules`].
+    pub(crate) saved_rules: DomainRules,
     pub(crate) suggest_mode: SuggestMode,
     pub(crate) style: TagStyle,
     /// Interests pinned in config (`[tags] interests`), normalized.
@@ -199,7 +204,7 @@ pub struct Store {
 impl Store {
     /// Opens the database at `path`, creating it and applying migrations as needed.
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Store::new(db::open(path)?))
+        Store::new(db::open(path)?)
     }
 
     /// Opens the database at the default location (see [`db::default_path`]).
@@ -208,19 +213,23 @@ impl Store {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Store::new(db::open_in_memory()?))
+        Store::new(db::open_in_memory()?)
     }
 
-    fn new(conn: Connection) -> Self {
-        Store {
+    fn new(conn: Connection) -> Result<Self> {
+        let mut store = Store {
             conn,
             strict_tags: StrictTags::Off,
             pinned: None,
             rules: DomainRules::default(),
+            pinned_rules: DomainRules::default(),
+            saved_rules: DomainRules::default(),
             suggest_mode: SuggestMode::default(),
             style: TagStyle::default(),
             pinned_interests: Vec::new(),
-        }
+        };
+        store.reload_rules()?;
+        Ok(store)
     }
 
     /// In strict mode, adding a tag that isn't canonical or an alias of a canonical tag fails

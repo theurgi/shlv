@@ -648,3 +648,100 @@ fn queued_keys_run_one_search() {
     assert_eq!(app.bookmarks.query, "python NOT tips");
     assert!(app.bookmarks.ids.is_empty());
 }
+
+#[test]
+fn rules_view_adds_removes_and_offers() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://a.bandcamp.com/", "A", &["music"]),
+        ("https://b.bandcamp.com/", "B", &["music"]),
+        ("https://c.bandcamp.com/", "C", &["music"]),
+        ("https://d.bandcamp.com/", "D", &[]),
+        ("https://github.com/x", "X", &[]),
+    ]);
+    let mut app = db.app_with(Config::default(), |s| {
+        let rules = [("docs.rs".to_string(), vec!["rust".to_string()])];
+        s.set_rules(DomainRules::new(rules.into_iter().collect()).unwrap());
+    });
+    press(&mut app, "4");
+    let t = text(&mut app);
+    assert!(t.contains("docs.rs"), "{t}");
+    assert!(t.contains("#rust"), "{t}");
+    assert!(t.contains("pinned"), "{t}");
+    assert!(t.contains("Offered"), "{t}");
+    assert!(t.contains("on 3 of 3 tagged bookmarks"), "{t}");
+    // Pinned rules stay.
+    press(&mut app, "d");
+    assert!(
+        message(&app).contains("pinned by [tags.rules]"),
+        "{}",
+        message(&app)
+    );
+    // y on the offer creates the rule and runs it on the site.
+    press(&mut app, "jy");
+    assert!(
+        message(&app).contains("added rule bandcamp.com → #music; 1 new suggestion"),
+        "{}",
+        message(&app)
+    );
+    let s = db.store();
+    assert_eq!(s.saved_rules().tags_of("bandcamp.com"), ["music"]);
+    let d = s.find_by_url("https://d.bandcamp.com/").unwrap().unwrap();
+    assert_eq!(s.pending(Some(d.id)).unwrap()[0].tag, "music");
+    assert!(!text(&mut app).contains("Offered"));
+
+    // a adds one with a form; tags complete.
+    press(&mut app, "agithub.com/x<Tab>code git<Enter>");
+    assert!(
+        message(&app).contains("added rule github.com → #code #git; 2 new suggestions"),
+        "{}",
+        message(&app)
+    );
+    let t = text(&mut app);
+    assert!(t.contains("github.com"), "{t}");
+    // Bad input keeps the form open with the error.
+    press(&mut app, "anot a host<Tab>x<Enter>");
+    assert!(
+        message(&app).contains("not a host name"),
+        "{}",
+        message(&app)
+    );
+    assert!(text(&mut app).contains("Add a rule"));
+    press(&mut app, "<Esc>");
+
+    // dd removes the rule under the cursor and its pending suggestions.
+    press(&mut app, "g");
+    let first = db.store().rule_list().unwrap()[0].clone();
+    assert_eq!(
+        (first.host.as_str(), first.tag.as_str()),
+        ("bandcamp.com", "music")
+    );
+    press(&mut app, "dd");
+    assert_eq!(
+        message(&app),
+        "removed rule bandcamp.com → #music; dropped 1 pending suggestion"
+    );
+    assert!(db.store().saved_rules().tags_of("bandcamp.com").is_empty());
+
+    // Enter shows the rule's bookmarks.
+    press(&mut app, "<Enter>");
+    assert_eq!(app.view, View::Bookmarks);
+    assert_eq!(app.bookmarks.query, "site:docs.rs #rust");
+}
+
+#[test]
+fn rules_view_declines_offers() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://x.example/1", "", &["blog"]),
+        ("https://x.example/2", "", &["blog"]),
+        ("https://x.example/3", "", &["blog"]),
+    ]);
+    let mut app = db.app();
+    press(&mut app, ":rules<Enter>");
+    assert!(text(&mut app).contains("No domain rules yet"));
+    press(&mut app, "n");
+    assert_eq!(message(&app), "won't offer x.example → #blog again");
+    assert!(!text(&mut app).contains("Offered"));
+    assert!(db.store().rule_candidates(3, 0.8).unwrap().is_empty());
+}

@@ -1247,8 +1247,9 @@ fn suggest_strict_rules() {
     assert_eq!(
         e,
         format!(
-            "shlv: {path}: [tags.rules] uses tags that aren't canonical (strict_tags is on): \
-             rust (docs.rs)\nhint: make the tags canonical, or change the rules\n"
+            "shlv: domain rules use tags that aren't canonical (strict_tags is on): rust (docs.rs)\n\
+             hint: make the tags canonical, or change the rules ([tags.rules] in {path}, or \
+             `shlv rule rm`)\n"
         )
     );
     assert!(db.fail(&["suggest", "--all"]).contains("rust (docs.rs)"));
@@ -1309,9 +1310,10 @@ fn import_runs_domain_rules() {
     assert_eq!(
         db.fail(&["import", file]),
         format!(
-            "shlv: nothing imported: {path}: [tags.rules] uses tags that aren't canonical \
+            "shlv: nothing imported: domain rules use tags that aren't canonical \
              (strict_tags is on): code (github.com)\n\
-             hint: make the tags canonical, change the rules, or pass --no-rules\n"
+             hint: make the tags canonical, change the rules ([tags.rules] in {path}, or \
+             `shlv rule rm`), or pass --no-rules\n"
         )
     );
 }
@@ -1633,4 +1635,39 @@ fn tag_health_reports_and_validates_flags() {
     );
     let (ok, _, err) = db.run(&["tag", "health", "--redundant", "1.5"]);
     assert!(!ok && err.contains("not a share between 0 and 1"), "{err}");
+}
+
+#[test]
+fn rule_add_ls_rm() {
+    let db = Db::new();
+    db.ok(&["add", "https://a.bandcamp.com/x"]);
+    std::fs::write(db.config(), "[tags.rules]\n\"github.com\" = [\"code\"]\n").unwrap();
+    db.ok(&["add", "https://bandcamp.com/y", "-t", "music"]);
+    assert_eq!(
+        db.ok(&["rule", "add", "https://Bandcamp.com/", "music"]),
+        "added rule bandcamp.com → #music\nrules matched 2 of 2 bookmarks: 1 new suggestion\n"
+    );
+    assert_eq!(
+        db.ok(&["rule", "add", "bandcamp.com", "music"]),
+        "bandcamp.com already gets #music\n"
+    );
+    db.ok(&["add", "https://github.com/x"]);
+    assert_eq!(
+        db.ok(&["rule", "ls"]),
+        "bandcamp.com  #music  1 bookmark (1 pending)\n\
+         github.com    #code  1 bookmark (1 pending)  # pinned\n"
+    );
+    let v = json_lines(&db.ok(&["rule", "ls", "--json"]));
+    assert_eq!(v[1]["host"], "github.com");
+    assert_eq!(v[1]["pinned"], true);
+    let e = db.fail(&["rule", "rm", "github.com"]);
+    assert!(
+        e.contains("(#code): it is pinned by [tags.rules] in the config\nhint: change it in"),
+        "{e}"
+    );
+    assert_eq!(
+        db.ok(&["rule", "rm", "bandcamp.com"]),
+        "removed rule bandcamp.com → #music; dropped 1 pending suggestion\n"
+    );
+    assert_eq!(db.ok(&["suggest", "ls"]).lines().count(), 1);
 }

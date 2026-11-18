@@ -151,6 +151,49 @@ impl DomainRules {
         }
     }
 
+    /// Whether a rule for exactly `host` gives `tag`.
+    pub fn contains(&self, host: &str, tag: &str) -> bool {
+        self.rules
+            .get(host)
+            .is_some_and(|t| t.iter().any(|x| x == tag))
+    }
+
+    /// Adds `tag` to the rule for `host` (both normalized). Returns false if it was there.
+    pub(crate) fn insert(&mut self, host: &str, tag: &str) -> bool {
+        let tags = self.rules.entry(host.to_string()).or_default();
+        if tags.iter().any(|t| t == tag) {
+            return false;
+        }
+        tags.push(tag.to_string());
+        true
+    }
+
+    /// Removes `tags` from the rule for `host`, and the rule if none is left.
+    pub(crate) fn remove(&mut self, host: &str, tags: &[String]) {
+        if let Some(list) = self.rules.get_mut(host) {
+            list.retain(|t| !tags.contains(t));
+            if list.is_empty() {
+                self.rules.remove(host);
+            }
+        }
+    }
+
+    /// The tags of the rule for exactly `host`.
+    pub fn tags_of(&self, host: &str) -> &[String] {
+        self.rules.get(host).map_or(&[], Vec::as_slice)
+    }
+
+    /// Both sets of rules: each host's tags from `self`, then those only `other` has.
+    pub fn union(&self, other: &DomainRules) -> DomainRules {
+        let mut out = self.clone();
+        for (host, tags) in other.iter() {
+            for t in tags {
+                out.insert(host, t);
+            }
+        }
+        out
+    }
+
     /// Every tag the rules use, deduplicated, in rule order.
     fn tags(&self) -> Vec<&str> {
         let mut seen = HashSet::new();
@@ -178,7 +221,7 @@ impl Serialize for DomainRules {
 
 /// A host as rules and `site:` see it: what `github.com`, `GitHub.com.`, or
 /// `https://github.com/x` normalize to.
-fn normalize_host(input: &str) -> Option<String> {
+pub fn normalize_host(input: &str) -> Option<String> {
     if input.trim().is_empty() || input.chars().any(char::is_whitespace) {
         return None;
     }
@@ -221,7 +264,7 @@ impl std::fmt::Display for NonCanonicalRuleTags {
         let list: Vec<String> = self.0.iter().map(|(h, t)| format!("{t} ({h})")).collect();
         write!(
             f,
-            "[tags.rules] uses tags that aren't canonical (strict_tags is on): {}",
+            "domain rules use tags that aren't canonical (strict_tags is on): {}",
             list.join(", ")
         )
     }
@@ -472,9 +515,12 @@ impl Store {
             .query_row(params![bookmark, source.as_str()], |r| r.get(0))?)
     }
 
-    /// Domain rules applied by [`Store::add`] and [`Store::apply_rules`]. None by default.
+    /// Pins domain rules from config: [`Store::add`] and [`Store::apply_rules`] use them along
+    /// with the rules saved in the database ([`Store::add_rule`]), and [`Store::remove_rule`]
+    /// refuses to remove them. None by default.
     pub fn set_rules(&mut self, rules: DomainRules) {
-        self.rules = rules;
+        self.pinned_rules = rules;
+        self.rules = self.pinned_rules.union(&self.saved_rules);
     }
 
     /// Whether suggestions are applied at once or wait for review. Confirm by default.
@@ -486,8 +532,14 @@ impl Store {
         self.suggest_mode
     }
 
+    /// The rules in effect: pinned from config and saved in the database.
     pub fn rules(&self) -> &DomainRules {
         &self.rules
+    }
+
+    /// The rules pinned from config; see [`Store::set_rules`].
+    pub fn pinned_rules(&self) -> &DomainRules {
+        &self.pinned_rules
     }
 
     /// In strict mode, fails unless every rule tag is canonical or an alias of a canonical tag.

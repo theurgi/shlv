@@ -62,7 +62,7 @@ fn opens_with_pragmas_and_schema() {
     let v: i64 = c
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 9);
+    assert_eq!(v, 10);
 }
 
 #[test]
@@ -386,6 +386,7 @@ fn upgrades_a_version_1_database() {
              DROP TABLE tag_proposal_bookmark; DROP TABLE tag_proposal; \
              DROP TABLE interest_tag; DROP TABLE interest; \
              DROP TABLE review_bookmark; DROP TABLE review_batch; \
+             DROP TABLE rule; DROP TABLE rule_declined; \
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -395,7 +396,7 @@ fn upgrades_a_version_1_database() {
         .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 9);
+    assert_eq!(v, 10);
     let n: i64 = s
         .conn()
         .query_row("SELECT count(*) FROM meta", [], |r| r.get(0))
