@@ -256,6 +256,25 @@ impl Store {
     /// `b.bandcamp.com`); a parent covers its subdomains, so they aren't offered as well. In
     /// strict mode, only canonical tags. Most bookmarks first.
     pub fn rule_candidates(&self, min: usize, share: f64) -> Result<Vec<RuleCandidate>> {
+        self.candidates(None, min, share)
+    }
+
+    /// The rules worth offering ([`Store::rule_candidates`], with [`OFFER_MIN`] and
+    /// [`OFFER_SHARE`]) for the site of one URL: its host and parent domains. Reads only that
+    /// site's bookmarks, so review can ask after each one.
+    pub fn rule_candidates_at(&self, url: &str) -> Result<Vec<RuleCandidate>> {
+        let norm = url::normalize(url);
+        let Some(host) = url::host(&norm) else {
+            return Ok(Vec::new());
+        };
+        let host = host.to_string();
+        let mut v = self.candidates(domains(&host).last(), OFFER_MIN, OFFER_SHARE)?;
+        v.retain(|c| domains(&host).any(|d| d == c.host));
+        Ok(v)
+    }
+
+    /// [`Store::rule_candidates`], for the bookmarks on `site` (and its subdomains) only.
+    fn candidates(&self, site: Option<&str>, min: usize, share: f64) -> Result<Vec<RuleCandidate>> {
         // Hosts and parent domains, interned: a 100k library has far fewer of them than tag rows.
         let mut names: Vec<String> = Vec::new();
         let mut ids: HashMap<String, u32> = HashMap::new();
@@ -287,15 +306,19 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.url_norm, bt.tag_id FROM bookmark_tag bt \
              JOIN bookmark b ON b.id = bt.bookmark_id \
-             WHERE bt.source <> 'rule' AND b.deleted_at IS NULL ORDER BY bt.bookmark_id",
+             WHERE bt.source <> 'rule' AND b.deleted_at IS NULL \
+             AND (?1 IS NULL OR instr(b.url_norm, ?1) > 0) ORDER BY bt.bookmark_id",
         )?;
-        let mut rows = stmt.query([])?;
+        let mut rows = stmt.query([site])?;
         while let Some(r) = rows.next()? {
             let (id, tag): (i64, i64) = (r.get(0)?, r.get(2)?);
             let norm = r.get_ref(1)?.as_str()?;
             let Some(host) = url::host(norm) else {
                 continue;
             };
+            if site.is_some_and(|s| !url::on_site(norm, s)) {
+                continue;
+            }
             let h = intern(host);
             for (i, d) in domains(host).enumerate() {
                 let site = sites.entry(if i == 0 { h } else { intern(d) }).or_default();

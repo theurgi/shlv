@@ -556,6 +556,18 @@ impl Store {
         self.query_tags(" AND t.canonical", TagSort::Name)
     }
 
+    /// One live tag, by name or alias.
+    pub fn tag_info(&self, name: &str) -> Result<Option<TagInfo>> {
+        let Some(id) = resolve_tag(&self.conn, &normalize_tag(name))? else {
+            return Ok(None);
+        };
+        // An integer id, so formatting it into the SQL is safe.
+        Ok(self
+            .query_tags(&format!(" AND t.id = {id}"), TagSort::Name)?
+            .into_iter()
+            .next())
+    }
+
     fn query_tags(&self, filter: &str, sort: TagSort) -> Result<Vec<TagInfo>> {
         let order = match sort {
             TagSort::Name => "t.name",

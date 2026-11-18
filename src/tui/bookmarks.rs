@@ -752,14 +752,21 @@ impl App {
         v
     }
 
-    /// Draws the bottom line while the view has something to say there; returns false if not.
+    /// Draws the search being typed on the bottom line; returns false if there's none.
     pub(super) fn draw_bookmarks_prompt(&self, f: &mut Frame, area: Rect) -> bool {
-        let hint = match &self.bookmarks.mode {
-            Mode::Normal | Mode::Delete => return false,
+        match &self.bookmarks.mode {
             Mode::Search { input, .. } => {
                 draw_line_input(f, area, "/", input);
-                return true;
+                true
             }
+            _ => false,
+        }
+    }
+
+    /// The keys of what the view is in the middle of, for the bottom line.
+    pub(super) fn bookmarks_hint(&self) -> Option<&'static str> {
+        Some(match &self.bookmarks.mode {
+            Mode::Normal | Mode::Delete | Mode::Search { .. } => return None,
             Mode::Suggest(_) => "y accept · n reject · j/k move · Esc done",
             Mode::Form(form) => match form.kind {
                 FormKind::Edit { .. } => {
@@ -767,9 +774,7 @@ impl App {
                 }
                 _ => form.hint(),
             },
-        };
-        f.render_widget(Line::from(hint).dim(), area);
-        true
+        })
     }
 
     pub(super) fn draw_bookmarks(&mut self, f: &mut Frame, area: Rect) {
@@ -1008,5 +1013,19 @@ impl App {
     /// Bookmarks changed elsewhere (tags, suggestions): rows are read again when drawn.
     pub(super) fn bookmarks_changed(&mut self) {
         self.bookmarks.rows.clear();
+    }
+}
+
+impl App {
+    /// A bookmark deleted elsewhere in the TUI joins the undo list.
+    pub(super) fn remember_delete(&mut self, d: Deleted) {
+        let id = d.bookmark.id;
+        let b = &mut self.bookmarks;
+        b.ids.retain(|&i| i != id);
+        b.total = b.total.saturating_sub(1);
+        b.marked.remove(&id);
+        b.move_to(b.cursor as isize);
+        b.undo.push(vec![d]);
+        self.tags_changed();
     }
 }

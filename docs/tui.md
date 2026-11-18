@@ -10,10 +10,10 @@ a first proposal and may change.
 
 ## Screen
 
-The top line lists the views; `1`-`6` switch between them. Bookmarks and Rules are built so far;
-Review, Tags, Bootstrap, and Status are placeholders. The bar at the bottom shows the view, the
-search, the position in the list, marked bookmarks, and running background jobs; the line below it
-is for messages and prompts.
+The top line lists the views; `1`-`6` switch between them. Bookmarks, Review, and Rules are built so
+far; Tags, Bootstrap, and Status are placeholders. The bar at the bottom shows the view, the search,
+the position in the list, marked bookmarks, and running background jobs; the line below it is for
+messages (until the next key), prompts, and the keys of what you are in the middle of.
 
 ## Everywhere
 
@@ -75,6 +75,43 @@ suggestions. Proposals it carried and its review history aren't kept. Undo lasts
 it returns, so a terminal browser gets the terminal. A browser command that stays running until the
 browser closes keeps the TUI waiting too; point `$BROWSER` at one that returns (`xdg-open`,
 `firefox` with a window already open).
+
+## Review
+
+`shlv review` in the TUI (see [config](config.md#review)): batches of bookmarks, one key per
+decision, and the queue of pending suggestions (`Tab` switches between them).
+
+**Batches** are picked and their suggestions made on the worker (domain rules, the classifier, the
+`[ai] tag` provider), as `shlv review` does: bookmarks not reviewed yet, spread across sites until
+the classifier has 100 reviewed bookmarks to learn from, then the ones it is least sure about. `f`
+sets filters (a suggested tag, its source, a confidence it must be below) and the batch size; with a
+filter, batches hold bookmarks with matching suggestions, reviewed or not.
+
+| Key          | In a batch                                                         |
+| ------------ | ------------------------------------------------------------------ |
+| `Enter`, `y` | Save: the checked tags; unchecked suggestions are rejected         |
+| `1`-`9`      | Check or uncheck a tag (`j` `k` and `Space` too)                   |
+| `t`, `+`     | Add a tag; `Tab` completes; a name off the list is proposed for it |
+| `s`, `n`     | Skip the bookmark for now                                          |
+| `o`          | Open it                                                            |
+| `dd`         | Delete it (`u` in Bookmarks brings it back)                        |
+| `R`          | Create the rule offered for its site                               |
+| `q`, `Esc`   | End the batch here; its names, back-fill, and retrain still follow |
+
+Digits toggle tags in a batch, so switch views with `:` there (`:bookmarks`). A bookmark saved
+without tags asks for `Enter` again. After a save, if at least 3 of the bookmarks you tagged on its
+site (80% of them) share a tag that no rule gives, the screen offers that rule; `R` creates it and
+runs it on the site's bookmarks, including the one on screen.
+
+After the bookmarks come the **names proposed** in the batch (`a` add to the canonical list, `l`
+alias of a canonical tag, `r` reject, `s` skip), then **back-fill** for each tag just added: the
+worker offers it on reviewed bookmarks (classifier or provider), and `y` `n` `s` decide each
+candidate. Then the classifier retrains on the worker, and the batch joins the history shown before
+the next one.
+
+The **queue** lists pending suggestions, newest bookmark first: `y` `n` accept or reject one, `Y`
+`N` all of a bookmark's, `f` cycles the source (rule, model, llm), `<` `>` lower or raise the
+confidence they must be below, `o` opens. It shows at most 5000.
 
 ## Rules
 

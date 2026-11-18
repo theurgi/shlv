@@ -263,6 +263,18 @@ fn spots_sites_tagged_the_same_way() {
             ("bandcamp.com".into(), "music".into(), 3, 3),
         ]
     );
+    // One site's offers, as review asks after each bookmark.
+    let at = |u: &str| -> Vec<String> {
+        s.rule_candidates_at(u)
+            .unwrap()
+            .into_iter()
+            .map(|c| format!("{} {}", c.host, c.tag))
+            .collect()
+    };
+    assert_eq!(at("https://new.bandcamp.com/x"), ["bandcamp.com music"]);
+    assert_eq!(at("https://blog.example.org/x"), ["blog.example.org blog"]);
+    assert!(at("https://example.org/").is_empty());
+    assert!(at("https://github.com/1").is_empty());
     // Declined offers and rules that exist aren't offered.
     s.decline_rule("blog.example.org", "blog").unwrap();
     s.add_rule("bandcamp.com", &strings(&["music"])).unwrap();

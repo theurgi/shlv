@@ -17,6 +17,7 @@ mod app;
 mod bookmarks;
 mod form;
 mod input;
+mod review;
 mod rules;
 #[cfg(test)]
 mod tests;

@@ -17,6 +17,7 @@ use shlv::config::Config;
 
 use super::bookmarks::Bookmarks;
 use super::input::{Edited, Input};
+use super::review::Review;
 use super::rules::Rules;
 use super::worker::{Job, OpenStore, Report, Worker};
 
@@ -67,7 +68,7 @@ impl View {
     fn placeholder(self) -> &'static str {
         match self {
             View::Bookmarks => "",
-            View::Review => "Review batches and the suggestions queue: task 044.",
+            View::Review => "",
             View::Tags => "The tag list, edits, proposals, health, and back-fill: task 045.",
             View::Rules => "",
             View::Bootstrap => "Interests, tag seed, and tag draft: task 046.",
@@ -101,9 +102,12 @@ pub struct App {
     pub view: View,
     pub bookmarks: Bookmarks,
     pub rules: Rules,
+    pub review: Review,
     help: bool,
     command: Option<Input>,
     message: Option<(String, Tone)>,
+    /// A message was given while handling the current key; one that wasn't is cleared.
+    said: bool,
     worker: Worker,
     jobs: BTreeMap<u64, Running>,
     /// Jobs sent in the current batch and how many of them finished, for "3/10".
@@ -123,9 +127,11 @@ impl App {
             view: View::Bookmarks,
             bookmarks: Bookmarks::default(),
             rules: Rules::default(),
+            review: Review::default(),
             help: false,
             command: None,
             message: None,
+            said: false,
             worker: Worker::new(worker),
             jobs: BTreeMap::new(),
             batch: (0, 0),
@@ -139,10 +145,12 @@ impl App {
 
     pub fn say(&mut self, text: impl Into<String>) {
         self.message = Some((text.into(), Tone::Info));
+        self.said = true;
     }
 
     pub fn warn(&mut self, text: impl Into<String>) {
         self.message = Some((text.into(), Tone::Error));
+        self.said = true;
     }
 
     #[cfg(test)]
@@ -164,12 +172,11 @@ impl App {
         !self.jobs.is_empty()
     }
 
-    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
     pub(super) fn send_job(&mut self, job: Job) {
         if self.jobs.is_empty() {
             self.batch = (0, 0);
         }
-        let step = format!("{} {}", job.verb(), job.id());
+        let step = job.describe();
         let n = self.worker.send(job.clone());
         self.jobs.insert(n, Running { job, step });
         self.batch.0 += 1;
@@ -185,7 +192,7 @@ impl App {
     }
 
     /// Waits for every running job to finish, for tests.
-    #[cfg(all(test, feature = "fetch"))]
+    #[cfg(test)]
     pub fn finish_jobs(&mut self) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         while self.busy() && std::time::Instant::now() < deadline {
@@ -198,19 +205,28 @@ impl App {
         let Some(running) = self.jobs.get_mut(&r.job()) else {
             return;
         };
-        match r {
-            Report::Progress { text, .. } => running.step = text,
-            Report::Done { job, id, text } => {
-                self.jobs.remove(&job);
-                self.batch.1 += 1;
+        let result = match r {
+            Report::Progress { text, .. } => {
+                running.step = text;
+                return;
+            }
+            Report::Done { job, text, ids } => (job, Ok((text, ids))),
+            Report::Failed { job, error } => (job, Err(error)),
+        };
+        let (n, result) = result;
+        let Some(Running { job, .. }) = self.jobs.remove(&n) else {
+            return;
+        };
+        self.batch.1 += 1;
+        match (job, result) {
+            (Job::FetchTitle { id, .. } | Job::Summarize { id, .. }, Ok((text, _))) => {
                 self.bookmarks.forget(&[id]);
                 self.say(format!("{id}: {text}"));
             }
-            Report::Failed { job, id, error } => {
-                let verb = self.jobs.remove(&job).map_or("", |r| r.job.verb());
-                self.batch.1 += 1;
-                self.warn(format!("{verb} {id} failed: {error}"));
+            (job @ (Job::FetchTitle { .. } | Job::Summarize { .. }), Err(e)) => {
+                self.warn(format!("{} failed: {e}", job.describe()));
             }
+            (job, result) => self.review_report(job, result),
         }
     }
 
@@ -237,21 +253,26 @@ impl App {
     pub(super) fn tags_changed(&mut self) {
         self.tag_names = None;
         self.rules_changed();
+        self.queue_changed();
     }
 
     /// Shows a view, loading what it lists if it hasn't yet.
     pub(super) fn switch(&mut self, v: View) {
         self.view = v;
         self.message = None;
-        if v == View::Rules {
-            self.rules_enter();
+        match v {
+            View::Rules => self.rules_enter(),
+            View::Review => self.review_enter(),
+            _ => {}
         }
     }
 
     /// A view's hint for the bottom line while it is in the middle of something.
     fn view_hint(&self) -> Option<&'static str> {
         match self.view {
+            View::Bookmarks => self.bookmarks_hint(),
             View::Rules => self.rules_hint(),
+            View::Review => self.review_hint(),
             _ => None,
         }
     }
@@ -272,12 +293,22 @@ impl App {
             match self.view {
                 View::Bookmarks => self.bookmarks_paste(text),
                 View::Rules => self.rules_paste(text),
+                View::Review => self.review_paste(text),
                 _ => {}
             }
         }
     }
 
+    /// Handles a key. A message lasts until a key that gives none.
     pub fn key(&mut self, k: KeyEvent) {
+        self.said = false;
+        self.handle_key(k);
+        if !self.said {
+            self.message = None;
+        }
+    }
+
+    fn handle_key(&mut self, k: KeyEvent) {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -294,6 +325,7 @@ impl App {
         let taken = match self.view {
             View::Bookmarks => self.bookmarks_key(k),
             View::Rules => self.rules_key(k),
+            View::Review => self.review_key(k),
             _ => false,
         };
         if taken {
@@ -357,6 +389,7 @@ impl App {
         match self.view {
             View::Bookmarks => self.draw_bookmarks(f, body),
             View::Rules => self.draw_rules(f, body),
+            View::Review => self.draw_review(f, body),
             v => f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),
@@ -393,6 +426,7 @@ impl App {
         match self.view {
             View::Bookmarks => left.extend(self.bookmarks_status()),
             View::Rules => left.extend(self.rules_status()),
+            View::Review => left.extend(self.review_status()),
             _ => {}
         }
         let mut right = Vec::new();
@@ -421,16 +455,18 @@ impl App {
     fn draw_prompt(&self, f: &mut Frame, area: Rect) {
         if let Some(input) = &self.command {
             draw_line_input(f, area, ":", input);
-        } else if self.view == View::Bookmarks && self.draw_bookmarks_prompt(f, area) {
-            // The view drew its prompt or hint.
-        } else if let Some(hint) = self.view_hint() {
-            f.render_widget(Line::from(hint).dim(), area);
-        } else if let Some((text, tone)) = &self.message {
+        } else if (self.view == View::Bookmarks && self.draw_bookmarks_prompt(f, area))
+            || (self.view == View::Review && self.draw_review_prompt(f, area))
+        {
+            // The view drew what is being typed.
+        } else if let Some((text, tone)) = self.message.as_ref().filter(|(t, _)| !t.is_empty()) {
             let style = match tone {
                 Tone::Info => Style::new(),
                 Tone::Error => Style::new().fg(Color::Red),
             };
             f.render_widget(Line::styled(text.as_str(), style), area);
+        } else if let Some(hint) = self.view_hint() {
+            f.render_widget(Line::from(hint).dim(), area);
         }
     }
 
@@ -458,6 +494,7 @@ impl App {
         match self.view {
             View::Bookmarks => section(self.view.title(), &super::bookmarks::keys()),
             View::Rules => section(self.view.title(), &super::rules::keys()),
+            View::Review => section(self.view.title(), &super::review::keys()),
             v => section(v.title(), &[("", v.placeholder())]),
         }
         lines.pop();

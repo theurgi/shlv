@@ -745,3 +745,347 @@ fn rules_view_declines_offers() {
     assert!(!text(&mut app).contains("Offered"));
     assert!(db.store().rule_candidates(3, 0.8).unwrap().is_empty());
 }
+
+/// Waits for the worker, and steps through back-fill (which only the `model` feature reaches)
+/// with `q`, until the batch is done.
+fn finish_batch(app: &mut App) {
+    for _ in 0..20 {
+        app.finish_jobs();
+        match app.review_phase() {
+            "idle" => return,
+            "backfill" => press(app, "q"),
+            "offering" | "training" | "picking" => {}
+            p => panic!("batch stuck in {p}"),
+        }
+    }
+    panic!("batch didn't finish");
+}
+
+fn reviewed(db: &Db, id: i64) -> bool {
+    db.store().is_reviewed(id).unwrap()
+}
+
+fn review_db(db: &Db) {
+    db.seed(&[
+        ("https://github.com/rust-lang/rust", "Rust compiler", &[]),
+        ("https://github.com/tokio-rs/tokio", "Tokio runtime", &[]),
+        ("https://example.com/wifi", "Fix home wifi", &[]),
+        ("https://cooking.com/pasta", "Pasta recipe", &[]),
+        ("https://cooking.com/soup", "Soup", &[]),
+    ]);
+    db.store()
+        .add_canonical(&["code".to_string(), "rust".to_string()])
+        .unwrap();
+}
+
+fn github_code(s: &mut Store) {
+    let rules = [("github.com".to_string(), vec!["code".to_string()])];
+    s.set_rules(DomainRules::new(rules.into_iter().collect()).unwrap());
+}
+
+#[test]
+fn reviews_a_batch() {
+    let db = Db::new();
+    review_db(&db);
+    let mut app = db.app_with(Config::default(), github_code);
+    press(&mut app, "2");
+    assert!(text(&mut app).contains("No batches yet"));
+    // Batches of 3.
+    press(&mut app, "f<Down><Down><Down><C-u>3<Enter>");
+    press(&mut app, "<Enter>");
+    app.finish_jobs();
+    assert_eq!(app.review_phase(), "deciding");
+    let t = text(&mut app);
+    assert!(t.contains("spread across domains, untagged first"), "{t}");
+    // 5 Soup first (one bookmark per site, newest first): a new name, proposed.
+    assert!(t.contains("[1/3] 5  Soup"), "{t}");
+    press(&mut app, "tcooking<Enter>");
+    assert!(text(&mut app).contains("#cooking  new: proposed for the list"));
+    press(&mut app, "<Enter>");
+    // 2 Tokio: #code from the rule; add #rust by completion, uncheck #code.
+    let t = text(&mut app);
+    assert!(t.contains("[2/3] 2  Tokio runtime"), "{t}");
+    assert!(t.contains("1 [x] #code  rule"), "{t}");
+    press(&mut app, "tru<Tab><Enter>1");
+    let t = text(&mut app);
+    assert!(t.contains("1 [ ] #code  rule"), "{t}");
+    assert!(t.contains("2 [x] #rust  added"), "{t}");
+    press(&mut app, "y");
+    // 3 wifi: nothing, so Enter asks first.
+    press(&mut app, "<Enter>");
+    assert!(
+        message(&app).contains("no tags: Enter again"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, "<Enter>");
+    // The name proposed: add it.
+    assert_eq!(app.review_phase(), "proposals");
+    let t = text(&mut app);
+    assert!(t.contains("1 name for the list, from this batch"), "{t}");
+    assert!(t.contains("#cooking  on 1 bookmark  (user)"), "{t}");
+    press(&mut app, "a");
+    finish_batch(&mut app);
+    let t = text(&mut app);
+    assert!(
+        t.contains("batch  reviewed  skipped  proposed  added"),
+        "{t}"
+    );
+    assert!(
+        t.contains("    1         3        0         1      1  -"),
+        "{t}"
+    );
+
+    assert_eq!(tags(&db, "https://github.com/tokio-rs/tokio"), ["rust"]);
+    assert_eq!(tags(&db, "https://cooking.com/soup"), ["cooking"]);
+    assert!(tags(&db, "https://example.com/wifi").is_empty() && reviewed(&db, 3));
+    let s = db.store();
+    assert!(
+        s.proposals(shlv::ProposalState::Pending)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(s.rules().is_empty(), "the worker's rules aren't saved");
+    drop(s);
+
+    // Batch 2: skip one, end the batch at the next.
+    press(&mut app, "<Enter>");
+    app.finish_jobs();
+    let t = text(&mut app);
+    assert!(t.contains("[1/2] 4  Pasta recipe"), "{t}");
+    press(&mut app, "s");
+    press(&mut app, "q");
+    finish_batch(&mut app);
+    assert!(!reviewed(&db, 4) && !reviewed(&db, 1));
+    let h = db.store().review_history().unwrap();
+    assert_eq!(h.len(), 1, "a batch that reviewed nothing isn't history");
+
+    // Filters: only the pending #code suggestion on 1 matches.
+    press(&mut app, "f#code<Enter>");
+    assert!(message(&app).contains("filtered"), "{}", message(&app));
+    press(&mut app, "<Enter>");
+    app.finish_jobs();
+    let t = text(&mut app);
+    assert!(t.contains("least confident suggestions first"), "{t}");
+    assert!(t.contains("1  Rust compiler"), "{t}");
+    press(&mut app, "<Enter>");
+    finish_batch(&mut app);
+    assert_eq!(tags(&db, "https://github.com/rust-lang/rust"), ["code"]);
+    press(&mut app, "f<C-u>nope<Enter>");
+    assert!(
+        message(&app).contains("no tag \"nope\""),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, "<Esc>");
+    // Every bookmark reviewed but 4.
+    press(&mut app, "f<C-u><Enter><Enter>");
+    app.finish_jobs();
+    press(&mut app, "<Enter><Enter>");
+    finish_batch(&mut app);
+    assert!(
+        message(&app).starts_with("batch done: reviewed 1 bookmark;"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, "<Enter>");
+    app.finish_jobs();
+    assert_eq!(message(&app), "every bookmark is reviewed");
+}
+
+#[test]
+fn review_aliases_and_rejects_names() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://a.com/1", "One", &[]),
+        ("https://b.com/2", "Two", &[]),
+    ]);
+    db.store()
+        .add_canonical(&["programming".to_string()])
+        .unwrap();
+    let mut app = db.app();
+    press(&mut app, "2<Enter>");
+    app.finish_jobs();
+    press(&mut app, "tcoding<Enter><Enter>tjunk<Enter><Enter>");
+    assert_eq!(app.review_phase(), "proposals");
+    let t = text(&mut app);
+    assert!(t.contains("2 names for the list"), "{t}");
+    // The newest bookmark came first, so junk is listed... by name: coding, junk.
+    press(&mut app, "lprog<Tab><Enter>");
+    assert!(
+        text(&mut app).contains("alias of #programming, tagged 1 bookmark"),
+        "{}",
+        text(&mut app)
+    );
+    press(&mut app, "r");
+    finish_batch(&mut app);
+    assert_eq!(tags(&db, "https://a.com/1"), ["programming"]);
+    assert!(tags(&db, "https://b.com/2").is_empty());
+    let s = db.store();
+    assert_eq!(
+        s.proposals(shlv::ProposalState::Rejected).unwrap()[0].name,
+        "junk"
+    );
+}
+
+#[test]
+fn review_offers_a_rule_and_deletes() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://a.bandcamp.com/", "A", &[]),
+        ("https://b.bandcamp.com/", "B", &[]),
+        ("https://c.bandcamp.com/", "C", &[]),
+        ("https://d.bandcamp.com/", "D", &[]),
+        ("https://spam.example/", "Spam", &[]),
+    ]);
+    db.store().add_canonical(&["music".to_string()]).unwrap();
+    let mut app = db.app();
+    press(&mut app, "2<Enter>");
+    app.finish_jobs();
+    // Tag the bandcamp bookmarks #music until a rule is offered; delete the spam.
+    let (mut offered, mut deleted) = (false, false);
+    while app.review_phase() == "deciding" {
+        if text(&mut app).contains("Spam") {
+            press(&mut app, "dd");
+            assert!(db.store().get(5).unwrap().is_none());
+            deleted = true;
+        } else if offered {
+            press(&mut app, "<Enter>");
+        } else {
+            press(&mut app, "tmusic<Enter><Enter>");
+            if message(&app).contains("R makes it a rule") {
+                offered = true;
+                assert!(text(&mut app).contains("Rule? bandcamp.com → #music"));
+                press(&mut app, "R");
+                assert!(
+                    message(&app).starts_with("added rule bandcamp.com → #music"),
+                    "{}",
+                    message(&app)
+                );
+            }
+        }
+    }
+    assert!(offered && deleted);
+    finish_batch(&mut app);
+    let s = db.store();
+    assert_eq!(s.saved_rules().tags_of("bandcamp.com"), ["music"]);
+    // The rule's suggestion reached the bookmark under review when R was pressed, and Enter
+    // accepted it.
+    for u in ["a", "b", "c", "d"] {
+        assert_eq!(
+            tags(&db, &format!("https://{u}.bandcamp.com/")),
+            ["music"],
+            "{u}"
+        );
+    }
+    assert!(s.get(5).unwrap().is_none());
+    drop(s);
+    // The deleted bookmark comes back from Bookmarks.
+    press(&mut app, "1u");
+    assert!(db.store().get(5).unwrap().is_some());
+}
+
+#[test]
+fn review_queue_filters_and_decides() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://github.com/a", "A", &[]),
+        ("https://github.com/b", "B", &[]),
+        ("https://docs.rs/c", "C", &[]),
+    ]);
+    let mut app = db.app_with(Config::default(), |s| {
+        let rules = [
+            ("github.com".to_string(), vec!["code".to_string()]),
+            (
+                "docs.rs".to_string(),
+                vec!["rust".to_string(), "docs".to_string()],
+            ),
+        ];
+        s.set_rules(DomainRules::new(rules.into_iter().collect()).unwrap());
+    });
+    {
+        let mut s = db.store();
+        github_code(&mut s);
+        let rules = [
+            ("github.com".to_string(), vec!["code".to_string()]),
+            (
+                "docs.rs".to_string(),
+                vec!["rust".to_string(), "docs".to_string()],
+            ),
+        ];
+        s.set_rules(DomainRules::new(rules.into_iter().collect()).unwrap());
+        s.apply_rules(None).unwrap();
+    }
+    press(&mut app, "2<Tab>");
+    let t = text(&mut app);
+    assert!(t.contains("queue: 4 pending"), "{t}");
+    assert!(t.contains("#docs  rule"), "{t}");
+    // The first is docs.rs's #docs (newest bookmark first, then by tag): accept it, then reject
+    // the bookmark's other.
+    press(&mut app, "y");
+    assert_eq!(message(&app), "3: accepted #docs");
+    press(&mut app, "N");
+    assert_eq!(message(&app), "3: rejected #rust");
+    assert_eq!(tags(&db, "https://docs.rs/c"), ["docs"]);
+    assert!(text(&mut app).contains("queue: 2 pending"));
+    // Filters: no model suggestions.
+    press(&mut app, "ff");
+    let t = text(&mut app);
+    assert!(t.contains("queue: 0 pending, model"), "{t}");
+    assert!(t.contains("No pending suggestions match"), "{t}");
+    press(&mut app, "ff<");
+    assert!(text(&mut app).contains("below 0.9"));
+    // Rules are sure (1.0), so none is below.
+    assert!(text(&mut app).contains("queue: 0 pending"));
+    press(&mut app, ">");
+    assert!(text(&mut app).contains("queue: 2 pending"));
+    press(&mut app, "<Tab>");
+    assert!(text(&mut app).contains("Enter starts one"));
+}
+
+/// A tag added after a batch is offered on the bookmarks reviewed before it existed; the
+/// offering runs on the worker.
+#[cfg(feature = "model")]
+#[test]
+fn review_backfills_new_tags() {
+    let db = Db::new();
+    db.seed(&[
+        ("https://a.com/1", "Music theory for programmers", &[]),
+        ("https://b.com/2", "Jazz albums", &[]),
+    ]);
+    db.store().add_canonical(&["code".to_string()]).unwrap();
+    let mut app = db.app();
+    press(&mut app, "2<Enter>");
+    app.finish_jobs();
+    // Theory: no tags; jazz: propose #music, whichever comes first.
+    for _ in 0..2 {
+        if text(&mut app).contains("Jazz albums") {
+            press(&mut app, "tmusic<Enter><Enter>");
+        } else {
+            press(&mut app, "<Enter><Enter>");
+        }
+    }
+    press(&mut app, "a");
+    app.finish_jobs();
+    assert_eq!(app.review_phase(), "backfill");
+    let t = text(&mut app);
+    assert!(
+        t.contains("Back-fill: #music on which of 1 reviewed bookmarks?"),
+        "{t}"
+    );
+    assert!(
+        t.contains("Music theory for programmers  (model 0.45, reviewed)"),
+        "{t}"
+    );
+    press(&mut app, "y");
+    app.finish_jobs();
+    assert_eq!(app.review_phase(), "idle");
+    let m = message(&app);
+    assert!(
+        m.contains("#music: 1 accepted, 0 rejected, 0 still pending"),
+        "{m}"
+    );
+    assert!(m.contains("classifier retrained on"), "{m}");
+    assert_eq!(tags(&db, "https://a.com/1"), ["music"]);
+    assert_eq!(tags(&db, "https://b.com/2"), ["music"]);
+}

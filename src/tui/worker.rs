@@ -4,6 +4,7 @@
 //! Jobs run one at a time, in the order sent. The thread starts with the first job, so a session
 //! that never sends one costs nothing.
 
+use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -11,11 +12,12 @@ use std::time::Duration;
 use anyhow::Result;
 use shlv::Store;
 use shlv::config::Config;
+use shlv::review::ReviewFilter;
 
 /// Opens the worker's own store, configured as the UI's is.
 pub type OpenStore = Box<dyn FnOnce() -> Result<(Store, Config)> + Send>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Job {
     /// Fetch the page and set the bookmark's title from it (feature `fetch`).
     #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
@@ -23,19 +25,26 @@ pub enum Job {
     /// Summarize the page with the `[ai] summarize` provider (feature `ai`).
     #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     Summarize { id: i64, url: String },
+    /// Pick the next review batch and run the suggestion layers on it: rules, the classifier,
+    /// the `[ai] tag` provider. Done with the batch's ids, and how they were ordered.
+    ReviewBatch { filter: ReviewFilter, size: usize },
+    /// Offer one tag on bookmarks (`suggest --tag`): the classifier, the provider.
+    #[cfg_attr(not(any(feature = "model", feature = "ai")), allow(dead_code))]
+    Backfill { tag: String, scope: Vec<i64> },
+    /// Retrain the classifier (feature `model`).
+    #[cfg_attr(not(feature = "model"), allow(dead_code))]
+    Train,
 }
 
 impl Job {
-    pub fn id(&self) -> i64 {
+    /// What the job does, for the status line until it reports a step.
+    pub fn describe(&self) -> String {
         match self {
-            Job::FetchTitle { id, .. } | Job::Summarize { id, .. } => *id,
-        }
-    }
-
-    pub fn verb(&self) -> &'static str {
-        match self {
-            Job::FetchTitle { .. } => "fetching the title of",
-            Job::Summarize { .. } => "summarizing",
+            Job::FetchTitle { id, .. } => format!("fetching the title of {id}"),
+            Job::Summarize { id, .. } => format!("summarizing {id}"),
+            Job::ReviewBatch { .. } => "picking a batch".into(),
+            Job::Backfill { tag, .. } => format!("back-filling #{tag}"),
+            Job::Train => "training the classifier".into(),
         }
     }
 }
@@ -48,15 +57,14 @@ pub enum Report {
         job: u64,
         text: String,
     },
-    /// The job is done and the bookmark changed (or not, as `text` says).
+    /// The job is done: what it did, and the bookmarks it picked (a review batch).
     Done {
         job: u64,
-        id: i64,
         text: String,
+        ids: Vec<i64>,
     },
     Failed {
         job: u64,
-        id: i64,
         error: String,
     },
 }
@@ -122,21 +130,18 @@ fn work(open: OpenStore, jobs: Receiver<(u64, Job)>, reports: Sender<Report>) {
     };
     let mut ctx = Context::default();
     while let Ok((n, job)) = jobs.recv() {
-        let id = job.id();
         let progress = |text: String| {
             let _ = reports.send(Report::Progress { job: n, text });
         };
         let report = match &mut opened {
             Err(e) => Report::Failed {
                 job: n,
-                id,
                 error: format!("cannot open the database: {e}"),
             },
             Ok((store, config)) => match run(&mut ctx, store, config, &job, &progress) {
-                Ok(text) => Report::Done { job: n, id, text },
+                Ok((text, ids)) => Report::Done { job: n, text, ids },
                 Err(e) => Report::Failed {
                     job: n,
-                    id,
                     error: format!("{e:#}"),
                 },
             },
@@ -154,6 +159,33 @@ struct Context {
     fetcher: Option<shlv::fetch::Fetcher>,
 }
 
+/// Turns what a CLI helper prints into progress reports, a line at a time.
+struct Lines<'a> {
+    progress: &'a dyn Fn(String),
+    line: Vec<u8>,
+}
+
+impl Write for Lines<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &b in buf {
+            if b == b'\n' || b == b'\r' {
+                let text = String::from_utf8_lossy(&self.line).trim().to_string();
+                if !text.is_empty() {
+                    (self.progress)(text);
+                }
+                self.line.clear();
+            } else {
+                self.line.push(b);
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[allow(unused_variables)]
 fn run(
     ctx: &mut Context,
@@ -161,7 +193,11 @@ fn run(
     config: &Config,
     job: &Job,
     progress: &dyn Fn(String),
-) -> Result<String> {
+) -> Result<(String, Vec<i64>)> {
+    let mut out = Lines {
+        progress,
+        line: Vec::new(),
+    };
     match job {
         #[cfg(feature = "fetch")]
         Job::FetchTitle { id, url } => {
@@ -180,7 +216,7 @@ fn run(
             if !store.edit(*id, &edit)? {
                 anyhow::bail!("bookmark {id} is gone");
             }
-            Ok(format!("title: {title}"))
+            Ok((format!("title: {title}"), vec![*id]))
         }
         #[cfg(feature = "ai")]
         Job::Summarize { id, url } => {
@@ -202,7 +238,54 @@ fn run(
             if !store.set_summary(*id, Some(&summary))? {
                 anyhow::bail!("bookmark {id} is gone");
             }
-            Ok("summarized".into())
+            Ok(("summarized".into(), vec![*id]))
+        }
+        Job::ReviewBatch { filter, size } => {
+            store.reload_rules()?;
+            let queue = store.review_queue(filter)?;
+            if queue.is_empty() {
+                return Ok((String::new(), Vec::new()));
+            }
+            progress(format!("ordering {} bookmarks", queue.len()));
+            let (ids, order) = crate::review_cmd::choose(store, config, &queue, filter, *size)?;
+            progress("suggesting tags".into());
+            crate::review_cmd::offer(store, config, &ids, &mut out)?;
+            Ok((
+                format!("{} of {} to review, {order}", ids.len(), queue.len()),
+                ids,
+            ))
+        }
+        #[cfg(any(feature = "model", feature = "ai"))]
+        Job::Backfill { tag, scope } => {
+            crate::backfill_cmd::offer(
+                store,
+                config,
+                tag,
+                Some(scope),
+                true,
+                #[cfg(feature = "ai")]
+                &crate::ai_cmd::LlmArgs {
+                    max_tags: 1,
+                    force: false,
+                    jobs: 2,
+                    yes: true,
+                    batch: false,
+                },
+                &mut out,
+            )?;
+            Ok((format!("offered #{tag}"), Vec::new()))
+        }
+        #[cfg(feature = "model")]
+        Job::Train => {
+            let t = store.train_model()?;
+            Ok((
+                format!(
+                    "classifier retrained on {} ({} ms)",
+                    crate::plural(t.examples, "example"),
+                    t.millis
+                ),
+                Vec::new(),
+            ))
         }
         #[allow(unreachable_patterns)]
         _ => anyhow::bail!("this build can't do that"),

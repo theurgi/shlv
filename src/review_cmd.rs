@@ -175,7 +175,7 @@ pub fn run(
 
 /// The next batch and how it was ordered.
 #[allow(unused_variables)]
-fn choose(
+pub(crate) fn choose(
     store: &mut Store,
     config: &Config,
     queue: &[review::Queued],
@@ -214,7 +214,12 @@ fn choose(
 /// Suggests tags for the batch: domain rules, the classifier, then the `[ai] tag` provider for
 /// bookmarks the classifier wasn't sure about (`[model] provider`) and the provider hasn't seen.
 #[allow(unused_variables, unused_mut)]
-fn offer(store: &mut Store, config: &Config, ids: &[i64], screen: &mut Screen) -> Result<()> {
+pub(crate) fn offer(
+    store: &mut Store,
+    config: &Config,
+    ids: &[i64],
+    out: &mut impl Write,
+) -> Result<()> {
     if !store.rules().is_empty() {
         store.apply_rules(Some(ids))?;
     }
@@ -259,7 +264,7 @@ fn offer(store: &mut Store, config: &Config, ids: &[i64], screen: &mut Screen) -
                     batch: false,
                 };
                 crate::ai_cmd::run_suggest_llm(
-                    store, config, &p, &targets, false, &llm, None, None, screen,
+                    store, config, &p, &targets, false, &llm, None, None, out,
                 )?;
             }
         }
