@@ -10,19 +10,39 @@ a first proposal and may change.
 
 ## Screen
 
-The top line lists the views; `1`-`6` switch between them. Bookmarks, Review, and Rules are built so
-far; Tags, Bootstrap, and Status are placeholders. The bar at the bottom shows the view, the search,
-the position in the list, marked bookmarks, and running background jobs; the line below it is for
-messages (until the next key), prompts, and the keys of what you are in the middle of.
+The top line lists the views: Bookmarks, Review, Tags, Rules, Bootstrap, Status; `1`-`6` switch
+between them. The bar at the bottom shows the view, the search, the position in the list, marked
+bookmarks, and running background jobs; the line below it is for messages (until the next key),
+prompts, and the keys of what you are in the middle of.
 
 ## Everywhere
 
-| Key         | Action                                                     |
-| ----------- | ---------------------------------------------------------- |
-| `1`-`6`     | Switch view                                                |
-| `:`         | Command line: `:q`, `:help`, a view name (`:review`, `:t`) |
-| `?`         | The current view's keys (any key closes them)              |
-| `q`, Ctrl-C | Quit (Ctrl-C works from anywhere, a form included)         |
+| Key         | Action                                                          |
+| ----------- | --------------------------------------------------------------- |
+| `1`-`6`     | Switch view                                                     |
+| `:`         | Command line: a view name (`:review`, `:t`) or an action, below |
+| `?`         | The current view's keys (any key closes them)                   |
+| `q`, Ctrl-C | Quit (Ctrl-C works from anywhere, a form included)              |
+
+The **command line** takes a view's name (or the start of one) and the views' actions; `Tab`
+completes command names, then subcommands, then tag names (or interests, or rule hosts):
+
+| Command                                        | Action                                       |
+| ---------------------------------------------- | -------------------------------------------- |
+| `:search QUERY`                                | Show a search in Bookmarks                   |
+| `:review`                                      | Start a review batch                         |
+| `:tag rename A B`, `merge A B`                 | As `shlv tag`                                |
+| `:tag alias ALIAS TAG`, `unalias ALIAS`        | Add or remove an alias                       |
+| `:tag canonical TAG...`, `uncanonical TAG...`  | Mark or unmark canonical                     |
+| `:tag describe TAG TEXT`                       | Describe a tag                               |
+| `:rule add HOST TAG...`, `:rule rm HOST [TAG]` | As `shlv rule`                               |
+| `:interest add NAME...`, `rm NAME...`          | Save or forget interests                     |
+| `:seed [INTEREST...]`, `:draft [N]`            | `tag seed`, `tag draft` (feature `ai`)       |
+| `:fetch`                                       | Fetch titles for bookmarks without one       |
+| `:summarize`                                   | Summarize bookmarks without a summary (asks) |
+| `:train`, `:eval`                              | Retrain or measure the classifier (`model`)  |
+| `:jobs`, `:cancel [N]`                         | The Status view; cancel job N, or every job  |
+| `:q`, `:help`                                  | Quit, the keys                               |
 
 ## Bookmarks
 
@@ -165,12 +185,46 @@ than one of them does (`a.bandcamp.com` and `b.bandcamp.com` make `bandcamp.com`
 A new rule runs on the bookmarks already on its site, so they get its tags as suggestions (or as
 tags, with `suggestions = "auto"`). Rules pinned in config can't be removed here.
 
+## Bootstrap
+
+**Interests** are broad topics you bookmark (`nix`, `home-lab`): `a` saves some, `dd` forgets one
+(those in `[tags] interests` in the config are pinned and stay). With the `ai` feature, `s` runs
+`tag seed` on them (the `[ai] tag` provider expands them into candidate tags) and `D` runs
+`tag draft` (it drafts tags from a sample of bookmarks, 200 by default). Both first show exactly
+what is sent and where, and send only on `y`.
+
+The **candidates** come back grouped by interest, with those already on the list shown as such:
+
+| Key          | Action                                                     |
+| ------------ | ---------------------------------------------------------- |
+| `y`, `Enter` | Keep: put it on the list                                   |
+| `d`          | Drop                                                       |
+| `r`          | Rename, then keep                                          |
+| `m`          | Merge into a tag or another candidate; it becomes an alias |
+| `e`          | Edit the description                                       |
+| `a`          | Add interests and expand them too (seed)                   |
+| `w`          | Write the decisions (undecided ones are left out)          |
+| `Esc` `Esc`  | Discard them                                               |
+
+A tag `tag draft` finds redundant shows what it could merge into; `m` then `Enter` merges it there.
+
+## Status
+
+Where the config and database are, the classifier (`model status`: when it was trained, on how many
+examples), its measurements once `e` runs `model eval`, and the background jobs. `t` retrains the
+classifier, `F` fetches missing titles, `S` summarizes bookmarks without a summary (after saying
+what is sent), `x` cancels the selected job and `X` every one.
+
 ## Background jobs
 
-Fetching titles and summarizing run on a worker thread with its own database connection, one job at
-a time; the bar shows the current step (`⟳ 2/5 fetching https://…`) and the TUI stays usable. When a
-job ends, its bookmark is redrawn and the message line says how it went. The worker starts with the
-first job, so a session without one doesn't pay for it.
+Slow work runs on a worker thread with its own database connection, one job at a time: fetching
+titles and summarizing (one bookmark or all that lack one), picking review batches and running the
+suggestion layers on them, back-fill, tag health, training and measuring the classifier, and seed
+and draft requests. The bar shows the current step (`⟳ 2/5 fetching https://…`) and the TUI stays
+usable; when a job ends, the view that started it gets the result and the message line says how it
+went. A cancelled job stops before it starts, or (fetching or summarizing many) after the bookmark
+it is on; what it did so far stays. The worker starts with the first job, so a session without one
+doesn't pay for it.
 
 ## Performance
 

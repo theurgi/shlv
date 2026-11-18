@@ -3,6 +3,7 @@
 //! it with key events and render it to a `TestBackend`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,11 +17,13 @@ use shlv::Store;
 use shlv::config::Config;
 
 use super::bookmarks::Bookmarks;
+use super::bootstrap::Bootstrap;
 use super::input::{Edited, Input};
 use super::review::Review;
 use super::rules::Rules;
+use super::status::Status;
 use super::tags::Tags;
-use super::worker::{Job, OpenStore, Report, Worker};
+use super::worker::{Job, OpenStore, Output, Report, Worker};
 
 /// The views, switched with `1`-`6` or `:name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,19 +68,7 @@ impl View {
         }
     }
 
-    /// What a placeholder view will hold, and the task that builds it.
-    fn placeholder(self) -> &'static str {
-        match self {
-            View::Bookmarks => "",
-            View::Review => "",
-            View::Tags => "",
-            View::Rules => "",
-            View::Bootstrap => "Interests, tag seed, and tag draft: task 046.",
-            View::Status => "Classifier, background jobs, and config: task 046.",
-        }
-    }
-
-    fn by_name(name: &str) -> Option<View> {
+    pub(super) fn by_name(name: &str) -> Option<View> {
         View::ALL
             .into_iter()
             .find(|v| v.name() == name || (name.len() >= 2 && v.name().starts_with(name)))
@@ -89,6 +80,12 @@ impl View {
 pub enum Tone {
     Info,
     Error,
+}
+
+/// A job waiting for `y`: what it sends, and where.
+struct Confirm {
+    lines: Vec<String>,
+    job: Job,
 }
 
 /// A job sent to the worker and not finished.
@@ -107,7 +104,13 @@ pub struct App {
     pub rules: Rules,
     pub review: Review,
     pub tags: Tags,
-    help: bool,
+    pub bootstrap: Bootstrap,
+    pub status: Status,
+    /// Where the config was read from (for the Status view).
+    pub config_path: Option<PathBuf>,
+    /// Something to send to a provider, shown until `y` sends it.
+    confirm: Option<Confirm>,
+    pub(super) help: bool,
     command: Option<Input>,
     message: Option<(String, Tone)>,
     /// A message was given while handling the current key; one that wasn't is cleared.
@@ -133,6 +136,10 @@ impl App {
             rules: Rules::default(),
             review: Review::default(),
             tags: Tags::default(),
+            bootstrap: Bootstrap::default(),
+            status: Status::default(),
+            config_path: None,
+            confirm: None,
             help: false,
             command: None,
             message: None,
@@ -194,6 +201,57 @@ impl App {
         self.batch.0 += 1;
     }
 
+    /// Running and queued jobs, oldest first: (number, step).
+    pub(super) fn job_list(&self) -> Vec<(u64, String)> {
+        self.jobs
+            .iter()
+            .map(|(n, r)| (*n, r.step.clone()))
+            .collect()
+    }
+
+    /// Stops a job: before it starts, or a bulk one after the current item.
+    pub(super) fn cancel_job(&mut self, n: u64) {
+        self.worker.cancel(n);
+        if let Some(r) = self.jobs.get_mut(&n) {
+            r.step = format!("cancelling: {}", r.step);
+            self.say(format!("cancelling job {n}"));
+        }
+    }
+
+    pub(super) fn cancel_all(&mut self) {
+        let all: Vec<u64> = self.jobs.keys().copied().collect();
+        if all.is_empty() {
+            self.say("no jobs");
+            return;
+        }
+        for n in all {
+            self.cancel_job(n);
+        }
+        self.say("cancelling every job");
+    }
+
+    /// Asks before sending `job`: `lines` say what it sends, and where.
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    pub(super) fn confirm(&mut self, lines: Vec<String>, job: Job) {
+        self.confirm = Some(Confirm { lines, job });
+    }
+
+    fn confirm_key(&mut self, k: KeyEvent) {
+        let Some(c) = self.confirm.take() else {
+            return;
+        };
+        if matches!(k.code, KeyCode::Enter | KeyCode::Char('y' | 'Y')) {
+            let seed = matches!(c.job, Job::Seed { .. } | Job::Draft { .. });
+            self.send_job(c.job.clone());
+            if seed {
+                self.bootstrap_sent(&c.job);
+            }
+            self.say(format!("sent: {}", c.job.describe()));
+        } else {
+            self.say("nothing sent");
+        }
+    }
+
     /// Applies the worker's reports, waiting up to `wait` for the first.
     pub fn drain_reports(&mut self, wait: Duration) {
         let mut wait = wait;
@@ -238,6 +296,31 @@ impl App {
             (job @ (Job::FetchTitle { .. } | Job::Summarize { .. }), Err(e)) => {
                 self.warn(format!("{} failed: {e}", job.describe()));
             }
+            (job @ (Job::FetchAll | Job::SummarizeAll), result) => match result {
+                Ok((text, _)) => {
+                    self.bookmarks_changed();
+                    self.say(text);
+                }
+                Err(e) => self.warn(format!("{} failed: {e}", job.describe())),
+            },
+            (Job::Train, result) if owner != View::Review => match result {
+                Ok((text, _)) => {
+                    self.status_enter();
+                    self.say(text);
+                }
+                Err(e) => self.warn(format!("training failed: {e}")),
+            },
+            (job @ Job::Eval, result) => {
+                let result = result.map(|(_, out)| match out {
+                    Output::Text(lines) => lines,
+                    _ => Vec::new(),
+                });
+                self.status_report(job, result);
+            }
+            (job @ (Job::Seed { .. } | Job::Draft { .. }), result) => {
+                self.bootstrap_report(job, result);
+            }
+            (job @ Job::Health, result) => self.tags_report(job, result),
             (job, result) if owner == View::Tags => self.tags_report(job, result),
             (job, result) => self.review_report(job, result),
         }
@@ -278,6 +361,8 @@ impl App {
             View::Rules => self.rules_enter(),
             View::Review => self.review_enter(),
             View::Tags => self.tags_enter(),
+            View::Bootstrap => self.bootstrap_enter(),
+            View::Status => self.status_enter(),
             _ => {}
         }
     }
@@ -289,6 +374,7 @@ impl App {
             View::Rules => self.rules_hint(),
             View::Review => self.review_hint(),
             View::Tags => self.tags_hint(),
+            View::Bootstrap => self.bootstrap_hint(),
             _ => None,
         }
     }
@@ -311,6 +397,7 @@ impl App {
                 View::Rules => self.rules_paste(text),
                 View::Review => self.review_paste(text),
                 View::Tags => self.tags_paste(text),
+                View::Bootstrap => self.bootstrap_paste(text),
                 _ => {}
             }
         }
@@ -334,6 +421,10 @@ impl App {
             self.help = false;
             return;
         }
+        if self.confirm.is_some() {
+            self.confirm_key(k);
+            return;
+        }
         if self.command.is_some() {
             self.command_key(k);
             return;
@@ -344,7 +435,8 @@ impl App {
             View::Rules => self.rules_key(k),
             View::Review => self.review_key(k),
             View::Tags => self.tags_key(k),
-            _ => false,
+            View::Bootstrap => self.bootstrap_key(k),
+            View::Status => self.status_key(k),
         };
         if taken {
             return;
@@ -362,36 +454,28 @@ impl App {
     }
 
     fn command_key(&mut self, k: KeyEvent) {
-        let Some(input) = &mut self.command else {
+        let Some(mut input) = self.command.take() else {
             return;
         };
         match k.code {
-            KeyCode::Esc => self.command = None,
+            KeyCode::Esc => {}
             KeyCode::Enter => {
                 let text = input.text().trim().to_string();
-                self.command = None;
                 self.run_command(&text);
             }
-            KeyCode::Backspace if input.text().is_empty() => self.command = None,
+            KeyCode::Backspace if input.text().is_empty() => {}
+            KeyCode::Tab => {
+                let head = input.before_cursor().to_string();
+                let names = self.command_completions(&head);
+                if !input.complete(&names) {
+                    self.say("nothing to complete");
+                }
+                self.command = Some(input);
+            }
             _ => {
                 input.key(k);
+                self.command = Some(input);
             }
-        }
-    }
-
-    /// Runs a `:` command.
-    pub fn run_command(&mut self, text: &str) {
-        let mut words = text.split_whitespace();
-        let Some(cmd) = words.next() else {
-            return;
-        };
-        match cmd {
-            "q" | "q!" | "quit" | "qa" | "wq" | "x" => self.quit = true,
-            "help" | "h" => self.help = true,
-            name => match View::by_name(name) {
-                Some(v) => self.switch(v),
-                None => self.warn(format!("unknown command :{text} (? lists the keys)")),
-            },
         }
     }
 
@@ -409,16 +493,14 @@ impl App {
             View::Rules => self.draw_rules(f, body),
             View::Review => self.draw_review(f, body),
             View::Tags => self.draw_tags(f, body),
-            v => f.render_widget(
-                Paragraph::new(vec![
-                    Line::from(""),
-                    Line::from(format!("  {}", v.placeholder())).dim(),
-                ]),
-                body,
-            ),
+            View::Bootstrap => self.draw_bootstrap(f, body),
+            View::Status => self.draw_status_view(f, body),
         }
         self.draw_status(f, status);
         self.draw_prompt(f, prompt);
+        if let Some(c) = &self.confirm {
+            draw_confirm(f, body, &c.lines);
+        }
         if self.help {
             self.draw_help(f);
         }
@@ -447,7 +529,8 @@ impl App {
             View::Rules => left.extend(self.rules_status()),
             View::Review => left.extend(self.review_status()),
             View::Tags => left.extend(self.tags_status()),
-            _ => {}
+            View::Bootstrap => left.extend(self.bootstrap_status()),
+            View::Status => left.extend(self.status_status()),
         }
         let mut right = Vec::new();
         if let Some(r) = self.jobs.values().next() {
@@ -475,9 +558,15 @@ impl App {
     fn draw_prompt(&self, f: &mut Frame, area: Rect) {
         if let Some(input) = &self.command {
             draw_line_input(f, area, ":", input);
+        } else if self.confirm.is_some() {
+            f.render_widget(
+                Line::from("send? y sends, any other key cancels").bold(),
+                area,
+            );
         } else if (self.view == View::Bookmarks && self.draw_bookmarks_prompt(f, area))
             || (self.view == View::Review && self.draw_review_prompt(f, area))
             || (self.view == View::Tags && self.draw_tags_prompt(f, area))
+            || (self.view == View::Bootstrap && self.draw_bootstrap_prompt(f, area))
         {
             // The view drew what is being typed.
         } else if let Some((text, tone)) = self.message.as_ref().filter(|(t, _)| !t.is_empty()) {
@@ -507,7 +596,10 @@ impl App {
             "Everywhere",
             &[
                 ("1-6", "switch view"),
-                (":", "command line (:q, :bookmarks, :review, …)"),
+                (
+                    ":",
+                    "command line: a view or an action below; Tab completes",
+                ),
                 ("?", "this help (any key closes it)"),
                 ("q, Ctrl-C", "quit"),
             ],
@@ -517,8 +609,14 @@ impl App {
             View::Rules => section(self.view.title(), &super::rules::keys()),
             View::Review => section(self.view.title(), &super::review::keys()),
             View::Tags => section(self.view.title(), &super::tags::keys()),
-            v => section(v.title(), &[("", v.placeholder())]),
+            View::Bootstrap => section(self.view.title(), &super::bootstrap::keys()),
+            View::Status => section(self.view.title(), &super::status::keys()),
         }
+        let commands: Vec<(&str, &str)> = super::commands::COMMANDS
+            .iter()
+            .map(|(c, what)| (*c, *what))
+            .collect();
+        section("Commands (:name)", &commands);
         lines.pop();
         let height = (lines.len() as u16 + 2).min(f.area().height);
         let width = 70.min(f.area().width);
@@ -563,4 +661,22 @@ pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// Whether a key edited `input` (so the caller is done with it).
 pub fn edited(input: &mut Input, k: KeyEvent) -> bool {
     input.key(k) != Edited::Ignored
+}
+
+/// What a job sends, in a box over the view until `y` or another key.
+fn draw_confirm(f: &mut Frame, area: Rect, lines: &[String]) {
+    let text: Vec<Line> = lines.iter().map(|l| Line::from(l.clone())).collect();
+    let width = 90.min(area.width);
+    let inner = width.saturating_sub(2).max(1) as usize;
+    // Wrapped lines: roughly each line's width over the box's.
+    let rows: usize = lines.iter().map(|l| l.chars().count() / inner + 1).sum();
+    let height = (rows as u16 + 2).min(area.height);
+    let r = centered(area, width, height);
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered().title(" Send? ")),
+        r,
+    );
 }

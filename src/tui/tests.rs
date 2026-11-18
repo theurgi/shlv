@@ -626,6 +626,110 @@ mod ai {
         press(&mut app, "S");
         assert!(message(&app).contains("no provider for summarize"));
     }
+
+    fn seed_server(replies: Vec<serde_json::Value>) -> Server {
+        let q = std::sync::Mutex::new(std::collections::VecDeque::from(replies));
+        Server::start(move |r| match r.path.as_str() {
+            "/v1/chat/completions" => {
+                let content = q.lock().unwrap().pop_front().expect("a queued reply");
+                Response::json(&serde_json::json!({"choices": [{"finish_reason": "stop",
+                    "message": {"role": "assistant", "content": content.to_string()}}]}))
+            }
+            _ => Response::new(404),
+        })
+    }
+
+    #[test]
+    fn seeds_from_interests() {
+        use serde_json::json;
+        let server = seed_server(vec![
+            json!({"interests": [
+                {"interest": "nix", "tags": [
+                    {"name": "nix", "description": "the Nix language"},
+                    {"name": "flake", "description": "Nix flakes"},
+                    {"name": "nixpkgs", "description": "the package collection"},
+                ]},
+                {"interest": "network", "tags": [
+                    {"name": "wifi", "description": "wireless networking"},
+                    {"name": "linux", "description": "already on the list"},
+                    {"name": "proxmox", "description": "Proxmox VE"},
+                ]},
+            ]}),
+            json!({"interests": [{"interest": "audio", "tags": [
+                {"name": "speakers", "description": "loudspeakers"},
+            ]}]}),
+        ]);
+        let db = Db::new();
+        {
+            let mut s = db.store();
+            s.add_canonical(&["linux".to_string()]).unwrap();
+            s.save_interests(&["nix".to_string(), "network".to_string()])
+                .unwrap();
+        }
+        let config = Config::parse(
+            &format!(
+                "[ai]\ntag = \"local\"\n\n[provider.local]\nkind = \"openai-compatible\"\n\
+                 base_url = \"{}\"\nmodel = \"m\"\n",
+                server.url("/v1")
+            ),
+            "test.toml".as_ref(),
+        )
+        .unwrap();
+        let mut app = db.app_with(config, |_| {});
+        // s shows what is sent; n sends nothing.
+        press(&mut app, "5s");
+        let t = text(&mut app);
+        assert!(t.contains("tag seed sends to"), "{t}");
+        assert!(t.contains("interests: network, nix"), "{t}");
+        press(&mut app, "n");
+        assert_eq!(message(&app), "nothing sent");
+        assert!(server.requests().is_empty());
+        press(&mut app, "sy");
+        app.finish_jobs();
+        let t = text(&mut app);
+        assert!(t.contains("Candidates from tag seed"), "{t}");
+        assert!(t.contains("on the list"), "linux is listed: {t}");
+        // By interest: network's wifi: rename (keeps); linux is skipped; proxmox: drop. nix's
+        // nix: keep; flake: describe, keep; nixpkgs: merge into nix (Tab completes it).
+        press(&mut app, "r<C-u>Wireless<Enter>");
+        press(&mut app, "d");
+        press(&mut app, "y");
+        press(&mut app, "e<C-u>Nix flakes and lock files<Enter>y");
+        press(&mut app, "mni<Tab><Enter>");
+        // More interests: their candidates join the list.
+        press(&mut app, "aaudio<Enter>");
+        app.finish_jobs();
+        assert!(
+            message(&app).starts_with("added 1 candidate"),
+            "{}",
+            message(&app)
+        );
+        press(&mut app, "d");
+        let t = text(&mut app);
+        assert!(
+            t.contains("3 to keep, 1 to merge, 2 dropped, 0 undecided"),
+            "{t}"
+        );
+        press(&mut app, "w");
+        assert_eq!(
+            message(&app),
+            "seeded: 3 new tags on the list (wireless nix flake), 1 alias (nixpkgs → nix), \
+             3 descriptions"
+        );
+        let s = db.store();
+        let names: Vec<String> = s
+            .canonical_tags()
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, ["flake", "linux", "nix", "wireless"]);
+        assert_eq!(
+            s.tag_info("flake").unwrap().unwrap().description.as_deref(),
+            Some("Nix flakes and lock files")
+        );
+        assert_eq!(s.tag_info("nixpkgs").unwrap().unwrap().name, "nix");
+    }
 }
 
 #[test]
@@ -1286,4 +1390,133 @@ fn tags_backfill() {
         message(&app)
     );
     assert_eq!(tags(&db, "https://b.com/2"), ["music"]);
+}
+
+#[test]
+fn status_view_and_commands() {
+    let db = Db::new();
+    three(&db);
+    let mut app = db.app();
+    press(&mut app, "6");
+    let t = text(&mut app);
+    assert!(t.contains("config      (none)"), "{t}");
+    assert!(t.contains(&db.path().display().to_string()), "{t}");
+    assert!(
+        t.contains("Classifier") && t.contains("none running"),
+        "{t}"
+    );
+    press(&mut app, "x");
+    assert_eq!(message(&app), "no jobs");
+
+    // Tab completes command names, subcommands, then tags.
+    press(&mut app, ":ta<Tab>");
+    assert!(text(&mut app).contains(":tag"), "{}", text(&mut app));
+    press(&mut app, " ren<Tab> we<Tab> www<Enter>");
+    assert_eq!(message(&app), "renamed #web to #www (1 bookmarks)");
+    press(&mut app, ":tag merge www rust<Enter>");
+    assert!(
+        message(&app).starts_with("merged #www into #rust"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, ":tag canonical rust<Enter>");
+    assert_eq!(message(&app), "marked 1 tag canonical");
+    press(&mut app, ":tag describe rust the language<Enter>");
+    assert_eq!(message(&app), "described #rust");
+    assert_eq!(
+        db.store()
+            .tag_info("rust")
+            .unwrap()
+            .unwrap()
+            .description
+            .as_deref(),
+        Some("the language")
+    );
+    press(&mut app, ":tag frob<Enter>");
+    assert!(
+        message(&app).starts_with("tag rename A B"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, ":rule add a.example rust<Enter>");
+    assert!(
+        message(&app).starts_with("added rule a.example → #rust"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, ":rule rm a.example<Enter>");
+    assert_eq!(message(&app), "removed rule a.example → #rust");
+    press(&mut app, ":interest add nix home-lab<Enter>");
+    assert_eq!(message(&app), "saved 2 new interests");
+    press(&mut app, ":interest rm h<Tab><Enter>");
+    assert_eq!(message(&app), "forgot 1 interest");
+    press(&mut app, ":search #python<Enter>");
+    assert_eq!(app.view, View::Bookmarks);
+    assert_eq!(app.bookmarks.ids.len(), 1);
+    press(&mut app, ":frob<Enter>");
+    assert!(message(&app).contains("unknown command"));
+    press(&mut app, ":jobs<Enter>");
+    assert_eq!(app.view, View::Status);
+    press(&mut app, "?");
+    assert!(text(&mut app).contains("Commands (:name)"));
+}
+
+#[test]
+fn cancels_a_job_before_it_starts() {
+    let db = Db::new();
+    three(&db);
+    let path = db.path();
+    // The worker takes a moment to open its store, so the job is still queued when cancelled.
+    let worker = Box::new(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Ok((Store::open(&path)?, Config::default()))
+    });
+    let mut app = App::new(db.store(), Config::default(), worker).unwrap();
+    press(&mut app, "6");
+    app.send_job(super::worker::Job::Health);
+    assert!(text(&mut app).contains("measuring the tag list"));
+    press(&mut app, "x");
+    assert!(text(&mut app).contains("cancelling: measuring the tag list"));
+    app.finish_jobs();
+    assert!(message(&app).contains("cancelled"), "{}", message(&app));
+    assert!(text(&mut app).contains("none running"));
+}
+
+#[test]
+fn bootstrap_interests() {
+    let db = Db::new();
+    let mut app = db.app_with(Config::default(), |s| {
+        s.set_pinned_interests(&["audio".to_string()]);
+    });
+    press(&mut app, "5");
+    let t = text(&mut app);
+    assert!(t.contains("audio  pinned in config"), "{t}");
+    press(&mut app, "anix, Home-Lab<Enter>");
+    assert_eq!(
+        message(&app),
+        "saved 2 new interests (s expands them into tags)"
+    );
+    let t = text(&mut app);
+    assert!(t.contains("home-lab") && t.contains("nix"), "{t}");
+    // By name: audio, home-lab, nix. The pinned one stays.
+    press(&mut app, "dd");
+    assert!(
+        message(&app).contains("pinned by [tags] interests"),
+        "{}",
+        message(&app)
+    );
+    press(&mut app, "jdd");
+    assert_eq!(message(&app), "forgot interest home-lab");
+    let names: Vec<String> = db
+        .store()
+        .interests()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    assert_eq!(
+        names,
+        ["nix"],
+        "pinned interests come from config, not the database"
+    );
 }

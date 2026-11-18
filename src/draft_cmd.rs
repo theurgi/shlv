@@ -43,6 +43,140 @@ pub struct DraftArgs {
     yes: bool,
 }
 
+/// What a draft sends, worked out before anything is sent.
+pub(crate) struct Plan {
+    provider: ai::Provider,
+    to: String,
+    list: Vec<TagOption>,
+    interests: Vec<String>,
+    sample: Sample,
+    chunk: usize,
+    max: usize,
+    fetch: bool,
+    jobs: usize,
+}
+
+impl Plan {
+    /// Picks the sample; fails without a provider or bookmarks.
+    pub(crate) fn new(
+        store: &Store,
+        config: &Config,
+        sample: usize,
+        chunk: usize,
+        max: usize,
+        fetch: bool,
+        jobs: usize,
+    ) -> Result<Plan> {
+        let provider = provider(config, Task::Tag)?;
+        let list: Vec<TagOption> = store
+            .canonical_tags()?
+            .iter()
+            .map(TagOption::from)
+            .collect();
+        let interests: Vec<String> = store.interests()?.into_iter().map(|i| i.name).collect();
+        let sample = store.draft_sample(sample)?;
+        if sample.bookmarks.is_empty() {
+            bail!("no bookmarks to draft from: add or import some first");
+        }
+        Ok(Plan {
+            to: describe_provider(config, &provider),
+            provider,
+            list,
+            interests,
+            sample,
+            chunk,
+            max,
+            fetch,
+            jobs,
+        })
+    }
+
+    /// Bookmarks in the sample.
+    pub(crate) fn len(&self) -> usize {
+        self.sample.bookmarks.len()
+    }
+
+    /// Says exactly what is sent, and where.
+    pub(crate) fn notice(&self, config: &Config, out: &mut impl Write) -> std::io::Result<()> {
+        notice(
+            out,
+            config,
+            &self.to,
+            &self.sample,
+            self.chunk,
+            &self.list,
+            &self.interests,
+            self.fetch,
+        )
+    }
+
+    /// Sends the sample (in requests of `chunk`), merges the drafts, and returns the candidates
+    /// to decide; says how each request went on `out`. Fails only if every request does.
+    pub(crate) fn run(&self, store: &Store, out: &mut impl Write) -> Result<Vec<Candidate>> {
+        let n = self.len();
+        let chunk = self.chunk;
+        let items = items(&self.sample, self.fetch, self.jobs);
+        let requests = n.div_ceil(chunk);
+        let mut drafts = Vec::new();
+        let mut known: Vec<String> = Vec::new();
+        let mut last_err = None;
+        for (k, part) in items.chunks(chunk).enumerate() {
+            let started = Instant::now();
+            let guide = DraftGuide {
+                list: &self.list,
+                interests: &self.interests,
+                known: &known,
+                max: self.max,
+            };
+            let r = self.provider.draft(part, &guide);
+            let took = format!("({:.1} s)", started.elapsed().as_secs_f64());
+            let which = if requests > 1 {
+                format!("request {} of {requests}", k + 1)
+            } else {
+                "draft".into()
+            };
+            match r {
+                Ok(d) => {
+                    let mut what = plural(d.tags.len(), "tag");
+                    if !d.redundant.is_empty() {
+                        what.push_str(&format!(", {} redundant", d.redundant.len()));
+                    }
+                    writeln!(out, "{which}: {what} {took}")?;
+                    for w in &d.refused {
+                        writeln!(out, "dropped: {w}")?;
+                    }
+                    for t in &d.tags {
+                        if known.len() < ai::MAX_KNOWN && !known.contains(&t.name) {
+                            known.push(t.name.clone());
+                        }
+                    }
+                    drafts.push(d);
+                }
+                Err(e) => {
+                    writeln!(out, "{which}: shlv: {e:#} {took}")?;
+                    last_err = Some(e);
+                }
+            }
+        }
+        if drafts.is_empty() {
+            return Err(last_err.expect("every request failed"));
+        }
+        let merged = draft::merge(&drafts, self.max);
+        if merged.cut > 0 {
+            writeln!(
+                out,
+                "{} proposed by fewer requests left out (-n sets how many tags)",
+                plural(merged.cut, "tag")
+            )?;
+        }
+        candidates(store, &merged, &self.interests)
+    }
+
+    pub(crate) fn print_usage(&self) {
+        print_usage(&self.provider);
+    }
+}
+
 /// `shlv tag draft`.
 pub fn run_draft(
     store: &mut Store,
@@ -51,31 +185,18 @@ pub fn run_draft(
     out: &mut impl Write,
     style: &Style,
 ) -> Result<ExitCode> {
-    let provider = provider(config, Task::Tag)?;
-    let list: Vec<TagOption> = store
-        .canonical_tags()?
-        .iter()
-        .map(TagOption::from)
-        .collect();
-    let interests: Vec<String> = store.interests()?.into_iter().map(|i| i.name).collect();
-    let sample = store.draft_sample(args.sample as usize)?;
-    if sample.bookmarks.is_empty() {
-        bail!("no bookmarks to draft from: add or import some first");
-    }
-    let n = sample.bookmarks.len();
-    let chunk = args.chunk as usize;
-    let to = describe_provider(config, &provider);
-    let mut screen = Screen::open();
-    notice(
-        &mut screen,
+    let plan = Plan::new(
+        store,
         config,
-        &to,
-        &sample,
-        chunk,
-        &list,
-        &interests,
+        args.sample as usize,
+        args.chunk as usize,
+        usize::from(args.max),
         args.fetch,
+        args.jobs.into(),
     )?;
+    let n = plan.len();
+    let mut screen = Screen::open();
+    plan.notice(config, &mut screen)?;
     if n > CONFIRM_ABOVE && !args.yes {
         bail!(
             "that sends {} to the provider; pass --yes to go ahead (--sample sets how many)",
@@ -91,79 +212,28 @@ pub fn run_draft(
             return Ok(ExitCode::SUCCESS);
         }
     }
-
-    let items = items(&sample, args.fetch, args.jobs.into());
-    let max = usize::from(args.max);
-    let requests = n.div_ceil(chunk);
-    let mut drafts = Vec::new();
-    let mut known: Vec<String> = Vec::new();
-    let mut last_err = None;
-    for (k, part) in items.chunks(chunk).enumerate() {
-        let started = Instant::now();
-        let guide = DraftGuide {
-            list: &list,
-            interests: &interests,
-            known: &known,
-            max,
-        };
-        let r = provider.draft(part, &guide);
-        let took = screen.dim(&format!("({:.1} s)", started.elapsed().as_secs_f64()));
-        let which = if requests > 1 {
-            format!("request {} of {requests}", k + 1)
-        } else {
-            "draft".into()
-        };
-        match r {
-            Ok(d) => {
-                let mut what = plural(d.tags.len(), "tag");
-                if !d.redundant.is_empty() {
-                    what.push_str(&format!(", {} redundant", d.redundant.len()));
-                }
-                writeln!(screen, "{which}: {what} {took}")?;
-                for w in &d.refused {
-                    let w = screen.dim(&format!("dropped: {w}"));
-                    writeln!(screen, "{w}")?;
-                }
-                for t in &d.tags {
-                    if known.len() < ai::MAX_KNOWN && !known.contains(&t.name) {
-                        known.push(t.name.clone());
-                    }
-                }
-                drafts.push(d);
-            }
-            Err(e) => {
-                writeln!(screen, "{which}: shlv: {e:#} {took}")?;
-                last_err = Some(e);
-            }
+    let ran = plan.run(store, &mut screen);
+    let mut cands = match ran {
+        Ok(c) => c,
+        Err(e) => {
+            plan.print_usage();
+            return Err(e);
         }
-    }
-    if drafts.is_empty() {
-        print_usage(&provider);
-        return Err(last_err.expect("every request failed"));
-    }
-    let merged = draft::merge(&drafts, max);
-    if merged.cut > 0 {
-        let note = screen.dim(&format!(
-            "{} proposed by fewer requests left out (-n sets how many tags)",
-            plural(merged.cut, "tag")
-        ));
-        writeln!(screen, "{note}")?;
-    }
-    let mut cands = candidates(store, &merged, &interests)?;
+    };
     if cands.is_empty() {
         writeln!(screen, "the draft has nothing to add")?;
-        print_usage(&provider);
+        plan.print_usage();
         return Ok(ExitCode::SUCCESS);
     }
     let end = review(&mut screen, &mut cands, None, |raw| store.seed_name(raw))?;
     if end == End::Abort {
         writeln!(screen, "nothing written")?;
-        print_usage(&provider);
+        plan.print_usage();
         return Ok(ExitCode::SUCCESS);
     }
     let s = store.apply_seed(&cands, &[])?;
     report(out, "drafted", &s, None, style)?;
-    print_usage(&provider);
+    plan.print_usage();
     Ok(if s.skipped.is_empty() {
         ExitCode::SUCCESS
     } else {
@@ -174,7 +244,7 @@ pub fn run_draft(
 /// Says exactly what is sent, and where.
 #[allow(clippy::too_many_arguments)]
 fn notice(
-    screen: &mut Screen,
+    screen: &mut impl Write,
     config: &Config,
     to: &str,
     sample: &Sample,

@@ -57,6 +57,11 @@ impl Input {
         &self.text
     }
 
+    /// The text before the cursor.
+    pub fn before_cursor(&self) -> &str {
+        &self.text[..self.cursor]
+    }
+
     /// The cursor's column: characters before it on its line.
     pub fn cursor_col(&self) -> usize {
         let line_start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);

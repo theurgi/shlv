@@ -356,6 +356,14 @@ impl Store {
     }
 
     /// The underlying connection, for inspection and tests.
+    /// The database file; none in memory.
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        self.conn
+            .path()
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }

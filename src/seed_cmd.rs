@@ -141,7 +141,7 @@ pub(crate) fn report(
 }
 
 /// Interests as typed: split on whitespace and commas, normalized, deduplicated in order.
-fn interests_of<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
+pub(crate) fn interests_of<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut v: Vec<String> = Vec::new();
     for w in words.flat_map(|w| w.split([',', ' ', '\t'])) {
         let i = normalize_interest(w);
@@ -153,7 +153,12 @@ fn interests_of<'a>(words: impl Iterator<Item = &'a str>) -> Vec<String> {
 }
 
 /// Says exactly what is sent, and where.
-fn notice(screen: &mut Screen, config: &Config, to: &str, interests: &[String]) -> io::Result<()> {
+pub(crate) fn notice(
+    screen: &mut impl Write,
+    config: &Config,
+    to: &str,
+    interests: &[String],
+) -> io::Result<()> {
     let g = match config.tags.style.guidelines() {
         Some(g) => format!(
             "your [tags.style] guidelines ({})",
@@ -173,7 +178,7 @@ fn notice(screen: &mut Screen, config: &Config, to: &str, interests: &[String]) 
 
 /// The provider's candidates for `interests`, styled and resolved against the database, with
 /// notes on names that couldn't be used and interests that got none.
-fn expand(
+pub(crate) fn expand(
     provider: &Provider,
     store: &Store,
     interests: &[String],

@@ -1536,3 +1536,14 @@ impl App {
         }
     }
 }
+
+impl App {
+    /// `:review`: starts a batch unless one is under way.
+    pub(super) fn run_review(&mut self) {
+        self.review.queue_tab = false;
+        match self.review.phase {
+            Phase::Idle => self.start_batch(),
+            _ => self.say("a batch is under way"),
+        }
+    }
+}

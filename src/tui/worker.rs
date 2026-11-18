@@ -4,16 +4,18 @@
 //! Jobs run one at a time, in the order sent. The thread starts with the first job, so a session
 //! that never sends one costs nothing.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use shlv::Store;
 use shlv::config::Config;
 use shlv::health::{Health, HealthOptions};
 use shlv::review::ReviewFilter;
+use shlv::{Candidate, Store};
 
 /// Opens the worker's own store, configured as the UI's is.
 pub type OpenStore = Box<dyn FnOnce() -> Result<(Store, Config)> + Send>;
@@ -38,6 +40,21 @@ pub enum Job {
     },
     /// Measure the tag list (`tag health`).
     Health,
+    /// Fetch titles for every bookmark without one (feature `fetch`).
+    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
+    FetchAll,
+    /// Summarize every bookmark without a summary (feature `ai`).
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    SummarizeAll,
+    /// Measure the classifier (`model eval`, feature `model`).
+    #[cfg_attr(not(feature = "model"), allow(dead_code))]
+    Eval,
+    /// Expand interests into candidate tags (`tag seed`, feature `ai`).
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    Seed { interests: Vec<String>, per: usize },
+    /// Draft tags from a sample of bookmarks (`tag draft`, feature `ai`).
+    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    Draft { sample: usize, max: usize },
     /// Retrain the classifier (feature `model`).
     #[cfg_attr(not(feature = "model"), allow(dead_code))]
     Train,
@@ -53,6 +70,11 @@ impl Job {
             Job::Backfill { tag, .. } => format!("back-filling #{tag}"),
             Job::Train => "training the classifier".into(),
             Job::Health => "measuring the tag list".into(),
+            Job::FetchAll => "fetching titles".into(),
+            Job::SummarizeAll => "summarizing".into(),
+            Job::Eval => "measuring the classifier".into(),
+            Job::Seed { interests, .. } => format!("expanding {}", interests.join(", ")),
+            Job::Draft { sample, .. } => format!("drafting tags from {sample} bookmarks"),
         }
     }
 }
@@ -65,6 +87,10 @@ pub enum Output {
     /// Bookmarks: those a review batch picked.
     Ids(Vec<i64>),
     Health(Box<Health>),
+    /// A report to show as it is.
+    Text(Vec<String>),
+    /// Candidate tags to decide (seed, draft).
+    Candidates(Vec<Candidate>),
 }
 
 /// What the worker says about a job.
@@ -102,6 +128,8 @@ pub struct Worker {
     jobs: Option<Sender<(u64, Job)>>,
     reports: Option<Receiver<Report>>,
     next: u64,
+    /// Jobs to stop: not started, or stopped between items.
+    cancelled: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl Worker {
@@ -111,6 +139,7 @@ impl Worker {
             jobs: None,
             reports: None,
             next: 1,
+            cancelled: Arc::default(),
         }
     }
 
@@ -120,7 +149,8 @@ impl Worker {
             let (jobs_tx, jobs_rx) = mpsc::channel();
             let (reports_tx, reports_rx) = mpsc::channel();
             let open = self.open.take().expect("worker started once");
-            thread::spawn(move || work(open, jobs_rx, reports_tx));
+            let cancelled = Arc::clone(&self.cancelled);
+            thread::spawn(move || work(open, jobs_rx, reports_tx, cancelled));
             self.jobs = Some(jobs_tx);
             self.reports = Some(reports_rx);
         }
@@ -129,6 +159,13 @@ impl Worker {
         // A send fails only if the thread is gone; `recv` reports that.
         let _ = self.jobs.as_ref().expect("started").send((n, job));
         n
+    }
+
+    /// Stops a job: before it starts, or (fetching or summarizing many) after the current one.
+    pub fn cancel(&self, job: u64) {
+        if let Ok(mut c) = self.cancelled.lock() {
+            c.insert(job);
+        }
     }
 
     /// The next report, waiting up to `wait` (or not at all for zero).
@@ -141,7 +178,12 @@ impl Worker {
     }
 }
 
-fn work(open: OpenStore, jobs: Receiver<(u64, Job)>, reports: Sender<Report>) {
+fn work(
+    open: OpenStore,
+    jobs: Receiver<(u64, Job)>,
+    reports: Sender<Report>,
+    cancelled: Arc<Mutex<HashSet<u64>>>,
+) {
     let mut opened = match open() {
         Ok(o) => Ok(o),
         Err(e) => Err(format!("{e:#}")),
@@ -151,12 +193,17 @@ fn work(open: OpenStore, jobs: Receiver<(u64, Job)>, reports: Sender<Report>) {
         let progress = |text: String| {
             let _ = reports.send(Report::Progress { job: n, text });
         };
+        let stop = || cancelled.lock().is_ok_and(|c| c.contains(&n));
         let report = match &mut opened {
+            _ if stop() => Report::Failed {
+                job: n,
+                error: "cancelled".into(),
+            },
             Err(e) => Report::Failed {
                 job: n,
                 error: format!("cannot open the database: {e}"),
             },
-            Ok((store, config)) => match run(&mut ctx, store, config, &job, &progress) {
+            Ok((store, config)) => match run(&mut ctx, store, config, &job, &progress, &stop) {
                 Ok((text, out)) => Report::Done { job: n, text, out },
                 Err(e) => Report::Failed {
                     job: n,
@@ -211,6 +258,7 @@ fn run(
     config: &Config,
     job: &Job,
     progress: &dyn Fn(String),
+    stop: &dyn Fn() -> bool,
 ) -> Result<(String, Output)> {
     let mut out = Lines {
         progress,
@@ -310,6 +358,135 @@ fn run(
             let h = health(store, config)?;
             Ok((String::new(), Output::Health(Box::new(h))))
         }
+        #[cfg(feature = "fetch")]
+        Job::FetchAll => {
+            let mut targets: Vec<(i64, String)> = Vec::new();
+            store.list_each(
+                &shlv::ListQuery {
+                    tags: Vec::new(),
+                    limit: usize::MAX,
+                },
+                |b| {
+                    if b.title.is_none() {
+                        targets.push((b.id, b.url));
+                    }
+                    Ok(())
+                },
+            )?;
+            if targets.is_empty() {
+                return Ok(("every bookmark has a title".into(), Output::Nothing));
+            }
+            let fetcher = ctx.fetcher.get_or_insert_with(Default::default);
+            let total = targets.len();
+            let (mut done, mut set, mut failed) = (0, 0, 0);
+            let r = shlv::bulk::run(
+                &targets,
+                4,
+                |(_, url)| fetcher.get(url).map(|p| shlv::fetch::title(&p.html)),
+                |i, r| -> Result<()> {
+                    done += 1;
+                    if let Ok(Some(title)) = r {
+                        let edit = shlv::Edit {
+                            title: Some(title),
+                            ..Default::default()
+                        };
+                        if store.edit(targets[i].0, &edit)? {
+                            set += 1;
+                        }
+                    } else {
+                        failed += 1;
+                    }
+                    progress(format!("fetching titles {done}/{total}"));
+                    if stop() {
+                        anyhow::bail!(Cancelled);
+                    }
+                    Ok(())
+                },
+            );
+            let text = format!(
+                "titles: {set} set, {failed} not found or failed, of {}",
+                crate::plural(total, "bookmark")
+            );
+            match r {
+                Err(e) if e.is::<Cancelled>() => {
+                    Ok((format!("cancelled; {text}"), Output::Nothing))
+                }
+                Err(e) => Err(e),
+                Ok(()) => Ok((text, Output::Nothing)),
+            }
+        }
+        #[cfg(feature = "ai")]
+        Job::SummarizeAll => {
+            let provider = crate::ai_cmd::provider(config, shlv::ai::Task::Summarize)?;
+            let mut targets: Vec<shlv::Bookmark> = Vec::new();
+            store.list_each(
+                &shlv::ListQuery {
+                    tags: Vec::new(),
+                    limit: usize::MAX,
+                },
+                |b| {
+                    if b.summary.is_none() {
+                        targets.push(b);
+                    }
+                    Ok(())
+                },
+            )?;
+            let fetcher = ctx.fetcher.get_or_insert_with(Default::default);
+            let total = targets.len();
+            let (mut set, mut failed) = (0, 0);
+            for (i, b) in targets.iter().enumerate() {
+                if stop() {
+                    return Ok((
+                        format!("cancelled after {i} of {total}; {set} summarized"),
+                        Output::Nothing,
+                    ));
+                }
+                progress(format!("summarizing {}/{total}: {}", i + 1, b.url));
+                let text = crate::ai_cmd::page_text(fetcher, &b.url).ok().flatten();
+                let item = shlv::choose::Item {
+                    text,
+                    ..shlv::choose::Item::from_bookmark(b)
+                };
+                match provider.summarize(&item) {
+                    Ok(s) if store.set_summary(b.id, Some(&s))? => set += 1,
+                    _ => failed += 1,
+                }
+            }
+            Ok((
+                format!("summarized {set} of {total}; {failed} failed"),
+                Output::Nothing,
+            ))
+        }
+        #[cfg(feature = "model")]
+        Job::Eval => {
+            let mut buf = Vec::new();
+            let cmd = crate::model_cmd::ModelCmd::Eval {
+                #[cfg(feature = "ai")]
+                provider: false,
+                #[cfg(feature = "ai")]
+                limit: 0,
+                #[cfg(feature = "ai")]
+                yes: false,
+            };
+            crate::model_cmd::run(store, config, cmd, &mut buf)?;
+            let lines = String::from_utf8_lossy(&buf)
+                .lines()
+                .map(String::from)
+                .collect();
+            Ok((String::new(), Output::Text(lines)))
+        }
+        #[cfg(feature = "ai")]
+        Job::Seed { interests, per } => {
+            let provider = crate::ai_cmd::provider(config, shlv::ai::Task::Tag)?;
+            let (cands, notes) = crate::seed_cmd::expand(&provider, store, interests, *per)?;
+            Ok((notes.join("; "), Output::Candidates(cands)))
+        }
+        #[cfg(feature = "ai")]
+        Job::Draft { sample, max } => {
+            let plan = crate::draft_cmd::Plan::new(store, config, *sample, 50, *max, false, 4)?;
+            let cands = plan.run(store, &mut out)?;
+            Ok((String::new(), Output::Candidates(cands)))
+        }
         #[allow(unreachable_patterns)]
         _ => anyhow::bail!("this build can't do that"),
     }
@@ -330,3 +507,16 @@ fn health(store: &mut Store, config: &Config) -> Result<Health> {
     }
     store.health(&opts, None)
 }
+
+/// A bulk job stopped by [`Worker::cancel`].
+#[derive(Debug)]
+#[cfg_attr(not(feature = "fetch"), allow(dead_code))]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}

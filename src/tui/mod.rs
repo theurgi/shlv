@@ -15,11 +15,14 @@ use ratatui::DefaultTerminal;
 
 mod app;
 mod bookmarks;
+mod bootstrap;
+mod commands;
 mod form;
 mod input;
 mod pick;
 mod review;
 mod rules;
+mod status;
 mod tags;
 #[cfg(test)]
 mod tests;
@@ -36,14 +39,15 @@ pub fn run(opened: crate::Opened) -> Result<()> {
     let crate::Opened {
         store,
         config,
+        config_path,
         notes,
-        ..
     } = opened;
     let worker = Box::new(|| {
         let o = crate::open_store()?;
         Ok((o.store, o.config))
     });
     let mut app = App::new(store, config, worker)?;
+    app.config_path = Some(config_path);
     if !notes.is_empty() {
         app.say(notes.join("; "));
     }
