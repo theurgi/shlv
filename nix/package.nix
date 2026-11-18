@@ -1,44 +1,45 @@
+# The shlv package, built with crane (task 049). The dependencies are their own derivation
+# (`passthru.cargoArtifacts`), so a source change rebuilds only shlv, and the binary cache keeps
+# the dependency build until `Cargo.lock` or the feature set changes.
+#
+# Tests and clippy don't run here: they're flake checks (`nix/checks.nix`), in the dev profile.
+# Running them in release would link every test binary again with fat LTO, which more than doubled
+# the build.
 {
   lib,
-  rustPlatform,
+  craneLib,
   # Cargo features to build with; `shlv-full` passes all of them.
   features ? [ ],
   pname ? "shlv",
 }:
 let
-  fs = lib.fileset;
+  common = import ./common.nix { inherit lib; };
+  args = common.args // {
+    inherit pname;
+    cargoExtraArgs = common.featureArgs features;
+  };
+  cargoArtifacts = craneLib.buildDepsOnly (
+    args
+    // {
+      # The package needs only the compiled dependencies, not `cargo check`'s metadata or the
+      # dev-dependencies.
+      cargoCheckCommand = "true";
+      doCheck = false;
+    }
+  );
 in
-rustPlatform.buildRustPackage {
-  inherit pname;
-  inherit ((lib.importTOML ../Cargo.toml).package) version;
+craneLib.buildPackage (
+  args
+  // {
+    inherit cargoArtifacts;
+    doCheck = false;
+    passthru = { inherit cargoArtifacts; };
 
-  src = fs.toSource {
-    root = ../.;
-    fileset = fs.unions [
-      ../Cargo.toml
-      ../Cargo.lock
-      ../src
-      ../tests
-      ../migrations
-      ../examples
-    ];
-  };
-
-  cargoLock.lockFile = ../Cargo.lock;
-  buildFeatures = features;
-
-  # The fetch tests run a local HTTP server on 127.0.0.1.
-  __darwinAllowLocalNetworking = true;
-
-  # nixpkgs' cargo setup hook exports LIBSQLITE3_SYS_USE_PKG_CONFIG=1, which overrides rusqlite's
-  # `bundled` feature. Keep the bundled SQLite so the package matches what `cargo test` and
-  # `bench/run.sh` measure (see tasks/completed/009-nix-package.md).
-  preBuild = "export LIBSQLITE3_SYS_USE_PKG_CONFIG=0";
-
-  meta = {
-    description = "A fast, resource-efficient bookmarking app";
-    homepage = "https://github.com/theurgi/shlv";
-    license = lib.licenses.mit;
-    mainProgram = "shlv";
-  };
-}
+    meta = {
+      description = "A fast, resource-efficient bookmarking app";
+      homepage = "https://github.com/theurgi/shlv";
+      license = lib.licenses.mit;
+      mainProgram = "shlv";
+    };
+  }
+)

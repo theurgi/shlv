@@ -1,10 +1,19 @@
 {
   description = "shlv: a fast, resource-efficient bookmarking app";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Builds the dependencies as their own derivation, so they're cached apart from shlv (task 049).
+    crane.url = "github:ipetkov/crane";
+  };
 
   outputs =
-    { self, nixpkgs, ... }:
+    {
+      self,
+      nixpkgs,
+      crane,
+      ...
+    }:
     let
       inherit (nixpkgs) lib;
       systems = [
@@ -33,12 +42,14 @@
       };
     in
     {
-      overlays.default = final: _prev: { shlv = final.callPackage ./nix/package.nix { }; };
+      overlays.default = final: _prev: {
+        shlv = final.callPackage ./nix/package.nix { craneLib = crane.mkLib final; };
+      };
 
       homeManagerModules.default = import ./nix/hm-module.nix { inherit self; };
 
       packages = forAll (pkgs: rec {
-        shlv = pkgs.callPackage ./nix/package.nix { };
+        shlv = pkgs.callPackage ./nix/package.nix { craneLib = crane.mkLib pkgs; };
         # Every optional Cargo feature (fetch, and later ai and model).
         shlv-full = shlv.override {
           pname = "shlv-full";
@@ -59,20 +70,6 @@
         pkgs:
         let
           inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) shlv shlv-full;
-          # cargo clippy over every target, reusing a package's vendored dependencies.
-          clippyCheck =
-            pkg: flags:
-            pkg.overrideAttrs (old: {
-              pname = "${old.pname}-clippy";
-              nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
-              buildPhase = ''
-                runHook preBuild
-                cargo clippy --offline --all-targets ${flags} -- -D warnings
-                runHook postBuild
-              '';
-              doCheck = false;
-              installPhase = "touch $out";
-            });
           # A check that runs `script` over the lint source and succeeds if it exits 0.
           lint =
             name: inputs: script:
@@ -82,11 +79,14 @@
               touch $out
             '';
         in
-        {
-          # Both build and run the tests: the default features, and all of them.
+        # Tests and clippy, for the default features and for all of them.
+        import ./nix/checks.nix {
+          inherit lib allFeatures;
+          craneLib = crane.mkLib pkgs;
+        }
+        // {
+          # The release builds.
           inherit shlv shlv-full;
-          clippy = clippyCheck shlv "";
-          clippy-full = clippyCheck shlv-full "--all-features";
           rustfmt = lint "rustfmt" [
             pkgs.cargo
             pkgs.rustfmt
