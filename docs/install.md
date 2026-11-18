@@ -11,9 +11,9 @@ nix profile add github:theurgi/shlv
 
 The flake also provides `overlays.default`, which adds `pkgs.shlv`.
 
-CI pushes its builds to the `shlv` Cachix cache, so you can download shlv instead of
-compiling it. Nix offers to use the cache when you run the flake. On NixOS, add it to your system
-configuration instead:
+CI pushes its builds to the `shlv` Cachix cache, so you can download shlv instead of compiling it.
+Nix offers to use the cache when you run the flake. On NixOS, add it to your system configuration
+instead:
 
 ```nix
 nix.settings = {
