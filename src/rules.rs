@@ -302,13 +302,21 @@ impl Store {
             tags: HashMap<i64, Seen>,
         }
         let mut sites: HashMap<u32, Site> = HashMap::new();
-        // By bookmark, so each site counts a bookmark once.
-        let mut stmt = self.conn.prepare(
+        // By bookmark, so each site counts a bookmark once. For one site, bookmarks come first
+        // (CROSS JOIN keeps that order), so other sites' tag rows are never read: 15 against
+        // 50 ms at 100k. For all of them, tag rows first: 95 against 120 ms.
+        let sql = if site.is_some() {
+            "SELECT b.id, b.url_norm, bt.tag_id FROM bookmark b \
+             CROSS JOIN bookmark_tag bt ON bt.bookmark_id = b.id \
+             WHERE bt.source <> 'rule' AND b.deleted_at IS NULL \
+             AND instr(b.url_norm, ?1) > 0 ORDER BY b.id"
+        } else {
             "SELECT b.id, b.url_norm, bt.tag_id FROM bookmark_tag bt \
              JOIN bookmark b ON b.id = bt.bookmark_id \
-             WHERE bt.source <> 'rule' AND b.deleted_at IS NULL \
-             AND (?1 IS NULL OR instr(b.url_norm, ?1) > 0) ORDER BY bt.bookmark_id",
-        )?;
+             WHERE bt.source <> 'rule' AND b.deleted_at IS NULL AND ?1 IS NULL \
+             ORDER BY bt.bookmark_id"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([site])?;
         while let Some(r) = rows.next()? {
             let (id, tag): (i64, i64) = (r.get(0)?, r.get(2)?);
