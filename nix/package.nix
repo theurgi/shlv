@@ -20,6 +20,7 @@ let
   };
   cargoArtifacts = craneLib.buildDepsOnly (
     args
+    // (common.depsArgs craneLib)
     // {
       # The package needs only the compiled dependencies, not `cargo check`'s metadata or the
       # dev-dependencies.

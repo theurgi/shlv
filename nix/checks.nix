@@ -20,6 +20,7 @@ let
   # dependencies and dev-dependencies for the tests.
   cargoArtifacts = craneLib.buildDepsOnly (
     common.args
+    // (common.depsArgs craneLib)
     // {
       pname = "shlv-checks";
       CARGO_PROFILE = "";
