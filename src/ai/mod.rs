@@ -14,6 +14,7 @@
 //!   the same checks.
 
 pub mod anthropic;
+pub mod key;
 pub mod openai;
 
 use std::collections::BTreeMap;
@@ -28,6 +29,7 @@ use toml::Spanned;
 use crate::choose::{Canonical, Choice, ChooseTags, Item, NewTag, TagOption};
 use crate::draft::{DraftTag, Drafted, Redundant};
 use crate::style::{StyleConfig, TagStyle};
+pub use key::{ApiKey, KeyCmd};
 
 /// Longest summary accepted, in characters.
 pub const MAX_SUMMARY: usize = 1000;
@@ -63,9 +65,14 @@ pub struct ProviderConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     /// A file holding the API key (an agenix or sops-nix secret, say); read only when the
-    /// provider is used. Exclusive with `api_key_env`.
+    /// provider is used. Exclusive with `api_key_env` and `api_key_cmd`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_file: Option<String>,
+    /// A command printing the API key (`["secret-tool", "lookup", "service", "shlv"]`), run
+    /// without a shell when the first request needs the key, then cached for the process.
+    /// Exclusive with `api_key_env` and `api_key_file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_cmd: Option<Vec<String>>,
     /// Seconds to wait for one response (default 120; local models can be slow).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
@@ -98,8 +105,18 @@ impl ProviderConfig {
                 "`base_url` must be an http or https URL, not {u:?}"
             ));
         }
-        if self.api_key_env.is_some() && self.api_key_file.is_some() {
-            return Err("set `api_key_env` or `api_key_file`, not both".into());
+        let sources = [
+            self.api_key_env.is_some(),
+            self.api_key_file.is_some(),
+            self.api_key_cmd.is_some(),
+        ];
+        if sources.into_iter().filter(|&s| s).count() > 1 {
+            return Err("set only one of `api_key_env`, `api_key_file`, and `api_key_cmd`".into());
+        }
+        if let Some(c) = &self.api_key_cmd
+            && c.first().is_none_or(|p| p.trim().is_empty())
+        {
+            return Err("`api_key_cmd` needs a program: [\"program\", \"arg\", ...]".into());
         }
         if let Some(e) = &self.effort {
             if self.kind != Kind::Anthropic {
@@ -121,16 +138,21 @@ impl ProviderConfig {
         Duration::from_secs(self.timeout.unwrap_or(120))
     }
 
-    /// The API key, read now. `None` when no key is configured (local servers).
-    pub fn api_key(&self) -> Result<Option<String>> {
+    /// Where provider `name`'s API key comes from. `api_key_env` and `api_key_file` are read
+    /// now; `api_key_cmd` runs when [`ApiKey::get`] first needs it. `None` when no key is
+    /// configured (local servers).
+    pub fn api_key(&self, name: &str) -> Result<Option<ApiKey>> {
+        if let Some(argv) = &self.api_key_cmd {
+            return Ok(Some(ApiKey::Cmd(KeyCmd::new(name, argv))));
+        }
         if let Some(path) = &self.api_key_file {
-            return read_key_file(Path::new(path)).map(Some);
+            return read_key_file(Path::new(path)).map(|k| Some(ApiKey::Value(k)));
         }
         let Some(var) = &self.api_key_env else {
             return Ok(None);
         };
         match std::env::var(var) {
-            Ok(k) if !k.trim().is_empty() => Ok(Some(k.trim().to_string())),
+            Ok(k) if !k.trim().is_empty() => Ok(Some(ApiKey::Value(k.trim().to_string()))),
             _ => bail!("environment variable {var} (api_key_env) is not set"),
         }
     }
@@ -254,18 +276,19 @@ pub struct Provider {
 }
 
 impl Provider {
-    /// Builds provider `name` from its config. Reads its API key now.
+    /// Builds provider `name` from its config. Reads its API key now, except from `api_key_cmd`:
+    /// that runs when the first request needs it.
     pub fn new(name: &str, config: &ProviderConfig) -> Result<Provider> {
         let at = || format!("provider {name}");
         config.check().map_err(|e| anyhow!(e)).with_context(at)?;
-        let key = config.api_key().with_context(at)?;
+        let key = config.api_key(name).with_context(at)?;
         let llm: Box<dyn Llm> = match config.kind {
             Kind::OpenaiCompatible => Box::new(openai::OpenAi::new(config, key)),
             Kind::Anthropic => match key {
                 Some(key) => Box::new(anthropic::Anthropic::new(config, key)),
                 None => bail!(
-                    "provider {name}: kind \"anthropic\" needs an API key: set api_key_env or \
-                     api_key_file"
+                    "provider {name}: kind \"anthropic\" needs an API key: set api_key_env, \
+                     api_key_file, or api_key_cmd"
                 ),
             },
         };

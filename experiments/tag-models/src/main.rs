@@ -642,6 +642,7 @@ fn run(cand: &str, out: &Path) -> Result<()> {
                     base_url: Some(base),
                     api_key_env: None,
                     api_key_file: None,
+                    api_key_cmd: None,
                     timeout: Some(600),
                     effort: None,
                 },

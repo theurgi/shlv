@@ -68,7 +68,8 @@ in
           text sent to the AI with every tagging request.
         - `ai` and `provider` (builds with the `ai` feature, such as `shlv-full`): `ai.summarize`
           and `ai.tag` name a `provider.<name>` with `kind` (`"openai-compatible"` or
-          `"anthropic"`), `model`, `base_url`, `api_key_env` or `api_key_file`, `timeout`, and for
+          `"anthropic"`), `model`, `base_url`, one of `api_key_env`, `api_key_file`, or `api_key_cmd`,
+          `timeout`, and for
           `"anthropic"` an optional `effort`. AI is
           off until `ai` names a provider. For each bookmark it processes, shlv sends the
           provider its URL, title, note, summary, and extracted page text, and for tagging the
@@ -80,7 +81,8 @@ in
         when the provider is used, such as an agenix or sops-nix secret:
         `provider.claude.api_key_file = config.age.secrets.anthropic.path`. Only the path
         reaches the store. shlv trims the file's trailing newline and warns if every user can
-        read it.
+        read it. Or a command that prints the key, run without a shell when the first request
+        needs it: `provider.claude.api_key_cmd = [ "secret-tool" "lookup" "service" "shlv" ]`.
       '';
     };
   };

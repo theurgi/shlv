@@ -11,20 +11,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::{Llm, ProviderConfig, Request, Usage, error_message};
+use super::{ApiKey, Llm, ProviderConfig, Request, Usage, error_message};
 
 pub struct OpenAi {
     agent: ureq::Agent,
     url: String,
     model: String,
-    key: Option<String>,
+    key: Option<ApiKey>,
     /// Cleared when the server rejects `json_schema`.
     schema_ok: AtomicBool,
     usage: Mutex<Usage>,
 }
 
 impl OpenAi {
-    pub fn new(config: &ProviderConfig, key: Option<String>) -> Self {
+    pub fn new(config: &ProviderConfig, key: Option<ApiKey>) -> Self {
         let base = config.base_url.as_deref().unwrap_or_default();
         OpenAi {
             agent: agent(config),
@@ -83,7 +83,7 @@ impl OpenAi {
             .post(&self.url)
             .header("content-type", "application/json");
         if let Some(k) = &self.key {
-            r = r.header("authorization", &format!("Bearer {k}"));
+            r = r.header("authorization", &format!("Bearer {}", k.get()?));
         }
         let mut resp = r.send(body.to_string()).map_err(transport_error)?;
         let status = resp.status().as_u16();

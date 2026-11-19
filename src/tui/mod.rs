@@ -5,6 +5,7 @@
 //! arrives as a key in raw mode and quits.
 
 use std::io::{self, Write};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -51,13 +52,49 @@ pub fn run(opened: crate::Opened) -> Result<()> {
     if !notes.is_empty() {
         app.say(notes.join("; "));
     }
+    let keys = key_requests();
     let mut screen = Screen::enter()?;
-    let result = event_loop(&mut app, &mut screen.terminal);
+    let result = event_loop(&mut app, &mut screen.terminal, &keys);
     drop(screen);
     result
 }
 
-fn event_loop(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+/// A worker's request to run `api_key_cmd`, and where to send the key.
+#[cfg(feature = "ai")]
+type KeyRequest = (shlv::ai::KeyCmd, mpsc::Sender<Result<String>>);
+#[cfg(not(feature = "ai"))]
+type KeyRequest = std::convert::Infallible;
+
+/// Routes `api_key_cmd` runs to the event loop, which runs them with the terminal suspended: a
+/// pinentry or other prompt then gets the real terminal instead of drawing over the TUI. Workers
+/// make every provider request, so they are the ones that ask; they wait for the answer.
+fn key_requests() -> mpsc::Receiver<KeyRequest> {
+    let (tx, rx) = mpsc::channel::<KeyRequest>();
+    #[cfg(feature = "ai")]
+    {
+        let ui = std::thread::current().id();
+        shlv::ai::key::set_runner(Box::new(move |cmd| {
+            if std::thread::current().id() == ui {
+                anyhow::bail!("{} must run on a worker thread", cmd.describe());
+            }
+            let (reply, answer) = mpsc::channel();
+            tx.send((cmd.clone(), reply))
+                .map_err(|_| anyhow::anyhow!("the TUI has quit"))?;
+            answer
+                .recv()
+                .map_err(|_| anyhow::anyhow!("the TUI has quit"))?
+        }));
+    }
+    #[cfg(not(feature = "ai"))]
+    drop(tx);
+    rx
+}
+
+fn event_loop(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    keys: &mpsc::Receiver<KeyRequest>,
+) -> Result<()> {
     loop {
         terminal.draw(|f| app.draw(f))?;
         if app.quit {
@@ -72,6 +109,21 @@ fn event_loop(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
             }
             app.settle();
         }
+        // A worker waits for its key, so jobs are running and the loop wakes every TICK.
+        #[cfg(feature = "ai")]
+        while let Ok((cmd, reply)) = keys.try_recv() {
+            let r = suspended(terminal, || {
+                eprintln!(
+                    "shlv: getting the API key for provider {} from {}",
+                    cmd.provider,
+                    cmd.describe()
+                );
+                cmd.run()
+            });
+            let _ = reply.send(r);
+        }
+        #[cfg(not(feature = "ai"))]
+        let _ = keys;
         app.drain_reports(Duration::ZERO);
         if let Some(url) = app.take_open() {
             let r = suspended(terminal, || crate::open(&url));

@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::openai::{agent, transport_error};
-use super::{Llm, ProviderConfig, Request, Usage, error_message};
+use super::{ApiKey, Llm, ProviderConfig, Request, Usage, error_message};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 pub const API_VERSION: &str = "2026-10-21";
@@ -32,13 +32,13 @@ pub struct Anthropic {
     agent: ureq::Agent,
     url: String,
     model: String,
-    key: String,
+    key: ApiKey,
     effort: Option<String>,
     usage: Mutex<Usage>,
 }
 
 impl Anthropic {
-    pub fn new(config: &ProviderConfig, key: String) -> Self {
+    pub fn new(config: &ProviderConfig, key: ApiKey) -> Self {
         let base = config.base_url.as_deref().unwrap_or(DEFAULT_BASE_URL);
         Anthropic {
             agent: agent(config),
@@ -82,7 +82,7 @@ impl Anthropic {
             .agent
             .post(&self.url)
             .header("content-type", "application/json")
-            .header("x-api-key", &self.key)
+            .header("x-api-key", &self.key.get()?)
             .header("anthropic-version", API_VERSION)
             .send(body)
             .map_err(transport_error)?;
@@ -160,7 +160,7 @@ impl Anthropic {
         let mut resp = self
             .agent
             .get(url)
-            .header("x-api-key", &self.key)
+            .header("x-api-key", &self.key.get()?)
             .header("anthropic-version", API_VERSION)
             .call()
             .map_err(transport_error)?;
@@ -187,7 +187,7 @@ impl Anthropic {
             .agent
             .post(&self.batches_url())
             .header("content-type", "application/json")
-            .header("x-api-key", &self.key)
+            .header("x-api-key", &self.key.get()?)
             .header("anthropic-version", API_VERSION)
             .send(json!({"requests": requests}).to_string())
             .map_err(transport_error)?;

@@ -43,6 +43,7 @@ fn config(server: &Server) -> ProviderConfig {
         base_url: Some(server.url("/v1")),
         api_key_env: None,
         api_key_file: None,
+        api_key_cmd: None,
         effort: None,
         timeout: Some(5),
     }
@@ -304,6 +305,7 @@ fn live_openai_compatible() {
         base_url: Some(url),
         api_key_env: std::env::var("SHLV_TEST_OPENAI_KEY_ENV").ok(),
         api_key_file: None,
+        api_key_cmd: None,
         effort: None,
         timeout: Some(300),
     };
@@ -385,10 +387,126 @@ fn api_keys_from_a_file() {
     c.api_key_env = Some("X".into());
     let e = format!("{:#}", Provider::new("secret", &c).err().unwrap());
     assert!(
-        e.contains("set `api_key_env` or `api_key_file`, not both"),
+        e.contains("set only one of `api_key_env`, `api_key_file`, and `api_key_cmd`"),
         "{e}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fresh directory for one key-command test (commands are cached by argv, so each test's
+/// scripts must differ: they mention the directory).
+fn key_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("shlv-keycmd-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn sh(script: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), script.into()]
+}
+
+#[test]
+fn api_keys_from_a_command_run_once_when_needed() {
+    let dir = key_dir("ok");
+    let runs = dir.join("runs");
+    let s = scripted(vec![chat(r#"{"tags": []}"#), chat(r#"{"tags": []}"#)]);
+    let mut c = config(&s);
+    // Counts its runs, prints the key with surrounding whitespace, and says something on stderr
+    // (passed through, as a prompt would be).
+    c.api_key_cmd = Some(sh(&format!(
+        "echo run >> '{}'; echo hello from the command >&2; printf '  sk-from-cmd\\n\\n'",
+        runs.display()
+    )));
+    let p = Provider::new("cmd", &c).unwrap();
+    assert!(!runs.exists(), "the command ran before a request needed it");
+    p.choose_tags(&item(), &list()).unwrap();
+    // Another provider built from the same config (the TUI builds one per job) uses the cache.
+    Provider::new("cmd", &c)
+        .unwrap()
+        .choose_tags(&item(), &list())
+        .unwrap();
+    for r in s.requests() {
+        assert_eq!(r.header("authorization"), Some("Bearer sk-from-cmd"));
+    }
+    assert_eq!(std::fs::read_to_string(&runs).unwrap(), "run\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn api_key_command_failures_name_the_command_not_the_output() {
+    let dir = key_dir("fail");
+    let s = scripted(vec![]);
+    let mut c = config(&s);
+    let err = |c: &ProviderConfig| {
+        format!(
+            "{:#}",
+            Provider::new("vault", c)
+                .unwrap()
+                .choose_tags(&item(), &list())
+                .unwrap_err()
+        )
+    };
+
+    let fail = sh(&format!(
+        "printf 'sk-%s' leaked; exit 3 # {}",
+        dir.display()
+    ));
+    c.api_key_cmd = Some(fail.clone());
+    let e = err(&c);
+    assert_eq!(
+        e,
+        format!("provider vault (tag): api_key_cmd {fail:?} failed (exit status: 3)")
+    );
+    assert!(!e.contains("sk-leaked"));
+
+    c.api_key_cmd = Some(sh(&format!("printf '\\n  \\n' # {}", dir.display())));
+    assert!(err(&c).ends_with("printed nothing"), "{}", err(&c));
+
+    // stdin is closed: a command reading it sees end of file at once instead of hanging.
+    c.api_key_cmd = Some(sh(&format!("cat # {}", dir.display())));
+    assert!(err(&c).ends_with("printed nothing"), "{}", err(&c));
+
+    c.api_key_cmd = Some(vec![dir.join("no-such-program").display().to_string()]);
+    assert!(err(&c).contains("cannot run api_key_cmd"), "{}", err(&c));
+
+    // Failures aren't cached: the next request runs the command again.
+    let flip = dir.join("flip");
+    c.api_key_cmd = Some(sh(&format!(
+        "[ -e '{0}' ] && echo sk-second || {{ touch '{0}'; exit 1; }}",
+        flip.display()
+    )));
+    assert!(err(&c).contains("failed (exit status: 1)"));
+    let ok = scripted(vec![chat(r#"{"tags": []}"#)]);
+    c.base_url = Some(ok.url("/v1"));
+    Provider::new("vault", &c)
+        .unwrap()
+        .choose_tags(&item(), &list())
+        .unwrap();
+    assert_eq!(
+        ok.requests()[0].header("authorization"),
+        Some("Bearer sk-second")
+    );
+    assert!(s.requests().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn api_key_command_times_out() {
+    let dir = key_dir("slow");
+    let mut cmd = shlv::ai::KeyCmd::new("slow", &sh(&format!("sleep 5 # {}", dir.display())));
+    cmd.timeout = Duration::from_millis(300);
+    let t = Instant::now();
+    let e = cmd.key().unwrap_err().to_string();
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    assert_eq!(e, format!("{} timed out after 300ms", cmd.describe()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn api_key_command_key_stays_out_of_debug_output() {
+    let k = shlv::ai::ApiKey::Value("sk-secret".into());
+    assert!(!format!("{k:?}").contains("sk-secret"));
 }
 
 #[test]

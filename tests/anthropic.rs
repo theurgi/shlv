@@ -63,6 +63,7 @@ fn config(server: &Server) -> ProviderConfig {
         base_url: Some(server.url("")),
         api_key_env: Some("SHLV_TEST_ANTHROPIC_KEY".into()),
         api_key_file: None,
+        api_key_cmd: None,
         timeout: Some(5),
         effort: Some("low".into()),
     }
@@ -268,6 +269,7 @@ fn live_anthropic() {
         base_url: None,
         api_key_env: Some("ANTHROPIC_API_KEY".into()),
         api_key_file: None,
+        api_key_cmd: None,
         timeout: Some(120),
         effort: Some("low".into()),
     };

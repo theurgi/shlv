@@ -17,9 +17,7 @@ model = "qwen2.5-3b-instruct"
 # timeout = 120                  # seconds per reply
 ```
 
-The Claude API is `kind = "anthropic"`. The key comes from an environment variable or from a file
-that shlv reads only when it sends a request (an agenix or sops-nix secret, say; shlv trims the
-trailing newline and warns if every user can read the file). Set one of the two:
+The Claude API is `kind = "anthropic"`:
 
 ```toml
 [provider.claude]
@@ -27,8 +25,31 @@ kind = "anthropic"
 model = "claude-opus-5-5"
 effort = "low" # low, medium, high, xhigh, max: less thinking, fewer tokens
 api_key_env = "ANTHROPIC_API_KEY"
-# api_key_file = "/run/agenix/anthropic" # instead of api_key_env
 ```
+
+**API keys** come from one of three places; set at most one per provider, and never the key itself:
+
+- `api_key_env = "ANTHROPIC_API_KEY"`: an environment variable.
+- `api_key_file = "/run/agenix/anthropic"`: a file (an agenix or sops-nix secret, say). shlv trims
+  the trailing newline and warns if every user can read the file.
+- `api_key_cmd = ["secret-tool", "lookup", "service", "shlv"]`: a command that prints the key, for a
+  secret manager. It is a program and its arguments, run without a shell. Other examples:
+  `["pass", "show", "anthropic"]`, `["op", "read", "op://Private/Anthropic/credential"]`,
+  `["security", "find-generic-password", "-s", "anthropic", "-w"]`.
+
+To store a key for the `secret-tool` example (GNOME Keyring, KeePassXC, or another Secret Service
+provider):
+
+```sh
+secret-tool store --label="shlv: Anthropic API key" service shlv
+```
+
+Keys are read only when a request is sent, never for other commands. The command runs once per
+`shlv` process, when the first request needs the key, and its output is trimmed. Its stdin is closed
+and its stderr goes to the terminal, so a prompt (a GPG pinentry, say) still works. In the TUI, the
+screen is suspended while the command runs. A command that fails, prints nothing, or takes longer
+than 120 seconds is an error that names the provider and the command, not the output. `config show`
+shows the command, never the key.
 
 Requests to Anthropic cache the instructions and the canonical tag list, so a bulk run pays full
 price for that prefix once. 429 and 529 responses are retried (honoring `retry-after`).
@@ -37,8 +58,7 @@ price for that prefix once. 429 and 529 responses are retried (honoring `retry-a
 title, note, and summary (when it has them), the page's extracted main text (up to 3000 words) when
 the task fetches the page, and for tagging the canonical tag list with aliases and descriptions, and
 the names already proposed for it. Nothing else from the database, and nothing at all unless `[ai]`
-names a provider. The API key is read from the named environment variable only when a request is
-made.
+names a provider.
 
 `shlv summarize ID...` (or `--all` for every bookmark without a summary; `--force` redoes them)
 fetches each page, extracts its main text, and stores the provider's two- or three-sentence summary,

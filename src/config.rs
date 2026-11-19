@@ -534,8 +534,39 @@ mod tests {
             .to_string();
         assert_eq!(
             e,
-            "/c.toml:1:1: [provider.c]: set `api_key_env` or `api_key_file`, not both"
+            "/c.toml:1:1: [provider.c]: set only one of `api_key_env`, `api_key_file`, and \
+             `api_key_cmd`"
         );
+    }
+
+    #[cfg(feature = "ai")]
+    #[test]
+    fn api_key_cmd_is_an_array_exclusive_with_the_others() {
+        let p = "[provider.c]\nkind = \"anthropic\"\nmodel = \"m\"\n";
+        let c = parse(&format!(
+            "{p}api_key_cmd = [\"secret-tool\", \"lookup\", \"service\", \"shlv\"]\n"
+        ))
+        .unwrap();
+        // `config show` shows the command, which is all it knows: the key is never read here.
+        assert!(
+            c.to_toml()
+                .contains("api_key_cmd = [\"secret-tool\", \"lookup\", \"service\", \"shlv\"]"),
+            "{}",
+            c.to_toml()
+        );
+        let e = |t: &str| parse(&format!("{p}{t}")).unwrap_err().to_string();
+        let both = "set only one of `api_key_env`, `api_key_file`, and `api_key_cmd`";
+        let err = e("api_key_cmd = [\"k\"]\napi_key_env = \"K\"\n");
+        assert!(err.ends_with(both), "{err}");
+        let err = e("api_key_cmd = [\"k\"]\napi_key_file = \"/k\"\n");
+        assert!(err.ends_with(both), "{err}");
+        // A string, which a shell would split, is refused.
+        let err = e("api_key_cmd = \"pass show claude\"\n");
+        assert!(err.contains("invalid type: string"), "{err}");
+        let err = e("api_key_cmd = []\n");
+        assert!(err.ends_with("`api_key_cmd` needs a program: [\"program\", \"arg\", ...]"));
+        let err = e("api_key_cmd = [\"\"]\n");
+        assert!(err.contains("needs a program"), "{err}");
     }
 
     #[test]
