@@ -31,10 +31,6 @@
         "aarch64-darwin"
       ];
       forAll = f: lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
-      allFeatures = lib.remove "default" (
-        builtins.attrNames ((lib.importTOML ./Cargo.toml).features or { })
-      );
-
       # Everything tracked, minus build output and local data. Used by the lint checks.
       lintSrc = lib.fileset.toSource {
         root = ./.;
@@ -59,11 +55,6 @@
 
       packages = forAll (pkgs: rec {
         shlv = pkgs.callPackage ./nix/package.nix { craneLib = crane.mkLib pkgs; };
-        # Every optional Cargo feature (fetch, and later ai and model).
-        shlv-full = shlv.override {
-          pname = "shlv-full";
-          features = allFeatures;
-        };
         default = shlv;
       });
 
@@ -78,7 +69,7 @@
       checks = forAll (
         pkgs:
         let
-          inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) shlv shlv-full;
+          inherit (self.packages.${pkgs.stdenv.hostPlatform.system}) shlv;
           # A check that runs `script` over the lint source and succeeds if it exits 0.
           lint =
             name: inputs: script:
@@ -88,21 +79,21 @@
               touch $out
             '';
         in
-        # Tests and clippy, for the default features and for all of them.
+        # Tests and clippy.
         import ./nix/checks.nix {
-          inherit lib allFeatures;
+          inherit lib;
           craneLib = crane.mkLib pkgs;
         }
         // {
-          # The release builds.
-          inherit shlv shlv-full;
+          # The release build.
+          inherit shlv;
           rustfmt = lint "rustfmt" [
             pkgs.cargo
             pkgs.rustfmt
           ] "cargo fmt --check";
           oxfmt = lint "oxfmt" [ pkgs.oxfmt ] "oxfmt --check .";
           hm-module = import ./nix/hm-module-test.nix {
-            inherit lib pkgs shlv-full;
+            inherit lib pkgs shlv;
             module = self.homeManagerModules.default;
           };
           nixfmt = lint "nixfmt" [ pkgs.nixfmt ] "nixfmt --check flake.nix nix/*.nix";

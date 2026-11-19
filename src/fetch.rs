@@ -1,5 +1,5 @@
-//! Fetching web pages (feature `fetch`): one bounded HTTP GET, charset handling, and the page
-//! title. The only network code in the core; AI providers have their own requests.
+//! Fetching web pages: one bounded HTTP GET, charset handling, and the page title. AI providers
+//! make their own requests.
 
 use std::fmt;
 use std::io::Read;

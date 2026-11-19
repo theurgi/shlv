@@ -1,26 +1,16 @@
 # The shlv package, built with crane (task 049). The dependencies are their own derivation
 # (`passthru.cargoArtifacts`), so a source change rebuilds only shlv, and the binary cache keeps
-# the dependency build until `Cargo.lock` or the feature set changes.
+# the dependency build until `Cargo.lock` changes.
 #
 # Tests and clippy don't run here: they're flake checks (`nix/checks.nix`), in the dev profile.
 # Running them in release would link every test binary again with fat LTO, which more than doubled
 # the build.
-{
-  lib,
-  craneLib,
-  # Cargo features to build with; `shlv-full` passes all of them.
-  features ? [ ],
-  pname ? "shlv",
-}:
+{ lib, craneLib }:
 let
-  common = import ./common.nix { inherit lib; };
-  args = common.args // {
-    inherit pname;
-    cargoExtraArgs = common.featureArgs features;
-  };
+  inherit (import ./common.nix { inherit lib; }) args depsArgs;
   cargoArtifacts = craneLib.buildDepsOnly (
     args
-    // (common.depsArgs craneLib)
+    // (depsArgs craneLib)
     // {
       # The package needs only the compiled dependencies, not `cargo check`'s metadata or the
       # dev-dependencies.

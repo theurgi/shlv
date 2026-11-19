@@ -66,12 +66,10 @@ in
           and the other separators in new tag names become; `max_length` refuses longer new
           names. Declared names and rule tags must already follow them. `guidelines` is plain
           text sent to the AI with every tagging request.
-        - `ai` and `provider` (builds with the `ai` feature, such as `shlv-full`): `ai.summarize`
-          and `ai.tag` name a `provider.<name>` with `kind` (`"openai-compatible"` or
-          `"anthropic"`), `model`, `base_url`, one of `api_key_env`, `api_key_file`, or `api_key_cmd`,
-          `timeout`, and for
-          `"anthropic"` an optional `effort`. AI is
-          off until `ai` names a provider. For each bookmark it processes, shlv sends the
+        - `ai` and `provider`: `ai.summarize` and `ai.tag` name a `provider.<name>` with `kind`
+          (`"openai-compatible"` or `"anthropic"`), `model`, `base_url`, one of `api_key_env`,
+          `api_key_file`, or `api_key_cmd`, `timeout`, and for `"anthropic"` an optional
+          `effort`. AI is off until `ai` names a provider. For each bookmark it processes, shlv sends the
           provider its URL, title, note, summary, and extracted page text, and for tagging the
           canonical tag list. Nothing is sent unless a provider is configured.
 

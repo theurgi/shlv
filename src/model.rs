@@ -1,5 +1,5 @@
-//! The in-binary tag classifier (feature `model`): chooses tags from the canonical list, with
-//! probabilities, offline, in microseconds. Task 025 picked the approach on a public dataset
+//! The in-binary tag classifier: chooses tags from the canonical list, with probabilities,
+//! offline, in microseconds. Task 025 picked the approach on a public dataset
 //! (HetRec 2011 Delicious): one-vs-rest logistic regression over hashed tokens beat naive Bayes
 //! and was well calibrated, and a lexical match against tag names, aliases, and descriptions is
 //! the best cold start.

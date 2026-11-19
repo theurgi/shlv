@@ -55,16 +55,3 @@ Don't put secrets in `settings`, since it ends up in the Nix store.
 ```sh
 cargo install --git https://github.com/theurgi/shlv
 ```
-
-## Optional features
-
-The default build is offline. Network features are Cargo features, off by default:
-
-| Feature | Adds                                                                                |
-| ------- | ----------------------------------------------------------------------------------- |
-| `fetch` | `add --fetch` and `shlv fetch`: page titles from the web                            |
-| `ai`    | AI summaries and tag suggestions through a provider you configure (implies `fetch`) |
-| `model` | An in-binary tag classifier that learns from your tags; offline, no dependencies    |
-
-The flake's `shlv-full` package has every feature (`nix run github:theurgi/shlv#shlv-full`). With
-Cargo, pass `--features fetch,ai,model` (or `--all-features`).

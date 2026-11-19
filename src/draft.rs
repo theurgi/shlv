@@ -1,7 +1,7 @@
 //! Drafting the tag list from a sample of bookmarks (task 035): choosing a sample that spreads
 //! across sites, and merging the drafts of several requests into one.
 //!
-//! The provider call itself is in [`crate::ai`] (feature `ai`); this part needs no network.
+//! The provider call itself is in [`crate::ai`]; this part needs no network.
 
 use std::collections::HashMap;
 

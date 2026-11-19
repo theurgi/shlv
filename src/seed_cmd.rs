@@ -1,5 +1,5 @@
-//! `shlv tag seed` (feature `ai`, task 034): expand interests into candidate tags with the
-//! `[ai] tag` provider and go through them one key each.
+//! `shlv tag seed` (task 034): expand interests into candidate tags with the `[ai] tag` provider
+//! and go through them one key each.
 
 use std::io::{self, Write};
 use std::process::ExitCode;

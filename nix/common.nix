@@ -22,6 +22,7 @@ in
     pname = "shlv";
     inherit version;
     strictDeps = true;
+    cargoExtraArgs = "--locked";
     src = source (sources ++ [ ../Cargo.lock ]);
 
     # nixpkgs' cargo setup hook exports LIBSQLITE3_SYS_USE_PKG_CONFIG=1, which overrides rusqlite's
@@ -65,9 +66,4 @@ in
       };
     };
 
-  # `cargo` arguments for a feature list.
-  featureArgs =
-    features:
-    "--locked"
-    + lib.optionalString (features != [ ]) " --features ${lib.concatStringsSep "," features}";
 }

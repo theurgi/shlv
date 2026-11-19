@@ -1,5 +1,4 @@
-//! AI providers against the local test server with recorded responses (feature `ai`).
-#![cfg(feature = "ai")]
+//! AI providers against the local test server with recorded responses.
 
 mod common;
 
@@ -289,7 +288,7 @@ fn empty_canonical_list_is_an_error() {
 }
 
 /// Against a real local server: `SHLV_TEST_OPENAI_URL=http://localhost:8080/v1
-/// SHLV_TEST_OPENAI_MODEL=... cargo test --all-features --test ai -- --ignored`.
+/// SHLV_TEST_OPENAI_MODEL=... cargo test --test ai -- --ignored`.
 #[test]
 #[ignore]
 fn live_openai_compatible() {

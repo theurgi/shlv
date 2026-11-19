@@ -404,10 +404,6 @@ impl App {
     /// Offers a canonical tag on every bookmark (as `suggest --tag TAG --all`), then goes
     /// through the candidates.
     fn backfill(&mut self, name: &str) {
-        if !cfg!(any(feature = "model", feature = "ai")) {
-            self.warn("back-fill needs the classifier (feature `model`) or an [ai] tag provider");
-            return;
-        }
         match self.store.backfill_tag(name) {
             Ok(tag) => {
                 self.send_job(Job::Backfill {

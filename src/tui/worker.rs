@@ -22,41 +22,32 @@ pub type OpenStore = Box<dyn FnOnce() -> Result<(Store, Config)> + Send>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Job {
-    /// Fetch the page and set the bookmark's title from it (feature `fetch`).
-    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
+    /// Fetch the page and set the bookmark's title from it.
     FetchTitle { id: i64, url: String },
-    /// Summarize the page with the `[ai] summarize` provider (feature `ai`).
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    /// Summarize the page with the `[ai] summarize` provider.
     Summarize { id: i64, url: String },
     /// Pick the next review batch and run the suggestion layers on it: rules, the classifier,
     /// the `[ai] tag` provider. Done with the batch's ids, and how they were ordered.
     ReviewBatch { filter: ReviewFilter, size: usize },
     /// Offer one tag (`suggest --tag`): the classifier, the provider; on the given bookmarks, or
     /// all of them.
-    #[cfg_attr(not(any(feature = "model", feature = "ai")), allow(dead_code))]
     Backfill {
         tag: String,
         scope: Option<Vec<i64>>,
     },
     /// Measure the tag list (`tag health`).
     Health,
-    /// Fetch titles for every bookmark without one (feature `fetch`).
-    #[cfg_attr(not(feature = "fetch"), allow(dead_code))]
+    /// Fetch titles for every bookmark without one.
     FetchAll,
-    /// Summarize every bookmark without a summary (feature `ai`).
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    /// Summarize every bookmark without a summary.
     SummarizeAll,
-    /// Measure the classifier (`model eval`, feature `model`).
-    #[cfg_attr(not(feature = "model"), allow(dead_code))]
+    /// Measure the classifier (`model eval`).
     Eval,
-    /// Expand interests into candidate tags (`tag seed`, feature `ai`).
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    /// Expand interests into candidate tags (`tag seed`).
     Seed { interests: Vec<String>, per: usize },
-    /// Draft tags from a sample of bookmarks (`tag draft`, feature `ai`).
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
+    /// Draft tags from a sample of bookmarks (`tag draft`).
     Draft { sample: usize, max: usize },
-    /// Retrain the classifier (feature `model`).
-    #[cfg_attr(not(feature = "model"), allow(dead_code))]
+    /// Retrain the classifier.
     Train,
 }
 
@@ -220,7 +211,6 @@ fn work(
 /// What the worker keeps between jobs.
 #[derive(Default)]
 struct Context {
-    #[cfg(feature = "fetch")]
     fetcher: Option<shlv::fetch::Fetcher>,
 }
 
@@ -251,7 +241,6 @@ impl Write for Lines<'_> {
     }
 }
 
-#[allow(unused_variables)]
 fn run(
     ctx: &mut Context,
     store: &mut Store,
@@ -265,7 +254,6 @@ fn run(
         line: Vec::new(),
     };
     match job {
-        #[cfg(feature = "fetch")]
         Job::FetchTitle { id, url } => {
             let fetcher = ctx.fetcher.get_or_insert_with(Default::default);
             progress(format!("fetching {url}"));
@@ -284,7 +272,6 @@ fn run(
             }
             Ok((format!("title: {title}"), Output::Nothing))
         }
-        #[cfg(feature = "ai")]
         Job::Summarize { id, url } => {
             let provider = crate::ai_cmd::provider(config, shlv::ai::Task::Summarize)?;
             let fetcher = ctx.fetcher.get_or_insert_with(Default::default);
@@ -313,7 +300,7 @@ fn run(
                 return Ok((String::new(), Output::Ids(Vec::new())));
             }
             progress(format!("ordering {} bookmarks", queue.len()));
-            let (ids, order) = crate::review_cmd::choose(store, config, &queue, filter, *size)?;
+            let (ids, order) = crate::review_cmd::choose(store, &queue, filter, *size)?;
             progress("suggesting tags".into());
             crate::review_cmd::offer(store, config, &ids, &mut out)?;
             Ok((
@@ -321,7 +308,6 @@ fn run(
                 Output::Ids(ids),
             ))
         }
-        #[cfg(any(feature = "model", feature = "ai"))]
         Job::Backfill { tag, scope } => {
             crate::backfill_cmd::offer(
                 store,
@@ -329,7 +315,6 @@ fn run(
                 tag,
                 scope.as_deref(),
                 true,
-                #[cfg(feature = "ai")]
                 &crate::ai_cmd::LlmArgs {
                     max_tags: 1,
                     force: false,
@@ -341,7 +326,6 @@ fn run(
             )?;
             Ok((format!("offered #{tag}"), Output::Nothing))
         }
-        #[cfg(feature = "model")]
         Job::Train => {
             let t = store.train_model()?;
             Ok((
@@ -358,7 +342,6 @@ fn run(
             let h = health(store, config)?;
             Ok((String::new(), Output::Health(Box::new(h))))
         }
-        #[cfg(feature = "fetch")]
         Job::FetchAll => {
             let mut targets: Vec<(i64, String)> = Vec::new();
             store.list_each(
@@ -415,7 +398,6 @@ fn run(
                 Ok(()) => Ok((text, Output::Nothing)),
             }
         }
-        #[cfg(feature = "ai")]
         Job::SummarizeAll => {
             let provider = crate::ai_cmd::provider(config, shlv::ai::Task::Summarize)?;
             let mut targets: Vec<shlv::Bookmark> = Vec::new();
@@ -457,15 +439,11 @@ fn run(
                 Output::Nothing,
             ))
         }
-        #[cfg(feature = "model")]
         Job::Eval => {
             let mut buf = Vec::new();
             let cmd = crate::model_cmd::ModelCmd::Eval {
-                #[cfg(feature = "ai")]
                 provider: false,
-                #[cfg(feature = "ai")]
                 limit: 0,
-                #[cfg(feature = "ai")]
                 yes: false,
             };
             crate::model_cmd::run(store, config, cmd, &mut buf)?;
@@ -475,29 +453,23 @@ fn run(
                 .collect();
             Ok((String::new(), Output::Text(lines)))
         }
-        #[cfg(feature = "ai")]
         Job::Seed { interests, per } => {
             let provider = crate::ai_cmd::provider(config, shlv::ai::Task::Tag)?;
             let (cands, notes) = crate::seed_cmd::expand(&provider, store, interests, *per)?;
             Ok((notes.join("; "), Output::Candidates(cands)))
         }
-        #[cfg(feature = "ai")]
         Job::Draft { sample, max } => {
             let plan = crate::draft_cmd::Plan::new(store, config, *sample, 50, *max, false, 4)?;
             let cands = plan.run(store, &mut out)?;
             Ok((String::new(), Output::Candidates(cands)))
         }
-        #[allow(unreachable_patterns)]
-        _ => anyhow::bail!("this build can't do that"),
     }
 }
 
 /// `tag health` with its default thresholds; with the classifier built and a canonical list,
 /// bookmarks it can place aren't gaps.
-#[allow(unused_variables)]
 fn health(store: &mut Store, config: &Config) -> Result<Health> {
     let opts = HealthOptions::default();
-    #[cfg(feature = "model")]
     if !shlv::model::canonical_list(store)?.is_empty() {
         let c = store.classifier(false)?;
         let t = config.model.threshold;
@@ -510,7 +482,6 @@ fn health(store: &mut Store, config: &Config) -> Result<Health> {
 
 /// A bulk job stopped by [`Worker::cancel`].
 #[derive(Debug)]
-#[cfg_attr(not(feature = "fetch"), allow(dead_code))]
 struct Cancelled;
 
 impl std::fmt::Display for Cancelled {

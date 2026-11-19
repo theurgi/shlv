@@ -1,5 +1,4 @@
-//! The LLM layer of `shlv suggest` against recorded provider replies (feature `ai`).
-#![cfg(feature = "ai")]
+//! The LLM layer of `shlv suggest` against recorded provider replies.
 
 mod common;
 
@@ -248,20 +247,12 @@ fn needs_a_list_or_proposals_and_reports_failures() {
         "{err}"
     );
 
-    // Without [ai] tag and rules, there's nothing to suggest with, unless the classifier is
-    // built: the database still has canonical tags for it to choose from.
+    // Without [ai] tag and rules, the classifier still runs: the database has canonical tags for
+    // it to choose from.
     f.config("");
     let (code, out, err) = f.run(&["suggest", "1"]);
-    if cfg!(feature = "model") {
-        assert_eq!(code, 0, "{err}");
-        assert!(out.starts_with("model checked 1 bookmark"), "{out}");
-        return;
-    }
-    assert_eq!(code, 1);
-    assert!(
-        err.contains("no domain rules") && err.contains("no [ai] tag provider"),
-        "{err}"
-    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.starts_with("model checked 1 bookmark"), "{out}");
 }
 
 /// The JSON body of chat request `i`.
@@ -471,7 +462,6 @@ fn health_names_the_largest_gap_groups() {
 }
 
 #[test]
-#[cfg(feature = "model")]
 fn backfill_asks_about_reviewed_bookmarks_the_classifier_passed_over() {
     let f = Fixture::new(&format!(
         "[ai]\ntag = \"local\"\nproposals = 3\n{CANONICAL}"

@@ -1,5 +1,4 @@
-//! The `anthropic` provider against the local test server with recorded responses (feature `ai`).
-#![cfg(feature = "ai")]
+//! The `anthropic` provider against the local test server with recorded responses.
 
 mod common;
 
@@ -255,7 +254,7 @@ fn needs_a_key_and_checks_effort() {
 }
 
 /// Live, when `ANTHROPIC_API_KEY` is set:
-/// `cargo test --all-features --test anthropic -- --ignored`. Costs a few cents at most.
+/// `cargo test --test anthropic -- --ignored`. Costs a few cents at most.
 #[test]
 #[ignore]
 fn live_anthropic() {

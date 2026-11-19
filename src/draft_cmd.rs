@@ -1,6 +1,6 @@
-//! `shlv tag draft` (feature `ai`, task 035): the `[ai] tag` provider drafts the tag list from a
-//! sample of bookmarks spread across sites, guided by the list and stored interests; the user
-//! goes through the draft in `tag seed`'s screen.
+//! `shlv tag draft` (task 035): the `[ai] tag` provider drafts the tag list from a sample of
+//! bookmarks spread across sites, guided by the list and stored interests; the user goes through
+//! the draft in `tag seed`'s screen.
 
 use std::io::Write;
 use std::process::ExitCode;

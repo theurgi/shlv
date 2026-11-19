@@ -327,7 +327,6 @@ fn cli_session() {
     }
     let pos = |s: &str| err.find(s).unwrap();
     assert!(pos("[1/3] 5") < pos("[2/3] 2") && pos("[2/3] 2") < pos("[3/3] 3"));
-    #[cfg(feature = "model")]
     {
         // Back-fill for the new tag on reviewed bookmarks, then a retrain.
         assert!(
@@ -411,7 +410,6 @@ fn cli_alias_and_reject_proposals() {
 }
 
 /// A tag added after a batch is offered on the bookmarks reviewed before it existed.
-#[cfg(feature = "model")]
 #[test]
 fn cli_backfills_new_tags() {
     let dir = tmp("backfill");
@@ -447,7 +445,6 @@ fn cli_backfills_new_tags() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "model")]
 #[test]
 fn least_sure_first() {
     let mut s = store();

@@ -1,5 +1,4 @@
-//! Fetching against a local test server (feature `fetch`). Nothing here touches the internet.
-#![cfg(feature = "fetch")]
+//! Fetching against a local test server. Nothing here touches the internet.
 
 mod common;
 

@@ -106,7 +106,6 @@ enum Phase {
     Proposals(Batch, Proposals),
     Backfill(Batch, Backfill),
     /// The worker is retraining the classifier.
-    #[cfg_attr(not(feature = "model"), allow(dead_code))]
     Training(Batch),
 }
 
@@ -845,23 +844,7 @@ impl App {
         if tags.is_empty() {
             return self.train(b);
         }
-        if !self.can_backfill() {
-            b.notes.push(format!(
-                "back-fill needs the classifier (feature `model`) or an [ai] tag provider; \
-                 check reviewed bookmarks for {} by hand",
-                hashed(&tags)
-            ));
-            return self.train(b);
-        }
         self.next_backfill(b, tags);
-    }
-
-    fn can_backfill(&self) -> bool {
-        #[cfg(feature = "ai")]
-        if matches!(crate::ai_cmd::backfill_provider(&self.config), Ok(Some(_))) {
-            return true;
-        }
-        cfg!(feature = "model")
     }
 
     fn next_backfill(&mut self, b: Batch, mut tags: Vec<String>) {
@@ -908,7 +891,6 @@ impl App {
 
     /// Retrains the classifier on the batch's decisions, then finishes the batch.
     fn train(&mut self, b: Batch) {
-        #[cfg(feature = "model")]
         if b.stats.reviewed > 0
             && matches!(shlv::model::canonical_list(&self.store), Ok(l) if !l.is_empty())
         {

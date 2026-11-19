@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use shlv::{BackfillCandidate, Config, Store};
 
 use crate::screen::{Key, Screen};
@@ -27,22 +27,13 @@ pub fn run(
     store: &mut Store,
     config: &Config,
     b: Backfill,
-    #[cfg(feature = "ai")] llm: &crate::ai_cmd::LlmArgs,
+    llm: &crate::ai_cmd::LlmArgs,
     out: &mut impl Write,
     style: &Style,
 ) -> Result<ExitCode> {
     let tag = store.backfill_tag(b.tag)?;
     let scope = (!b.all).then_some(b.ids);
-    let code = offer(
-        store,
-        config,
-        &tag,
-        scope,
-        b.all,
-        #[cfg(feature = "ai")]
-        llm,
-        out,
-    )?;
+    let code = offer(store, config, &tag, scope, b.all, llm, out)?;
     let candidates = store.backfill_candidates(&tag, scope)?;
     if b.pick {
         out.flush()?;
@@ -56,33 +47,21 @@ pub fn run(
 /// Offers `tag` with every layer there is: the classifier on `scope` (the given bookmarks, or
 /// all), then the provider on `scope`, or with `unoffered`, on reviewed bookmarks the classifier
 /// passed over.
-#[allow(unused_variables, unused_mut)]
 pub(crate) fn offer(
     store: &mut Store,
     config: &Config,
     tag: &str,
     scope: Option<&[i64]>,
     unoffered: bool,
-    #[cfg(feature = "ai")] llm: &crate::ai_cmd::LlmArgs,
+    llm: &crate::ai_cmd::LlmArgs,
     out: &mut impl Write,
 ) -> Result<ExitCode> {
-    let model_on = cfg!(feature = "model");
     // `provider = "never"` keeps the provider out wherever the classifier runs.
-    #[cfg(feature = "ai")]
-    let provider = if model_on && config.model.provider == shlv::config::ProviderUse::Never {
+    let provider = if config.model.provider == shlv::config::ProviderUse::Never {
         None
     } else {
         crate::ai_cmd::backfill_provider(config)?
     };
-    #[cfg(not(feature = "ai"))]
-    let provider: Option<()> = None;
-    if !model_on && provider.is_none() {
-        bail!(
-            "back-filling a tag needs the classifier (feature `model`) or an [ai] tag provider \
-             (feature `ai`)"
-        );
-    }
-    #[cfg(feature = "model")]
     {
         let classifier = store.classifier(true)?;
         let s = store.backfill_model(tag, scope, &classifier, &config.model)?;
@@ -100,7 +79,6 @@ pub(crate) fn offer(
             plural(s.checked, "bookmark")
         )?;
     }
-    #[cfg(feature = "ai")]
     if let Some(p) = provider {
         // With --all, only reviewed bookmarks the classifier passed over: they're the examples
         // that teach it, and the rest get the tag offered as they're reviewed.

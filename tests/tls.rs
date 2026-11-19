@@ -1,6 +1,5 @@
-//! HTTPS trust (feature `fetch`): shlv trusts the system's CA bundle, here a test CA given as
-//! `SSL_CERT_FILE`, and explains an unknown issuer. A local rustls server; no internet.
-#![cfg(feature = "fetch")]
+//! HTTPS trust: shlv trusts the system's CA bundle, here a test CA given as `SSL_CERT_FILE`, and
+//! explains an unknown issuer. A local rustls server; no internet.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

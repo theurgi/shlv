@@ -12,25 +12,16 @@ use super::app::App;
 use super::worker::Job;
 
 pub fn keys() -> Vec<(&'static str, &'static str)> {
-    let mut k = vec![("j k", "select a job")];
-    if cfg!(feature = "model") {
-        k.extend([
-            ("t", "train the classifier"),
-            ("e", "measure it (model eval)"),
-        ]);
-    }
-    if cfg!(feature = "fetch") {
-        k.push(("F", "fetch titles for bookmarks without one"));
-    }
-    if cfg!(feature = "ai") {
-        k.push(("S", "summarize bookmarks without a summary (asks first)"));
-    }
-    k.extend([
+    vec![
+        ("j k", "select a job"),
+        ("t", "train the classifier"),
+        ("e", "measure it (model eval)"),
+        ("F", "fetch titles for bookmarks without one"),
+        ("S", "summarize bookmarks without a summary (asks first)"),
         ("x", "cancel the selected job"),
         ("X", "cancel every job"),
         ("Ctrl-l", "reload"),
-    ]);
-    k
+    ]
 }
 
 #[derive(Default)]
@@ -47,7 +38,6 @@ impl App {
         self.status.classifier = Some(self.classifier_lines());
     }
 
-    #[cfg(feature = "model")]
     fn classifier_lines(&mut self) -> Vec<String> {
         let mut buf = Vec::new();
         let r = crate::model_cmd::run(
@@ -63,11 +53,6 @@ impl App {
                 .collect(),
             Err(e) => vec![format!("{e:#}")],
         }
-    }
-
-    #[cfg(not(feature = "model"))]
-    fn classifier_lines(&mut self) -> Vec<String> {
-        vec!["not built: the classifier needs the `model` feature".into()]
     }
 
     pub(super) fn status_key(&mut self, k: KeyEvent) -> bool {

@@ -1,6 +1,6 @@
 //! Prints the main text shlv extracts from a page, for tuning `shlv::extract`.
 //!
-//! cargo run --example extract --features fetch -- FILE|URL
+//! cargo run --example extract -- FILE|URL
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arg = std::env::args().nth(1).ok_or("usage: extract FILE|URL")?;

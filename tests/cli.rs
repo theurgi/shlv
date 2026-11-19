@@ -326,11 +326,6 @@ fn open_uses_browser() {
 #[test]
 fn errors_and_usage() {
     let db = Db::new();
-    #[cfg(not(feature = "fetch"))]
-    assert!(
-        db.fail(&["add", "https://a.com", "--fetch"])
-            .contains("no fetch support")
-    );
     assert!(
         db.fail(&["add", "https://a.com", "-t", " "])
             .contains("empty tag")
@@ -580,24 +575,6 @@ fn config_path_and_show() {
         .env("XDG_CONFIG_HOME", "relative")
         .env("HOME", "/home/u");
     assert_eq!(output(c).1, "/home/u/.config/shlv/config.toml\n");
-
-    // Sections for features this build lacks are accepted and reported.
-    if cfg!(feature = "ai") {
-        return;
-    }
-    std::fs::create_dir_all(&db.0).unwrap();
-    std::fs::write(
-        db.config(),
-        "strict_tags = true\n[ai]\nmodel = \"m\"\n[provider.x]\nurl = \"u\"\n",
-    )
-    .unwrap();
-    assert_eq!(
-        db.ok(&["config", "show"]),
-        format!(
-            "# {path}\n# [ai] ignored: not in this build\n\
-             # [provider] ignored: not in this build\nstrict_tags = true\n"
-        )
-    );
 }
 
 #[test]

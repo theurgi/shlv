@@ -1,4 +1,4 @@
-//! View 5, Bootstrap (task 046): interests, and with the `ai` feature, `tag seed` (expand
+//! View 5, Bootstrap (task 046): interests, `tag seed` (expand
 //! interests into candidate tags) and `tag draft` (draft tags from a sample of bookmarks), with
 //! the same keep / rename / merge / drop decisions. Sending asks first and says what is sent.
 
@@ -233,9 +233,7 @@ impl App {
     }
 
     /// Shows what `tag seed` sends, and sends it on `y`.
-    #[allow(unused_variables)]
     pub(super) fn ask_seed(&mut self, interests: Vec<String>) {
-        #[cfg(feature = "ai")]
         {
             let p = match crate::ai_cmd::provider(&self.config, shlv::ai::Task::Tag) {
                 Ok(p) => p,
@@ -253,14 +251,10 @@ impl App {
                 },
             );
         }
-        #[cfg(not(feature = "ai"))]
-        self.warn("tag seed needs the `ai` feature");
     }
 
     /// Shows what `tag draft` sends, and sends it on `y`.
-    #[allow(unused_variables)]
     pub(super) fn ask_draft(&mut self, sample: usize, max: usize) -> anyhow::Result<()> {
-        #[cfg(feature = "ai")]
         {
             let plan =
                 crate::draft_cmd::Plan::new(&self.store, &self.config, sample, 50, max, false, 4)?;
@@ -276,8 +270,6 @@ impl App {
             );
             Ok(())
         }
-        #[cfg(not(feature = "ai"))]
-        anyhow::bail!("tag draft needs the `ai` feature")
     }
 
     /// A confirmed seed or draft was sent.
@@ -574,10 +566,9 @@ impl App {
                 "y keep · d drop · r rename · m merge · e describe · w write · Esc discard"
             }
             Mode::Waiting(_) => return None,
-            _ if cfg!(feature = "ai") => {
+            _ => {
                 "a add interests · dd forget · s seed tags from them · D draft tags from bookmarks"
             }
-            _ => "a add interests · dd forget (seed and draft need the ai feature)",
         })
     }
 
@@ -794,7 +785,6 @@ fn join_notes(msg: String, notes: &str) -> String {
     }
 }
 
-#[cfg_attr(not(feature = "ai"), allow(dead_code))]
 fn lines(buf: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(buf)
         .lines()

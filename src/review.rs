@@ -485,7 +485,6 @@ pub fn confidence(probabilities: impl IntoIterator<Item = f64>) -> f64 {
         .fold(1.0, f64::min)
 }
 
-#[cfg(feature = "model")]
 impl Store {
     /// The classifier's [`confidence`] for each of `ids` (live bookmarks; others are left out).
     pub fn review_confidence(

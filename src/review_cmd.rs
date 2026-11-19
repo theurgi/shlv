@@ -52,7 +52,6 @@ impl From<SourceArg> for Source {
 
 /// Bookmarks scored when picking the classifier's least sure ones: a random sample keeps a batch
 /// quick to start at 100k bookmarks.
-#[cfg(feature = "model")]
 const SAMPLE: usize = 2000;
 
 pub fn run(
@@ -98,7 +97,7 @@ pub fn run(
             writeln!(screen, "{what}")?;
             break;
         }
-        let (ids, order) = choose(store, config, &queue, &filter, size)?;
+        let (ids, order) = choose(store, &queue, &filter, size)?;
         let (batch, started) = store.start_review_batch()?;
         batches += 1;
         writeln!(
@@ -174,10 +173,8 @@ pub fn run(
 }
 
 /// The next batch and how it was ordered.
-#[allow(unused_variables)]
 pub(crate) fn choose(
     store: &mut Store,
-    config: &Config,
     queue: &[review::Queued],
     filter: &ReviewFilter,
     size: usize,
@@ -188,7 +185,6 @@ pub(crate) fn choose(
         let ids = q.into_iter().take(size).map(|q| q.id).collect();
         return Ok((ids, "least confident suggestions first"));
     }
-    #[cfg(feature = "model")]
     if !shlv::model::canonical_list(store)?.is_empty()
         && store.reviewed_count()? >= review::DISCOVERY
     {
@@ -213,7 +209,6 @@ pub(crate) fn choose(
 
 /// Suggests tags for the batch: domain rules, the classifier, then the `[ai] tag` provider for
 /// bookmarks the classifier wasn't sure about (`[model] provider`) and the provider hasn't seen.
-#[allow(unused_variables, unused_mut)]
 pub(crate) fn offer(
     store: &mut Store,
     config: &Config,
@@ -223,9 +218,7 @@ pub(crate) fn offer(
     if !store.rules().is_empty() {
         store.apply_rules(Some(ids))?;
     }
-    #[cfg(feature = "model")]
     let model_on = !shlv::model::canonical_list(store)?.is_empty();
-    #[cfg(feature = "model")]
     let sure = if model_on {
         let classifier = store.classifier(true)?;
         let s = store.apply_model(Some(ids), &classifier, &config.model)?;
@@ -233,9 +226,6 @@ pub(crate) fn offer(
     } else {
         None
     };
-    #[cfg(not(feature = "model"))]
-    let (model_on, sure): (bool, Option<HashSet<i64>>) = (false, None);
-    #[cfg(feature = "ai")]
     {
         let provider = match config.model.provider {
             shlv::config::ProviderUse::Never if model_on => None,
@@ -820,7 +810,6 @@ fn proposals(screen: &mut Screen, store: &mut Store, done: &[i64]) -> Result<Opt
 
 /// Back-fills tags just added to the list on the bookmarks already reviewed: they lack the tag
 /// only because it didn't exist yet, and would teach the classifier it doesn't apply.
-#[allow(unused_variables)]
 fn backfill(
     screen: &mut Screen,
     store: &mut Store,
@@ -828,23 +817,6 @@ fn backfill(
     added: &[String],
 ) -> Result<()> {
     if added.is_empty() {
-        return Ok(());
-    }
-    #[cfg(feature = "ai")]
-    let have_ai = crate::ai_cmd::backfill_provider(config)?.is_some();
-    #[cfg(not(feature = "ai"))]
-    let have_ai = false;
-    if !cfg!(feature = "model") && !have_ai {
-        writeln!(
-            screen,
-            "\nback-fill needs the classifier (feature `model`) or an [ai] tag provider; check \
-             reviewed bookmarks for {} with `shlv search` and `shlv edit`",
-            added
-                .iter()
-                .map(|t| format!("#{t}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )?;
         return Ok(());
     }
     let scope = store.reviewed_ids()?;
@@ -856,7 +828,6 @@ fn backfill(
             tag,
             Some(&scope),
             true,
-            #[cfg(feature = "ai")]
             &crate::ai_cmd::LlmArgs {
                 max_tags: 1,
                 force: false,
@@ -878,9 +849,7 @@ fn backfill(
 }
 
 /// Retrains the classifier on the batch's decisions, so the next batch gets better suggestions.
-#[allow(unused_variables)]
 fn retrain(screen: &mut Screen, store: &mut Store) -> Result<()> {
-    #[cfg(feature = "model")]
     if !shlv::model::canonical_list(store)?.is_empty() {
         let t = store.train_model()?;
         writeln!(

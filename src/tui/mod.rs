@@ -27,8 +27,6 @@ mod status;
 mod tags;
 #[cfg(test)]
 mod tests;
-// Its jobs need the `fetch` or `ai` feature; the default build has the plumbing only.
-#[cfg_attr(not(feature = "fetch"), allow(dead_code))]
 mod worker;
 
 pub use app::App;
@@ -60,17 +58,13 @@ pub fn run(opened: crate::Opened) -> Result<()> {
 }
 
 /// A worker's request to run `api_key_cmd`, and where to send the key.
-#[cfg(feature = "ai")]
 type KeyRequest = (shlv::ai::KeyCmd, mpsc::Sender<Result<String>>);
-#[cfg(not(feature = "ai"))]
-type KeyRequest = std::convert::Infallible;
 
 /// Routes `api_key_cmd` runs to the event loop, which runs them with the terminal suspended: a
 /// pinentry or other prompt then gets the real terminal instead of drawing over the TUI. Workers
 /// make every provider request, so they are the ones that ask; they wait for the answer.
 fn key_requests() -> mpsc::Receiver<KeyRequest> {
     let (tx, rx) = mpsc::channel::<KeyRequest>();
-    #[cfg(feature = "ai")]
     {
         let ui = std::thread::current().id();
         shlv::ai::key::set_runner(Box::new(move |cmd| {
@@ -85,8 +79,6 @@ fn key_requests() -> mpsc::Receiver<KeyRequest> {
                 .map_err(|_| anyhow::anyhow!("the TUI has quit"))?
         }));
     }
-    #[cfg(not(feature = "ai"))]
-    drop(tx);
     rx
 }
 
@@ -110,7 +102,6 @@ fn event_loop(
             app.settle();
         }
         // A worker waits for its key, so jobs are running and the loop wakes every TICK.
-        #[cfg(feature = "ai")]
         while let Ok((cmd, reply)) = keys.try_recv() {
             let r = suspended(terminal, || {
                 eprintln!(
@@ -122,8 +113,6 @@ fn event_loop(
             });
             let _ = reply.send(r);
         }
-        #[cfg(not(feature = "ai"))]
-        let _ = keys;
         app.drain_reports(Duration::ZERO);
         if let Some(url) = app.take_open() {
             let r = suspended(terminal, || crate::open(&url));

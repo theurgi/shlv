@@ -1,6 +1,5 @@
-//! Tagging layers in order: rules, the classifier (feature `model`), then the provider when the
-//! classifier is unsure (feature `ai`).
-#![cfg(feature = "model")]
+//! Tagging layers in order: rules, the classifier, then the provider when the classifier is
+//! unsure.
 
 mod common;
 
@@ -240,7 +239,6 @@ fn rules_then_model_share_rows_and_add_runs_the_model() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(feature = "ai")]
 #[test]
 fn provider_fallback() {
     use common::server::{Response, Server};

@@ -1,6 +1,5 @@
-//! The tag classifier on a small hand-made fixture (feature `model`). Quality is judged in task
-//! 025 on a public dataset; this checks the plumbing and that obvious cases come out right.
-#![cfg(feature = "model")]
+//! The tag classifier on a small hand-made fixture. Quality is judged in task 025 on a public
+//! dataset; this checks the plumbing and that obvious cases come out right.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

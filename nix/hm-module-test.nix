@@ -4,10 +4,11 @@
   lib,
   pkgs,
   module,
-  # Built with every feature, so `ai` and `provider` settings are parsed, not ignored.
-  shlv-full,
+  shlv,
 }:
 let
+  # Only compared at evaluation time, never built.
+  chosen = pkgs.writeShellScriptBin "shlv" "";
   stubs = {
     options.home.packages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
@@ -59,7 +60,7 @@ let
   # A provider whose key comes from a secret file (agenix-style); only the path is rendered.
   secrets = eval {
     enable = true;
-    package = shlv-full;
+    package = chosen;
     settings = {
       ai.tag = "claude";
       provider.claude = {
@@ -75,7 +76,6 @@ let
   };
 
   configOf = c: c.xdg.configFile."shlv/config.toml".source;
-  shlv = lib.head full.home.packages;
 
   # Evaluation-time assertions; a failure names the case.
   assertions = {
@@ -83,7 +83,7 @@ let
     "no config file without settings" = noSettings.xdg.configFile == { };
     "installs the package without settings" = noSettings.home.packages == [ shlv ];
     "does nothing when disabled" = disabled.home.packages == [ ] && disabled.xdg.configFile == { };
-    "installs the chosen package" = secrets.home.packages == [ shlv-full ];
+    "installs the chosen package" = secrets.home.packages == [ chosen ];
   };
   failed = lib.attrNames (lib.filterAttrs (_: ok: !ok) assertions);
 in
@@ -148,15 +148,9 @@ pkgs.runCommand "shlv-hm-module" { nativeBuildInputs = [ shlv ]; } ''
   fi
   check "refusal names the config" "hint: change it in $HOME/.config/shlv/config.toml" "$(echo "$err" | tail -n 1)"
 
-  # With every feature built, the provider section is parsed; `config show` prints the key
-  # file's path.
+  # The provider section is parsed; `config show` prints the key file's path.
   ln -sf ${configOf secrets} $HOME/.config/shlv/config.toml
-  check "key file path" 'api_key_file = "/run/agenix/anthropic"' \
-    "$(${lib.getExe shlv-full} config show | grep api_key_file)"
-  if ${lib.getExe shlv-full} config show | grep -q ignored; then
-    echo "hm-module: shlv-full ignored the provider section" >&2
-    exit 1
-  fi
+  check "key file path" 'api_key_file = "/run/agenix/anthropic"' "$(shlv config show | grep api_key_file)"
 
   # Switching to the empty list unpins everything but removes nothing; unpinned tags can be
   # unmarked.

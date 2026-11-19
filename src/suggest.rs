@@ -25,9 +25,9 @@ use crate::url;
 pub enum Source {
     /// A domain rule from config.
     Rule,
-    /// The local classifier (feature `model`).
+    /// The local classifier.
     Model,
-    /// The configured LLM provider (feature `ai`).
+    /// The configured LLM provider.
     Llm,
 }
 

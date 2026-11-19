@@ -15,19 +15,15 @@ use shlv::{
 };
 use shlv::{netscape, transfer};
 
-#[cfg(feature = "ai")]
 mod ai_cmd;
 mod backfill_cmd;
-#[cfg(feature = "ai")]
 mod draft_cmd;
 mod edit_cmd;
-#[cfg(feature = "model")]
 mod model_cmd;
 // The interactive screen: `edit --pick`, `suggest --tag --pick`, `tag seed`, `tag draft`, and
 // `review`.
 mod review_cmd;
 mod screen;
-#[cfg(feature = "ai")]
 mod seed_cmd;
 mod tui;
 
@@ -135,7 +131,6 @@ enum Cmd {
         /// With --tag, go through the candidates one key each: y accepts, n rejects
         #[arg(long, requires = "tag")]
         pick: bool,
-        #[cfg(feature = "ai")]
         #[command(flatten)]
         llm: ai_cmd::LlmArgs,
     },
@@ -173,7 +168,6 @@ enum Cmd {
         format: FormatArg,
     },
     /// Fetch page titles: for the IDs given, or with --all for every bookmark without one
-    #[cfg(feature = "fetch")]
     Fetch {
         #[arg(
             value_name = "ID",
@@ -192,7 +186,6 @@ enum Cmd {
         jobs: u16,
     },
     /// Summarize bookmarks with the [ai] summarize provider: fetch each page, send its text
-    #[cfg(feature = "ai")]
     Summarize {
         #[arg(
             value_name = "ID",
@@ -217,13 +210,11 @@ enum Cmd {
         batch: bool,
     },
     /// Train, inspect, or evaluate the tag classifier
-    #[cfg(feature = "model")]
     Model {
         #[command(subcommand)]
         cmd: model_cmd::ModelCmd,
     },
     /// Collect Message Batches submitted with --batch (kind "anthropic")
-    #[cfg(feature = "ai")]
     Batch {
         #[command(subcommand)]
         cmd: ai_cmd::BatchCmd,
@@ -321,7 +312,6 @@ enum TagCmd {
         groups: usize,
         /// Ask the [ai] tag provider to name the N largest gap groups (default 5); sends up to 15
         /// titles and URLs per group
-        #[cfg(feature = "ai")]
         #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "5")]
         name_gaps: Option<usize>,
         /// Print the report as one JSON object
@@ -330,12 +320,10 @@ enum TagCmd {
     },
     /// Expand interests into candidate tags with the [ai] tag provider and go through them one
     /// key each (keep, rename, merge, drop). Sends only the interests and the tag style
-    #[cfg(feature = "ai")]
     Seed(seed_cmd::SeedArgs),
     /// Draft the list from a sample of bookmarks with the [ai] tag provider, guided by the list
     /// and stored interests, and go through it as `tag seed` does. Sends each sampled bookmark's
     /// site, title, and summary
-    #[cfg(feature = "ai")]
     Draft(draft_cmd::DraftArgs),
     /// List stored interests (saved with `tag seed --save` or pinned in [tags] interests), or
     /// add and forget saved ones
@@ -504,9 +492,8 @@ pub(crate) fn open_store() -> Result<Opened> {
 
 /// Runs the classifier on a bookmark just added, as `add` does: offline and fast, with the
 /// stored model (`suggest` retrains it; `add` doesn't wait for that). Returns whether it ran:
-/// it needs the `model` feature and a canonical list.
+/// it needs a canonical list.
 pub(crate) fn classify_added(store: &mut Store, config: &Config, id: i64) -> Result<bool> {
-    #[cfg(feature = "model")]
     if !shlv::model::canonical_list(store)?.is_empty() {
         let classifier = store.classifier(false)?;
         store.apply_model(Some(&[id]), &classifier, &config.model)?;
@@ -554,12 +541,7 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             note,
             fetch,
         } => {
-            #[cfg(not(feature = "fetch"))]
-            if fetch {
-                bail!("--fetch isn't available: this build has no fetch support (feature `fetch`)");
-            }
             // The request runs before the write transaction, so no lock is held while waiting.
-            #[cfg(feature = "fetch")]
             let title = match title {
                 None if fetch => fetch_title(&url),
                 t => t,
@@ -741,7 +723,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                     rare,
                     min_group,
                     groups,
-                    #[cfg(feature = "ai")]
                     name_gaps,
                     json,
                 },
@@ -756,26 +737,19 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             };
             // With the classifier built, untagged bookmarks it can place aren't gaps in the list:
             // `suggest` would tag them. It uses the stored model as is (no retraining here).
-            #[cfg(feature = "model")]
             let classifier = if shlv::model::canonical_list(&store)?.is_empty() {
                 None
             } else {
                 Some(store.classifier(false)?)
             };
-            #[cfg(feature = "model")]
             let place = classifier.as_ref().map(|c| {
                 let t = config.model.threshold;
                 move |item: &shlv::choose::Item| c.probabilities(item).iter().any(|(_, p)| *p >= t)
             });
-            #[cfg(feature = "model")]
             let place = place
                 .as_ref()
                 .map(|f| f as &dyn Fn(&shlv::choose::Item) -> bool);
-            #[cfg(not(feature = "model"))]
-            let place = None;
-            #[allow(unused_mut)]
             let mut h = store.health(&opts, place)?;
-            #[cfg(feature = "ai")]
             if let Some(n) = name_gaps {
                 ai_cmd::name_gaps(&config, &store, &mut h.gaps, n)?;
             }
@@ -786,7 +760,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                 print_health(&mut out, &h, &opts, store.pinned().is_some(), &style)?;
             }
         }
-        #[cfg(feature = "ai")]
         Cmd::Tag {
             cmd: TagCmd::Draft(args),
         } => {
@@ -795,7 +768,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             out.flush()?;
             return Ok(code);
         }
-        #[cfg(feature = "ai")]
         Cmd::Tag {
             cmd: TagCmd::Seed(args),
         } => {
@@ -816,7 +788,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             all,
             tag: Some(tag),
             pick,
-            #[cfg(feature = "ai")]
             llm,
         } => {
             let b = backfill_cmd::Backfill {
@@ -825,15 +796,7 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                 all,
                 pick,
             };
-            let code = backfill_cmd::run(
-                &mut store,
-                &config,
-                b,
-                #[cfg(feature = "ai")]
-                &llm,
-                &mut out,
-                &style,
-            )?;
+            let code = backfill_cmd::run(&mut store, &config, b, &llm, &mut out, &style)?;
             out.flush()?;
             return Ok(code);
         }
@@ -842,30 +805,19 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             ids,
             all,
             tag: None,
-            #[cfg(feature = "ai")]
             llm,
             ..
         } => {
             // The classifier runs whenever it's built and there's a canonical list to choose from.
-            #[cfg(feature = "model")]
             let model_on = !shlv::model::canonical_list(&store)?.is_empty();
-            #[cfg(not(feature = "model"))]
-            let model_on = false;
-            #[cfg(feature = "ai")]
             let provider = match config.model.provider {
                 config::ProviderUse::Never if model_on => None,
                 _ => ai_cmd::tag_provider(&config, &store)?,
             };
-            #[cfg(not(feature = "ai"))]
-            let provider: Option<()> = None;
             if store.rules().is_empty() && provider.is_none() && !model_on {
-                let llm = if cfg!(feature = "ai") {
-                    ", and no [ai] tag provider"
-                } else {
-                    ""
-                };
                 bail!(
-                    "nothing to suggest with: no domain rules in {} ([tags.rules]){llm}",
+                    "nothing to suggest with: no domain rules in {} ([tags.rules]), and no [ai] \
+                     tag provider",
                     config_path.display()
                 );
             }
@@ -877,7 +829,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             }
             // Bookmarks the classifier is sure about; with `provider = "fallback"` the provider
             // skips them.
-            #[cfg(feature = "model")]
             let sure = if model_on {
                 let classifier = store.classifier(true)?;
                 let s = store.apply_model(
@@ -890,9 +841,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             } else {
                 None
             };
-            #[cfg(not(feature = "model"))]
-            let sure: Option<std::collections::HashSet<i64>> = None;
-            #[cfg(feature = "ai")]
             let code = match provider {
                 Some(p) => {
                     out.flush()?;
@@ -910,8 +858,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                 }
                 None => ExitCode::SUCCESS,
             };
-            #[cfg(not(feature = "ai"))]
-            let (code, _) = (ExitCode::SUCCESS, sure);
             if !all {
                 let width = id_width(&store)?;
                 for id in ids {
@@ -938,14 +884,12 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
             return Ok(code);
         }
         Cmd::Suggest { cmd: Some(cmd), .. } => run_suggest(&mut store, cmd, &mut out, &style)?,
-        #[cfg(feature = "fetch")]
         Cmd::Fetch {
             ids,
             all,
             force,
             jobs,
         } => return run_fetch(&mut store, &ids, all, force, jobs.into(), &mut out, &style),
-        #[cfg(feature = "ai")]
         Cmd::Summarize {
             ids,
             all,
@@ -967,13 +911,11 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
                 &style,
             );
         }
-        #[cfg(feature = "model")]
         Cmd::Model { cmd } => {
             let code = model_cmd::run(&mut store, &config, cmd, &mut out)?;
             out.flush()?;
             return Ok(code);
         }
-        #[cfg(feature = "ai")]
         Cmd::Batch { cmd } => {
             out.flush()?;
             let code = ai_cmd::run_batch(&mut store, &config, cmd, &mut out)?;
@@ -988,7 +930,6 @@ fn run(cmd: Cmd) -> Result<ExitCode> {
 
 /// `add --fetch`: the page title, or `None` with a warning. A failed fetch doesn't fail `add`;
 /// see task 016.
-#[cfg(feature = "fetch")]
 fn fetch_title(url: &str) -> Option<String> {
     let full = shlv::store::check_url(url).ok()?.0;
     match shlv::fetch::Fetcher::default().get(&full) {
@@ -1007,7 +948,6 @@ fn fetch_title(url: &str) -> Option<String> {
 }
 
 /// `shlv fetch`: sets titles from the pages, a few requests at a time, one commit per bookmark.
-#[cfg(feature = "fetch")]
 fn run_fetch(
     store: &mut Store,
     ids: &[i64],
@@ -1104,9 +1044,6 @@ fn run_config(cmd: ConfigCmd, out: &mut impl Write) -> Result<()> {
                 " (not found; defaults)"
             };
             writeln!(out, "# {}{status}", path.display())?;
-            for s in config.ignored_sections() {
-                writeln!(out, "# [{s}] ignored: not in this build")?;
-            }
             out.write_all(config.to_toml().as_bytes())?;
         }
     }
@@ -1140,7 +1077,6 @@ fn print_rule_stats(out: &mut impl Write, s: &RuleStats, mode: SuggestMode) -> i
 }
 
 /// One line on what the classifier did, for `suggest`.
-#[cfg(feature = "model")]
 fn print_model_stats(
     out: &mut impl Write,
     s: &shlv::model::ModelStats,
@@ -1458,9 +1394,7 @@ fn run_tag(store: &mut Store, cmd: TagCmd, out: &mut impl Write, style: &Style) 
             }
         },
         TagCmd::Health { .. } => unreachable!("handled in run: it needs the config"),
-        #[cfg(feature = "ai")]
         TagCmd::Seed(_) => unreachable!("handled in run: it needs the config"),
-        #[cfg(feature = "ai")]
         TagCmd::Draft(_) => unreachable!("handled in run: it needs the config"),
         TagCmd::Interests { add, rm } => {
             if !add.is_empty() {

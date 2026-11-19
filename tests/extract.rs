@@ -1,6 +1,5 @@
-//! Main-text extraction on saved real pages (feature `fetch`). Sources and licenses are in
+//! Main-text extraction on saved real pages. Sources and licenses are in
 //! tests/fixtures/pages/README.md.
-#![cfg(feature = "fetch")]
 
 use shlv::extract::{MAX_WORDS, extract};
 

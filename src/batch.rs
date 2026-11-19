@@ -1,6 +1,5 @@
 //! Bookkeeping for AI Message Batches: which ones were submitted and not yet collected. The
-//! batches themselves live with the provider ([`crate::ai`], feature `ai`); this part is plain
-//! storage so the schema doesn't depend on features.
+//! batches themselves live with the provider ([`crate::ai`]); this part is plain storage.
 
 use anyhow::Result;
 use rusqlite::params;

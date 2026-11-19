@@ -147,10 +147,10 @@ review to pending suggestions, on reviewed bookmarks too, least confident first:
 below P; an `llm` one counts as 0.5). Filters see the suggestions there are, so run `suggest --all`
 first to have them everywhere.
 
-Before a batch, its bookmarks get suggestions from domain rules, the classifier (feature `model`),
-and the `[ai] tag` provider (feature `ai`) for the ones the classifier wasn't sure about and the
-provider hasn't seen, as `[model] provider` says. Without AI, review works with rules and the
-classifier, and new names come only from what you type. After a batch:
+Before a batch, its bookmarks get suggestions from domain rules, the classifier, and the `[ai] tag`
+provider for the ones the classifier wasn't sure about and the provider hasn't seen, as
+`[model] provider` says. Without AI, review works with rules and the classifier, and new names come
+only from what you type. After a batch:
 
 1. **Proposals:** the names proposed for the batch's bookmarks, with how many bookmarks each is on:
    `a` adds it to the list (its bookmarks get the tag), `l` makes it an alias of a canonical tag,
@@ -200,10 +200,10 @@ and nothing changes until you run one. `--json` prints the report as one JSON ob
 - **Gaps:** bookmarks without a canonical tag (without any tag when there is no canonical list),
   grouped by site and by shared title words: groups of at least `--min-group` (3), at most
   `--groups` (10) of each. A word that is already a tag or alias says so: those bookmarks only need
-  tagging. With the `model` feature, bookmarks the classifier would tag (at `[model] threshold`) are
-  counted apart and left out of the groups; `suggest --all` tags them. With the `ai` feature,
-  `--name-gaps [N]` asks the `[ai] tag` provider to name the N largest groups (5), or to pick a tag
-  already on the list; it sends up to 15 titles and URLs per group, with the list.
+  tagging. Bookmarks the classifier would tag (at `[model] threshold`) are counted apart and left
+  out of the groups; `suggest --all` tags them. `--name-gaps [N]` asks the `[ai] tag` provider to
+  name the N largest groups (5), or to pick a tag already on the list; it sends up to 15 titles and
+  URLs per group, with the list.
 - **Style:** names that break `[tags.style]`, a singular and a plural both present (`plugin`,
   `plugins`), and compounds of other tags (`rust-wifi` when `rust` and `wifi` exist).
 - **Interests:** with stored interests (`[tags] interests`, or saved with

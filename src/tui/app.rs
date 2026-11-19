@@ -231,7 +231,6 @@ impl App {
     }
 
     /// Asks before sending `job`: `lines` say what it sends, and where.
-    #[cfg_attr(not(feature = "ai"), allow(dead_code))]
     pub(super) fn confirm(&mut self, lines: Vec<String>, job: Job) {
         self.confirm = Some(Confirm { lines, job });
     }

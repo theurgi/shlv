@@ -1,4 +1,4 @@
-//! `shlv model` (feature `model`): train, inspect, and evaluate the tag classifier.
+//! `shlv model`: train, inspect, and evaluate the tag classifier.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -21,15 +21,12 @@ pub enum ModelCmd {
     /// Measure the classifier on your own bookmarks: train on the oldest 80%, test the newest 20%
     Eval {
         /// Also measure the [ai] tag provider on up to --limit test bookmarks (sends them)
-        #[cfg(feature = "ai")]
         #[arg(long)]
         provider: bool,
         /// How many test bookmarks to send to the provider
-        #[cfg(feature = "ai")]
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Go ahead when more than 20 bookmarks would be sent
-        #[cfg(feature = "ai")]
         #[arg(short, long)]
         yes: bool,
     },
@@ -89,11 +86,6 @@ pub fn run(
                 }
             }
         },
-        #[cfg(not(feature = "ai"))]
-        ModelCmd::Eval {} => {
-            eval(store, config, out)?;
-        }
-        #[cfg(feature = "ai")]
         ModelCmd::Eval {
             provider,
             limit,
@@ -253,7 +245,6 @@ fn row(out: &mut impl Write, name: &str, m: &Metrics, time: &str) -> std::io::Re
 }
 
 /// The `[ai] tag` provider on the newest test bookmarks.
-#[cfg(feature = "ai")]
 fn eval_provider(
     store: &Store,
     config: &Config,

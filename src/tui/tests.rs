@@ -528,11 +528,9 @@ fn pasting_a_url_starts_adding_it() {
     );
 }
 
-#[cfg(feature = "fetch")]
 #[path = "../../tests/common/server.rs"]
 mod server;
 
-#[cfg(feature = "fetch")]
 mod fetch {
     use super::*;
 
@@ -583,7 +581,6 @@ mod fetch {
     }
 }
 
-#[cfg(feature = "ai")]
 mod ai {
     use super::*;
 
@@ -850,8 +847,7 @@ fn rules_view_declines_offers() {
     assert!(db.store().rule_candidates(3, 0.8).unwrap().is_empty());
 }
 
-/// Waits for the worker, and steps through back-fill (which only the `model` feature reaches)
-/// with `q`, until the batch is done.
+/// Waits for the worker, and steps through back-fill with `q`, until the batch is done.
 fn finish_batch(app: &mut App) {
     for _ in 0..20 {
         app.finish_jobs();
@@ -1149,7 +1145,6 @@ fn review_queue_filters_and_decides() {
 
 /// A tag added after a batch is offered on the bookmarks reviewed before it existed; the
 /// offering runs on the worker.
-#[cfg(feature = "model")]
 #[test]
 fn review_backfills_new_tags() {
     let db = Db::new();
@@ -1363,7 +1358,6 @@ fn tags_health_fixes() {
     assert_eq!(tags(&db, "https://blog.site/1"), ["blog"]);
 }
 
-#[cfg(feature = "model")]
 #[test]
 fn tags_backfill() {
     let db = Db::new();

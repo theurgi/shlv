@@ -5,11 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-#[cfg(feature = "ai")]
 use std::collections::BTreeMap;
 
-#[cfg(not(feature = "ai"))]
-use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 use toml::Spanned;
 
@@ -28,29 +25,18 @@ pub struct Config {
     pub strict_tags: crate::proposal::StrictTags,
     #[serde(default, skip_serializing_if = "Tags::is_empty")]
     pub tags: Tags,
-    /// The tag classifier (feature `model`): thresholds and when to ask the provider. Parsed in
-    /// every build so one config works across builds.
+    /// The tag classifier: thresholds and when to ask the provider.
     #[serde(default, skip_serializing_if = "ModelConfig::is_default")]
     pub model: ModelConfig,
     /// Which provider does which AI task.
-    #[cfg(feature = "ai")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai: Option<crate::ai::AiConfig>,
     /// AI providers by name.
-    #[cfg(feature = "ai")]
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider: BTreeMap<String, Spanned<crate::ai::ProviderConfig>>,
-    /// Without the `ai` feature, its sections are accepted unchecked, so one config works
-    /// across builds.
-    #[cfg(not(feature = "ai"))]
-    #[serde(default, skip_serializing)]
-    ai: Option<IgnoredAny>,
-    #[cfg(not(feature = "ai"))]
-    #[serde(default, skip_serializing)]
-    provider: Option<IgnoredAny>,
 }
 
-/// The `[model]` section: how the tag classifier's suggestions are used (feature `model`).
+/// The `[model]` section: how the tag classifier's suggestions are used.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ModelConfig {
@@ -297,7 +283,6 @@ impl Config {
         if let Some((site, msg)) = config.tags.bad_style() {
             return Err(at(site.find(text), &msg));
         }
-        #[cfg(feature = "ai")]
         if let Some((pos, msg)) = config.bad_ai() {
             return Err(at(Some(pos), &msg));
         }
@@ -309,26 +294,8 @@ impl Config {
         toml::to_string(self).expect("config serializes")
     }
 
-    /// Sections present in the file that this build ignores.
-    pub fn ignored_sections(&self) -> Vec<&'static str> {
-        #[cfg(not(feature = "ai"))]
-        {
-            let mut v = Vec::new();
-            if self.ai.is_some() {
-                v.push("ai");
-            }
-            if self.provider.is_some() {
-                v.push("provider");
-            }
-            v
-        }
-        #[cfg(feature = "ai")]
-        Vec::new()
-    }
-
     /// A provider section that breaks its kind's rules, or an `[ai]` task naming a provider
     /// that doesn't exist: the byte offset to report and the message.
-    #[cfg(feature = "ai")]
     fn bad_ai(&self) -> Option<(usize, String)> {
         for (name, p) in &self.provider {
             if let Err(e) = p.get_ref().check() {
@@ -438,19 +405,6 @@ mod tests {
         assert_eq!(c.to_toml(), "strict_tags = \"propose\"\n");
     }
 
-    #[cfg(not(feature = "ai"))]
-    #[test]
-    fn ignores_unbuilt_sections() {
-        let c = parse(
-            "strict_tags = true\n[ai]\nmodel = \"x\"\n[provider.openai]\nkey_cmd = \"pass x\"\n",
-        )
-        .unwrap();
-        assert_eq!(c.strict_tags, crate::StrictTags::On);
-        assert_eq!(c.ignored_sections(), ["ai", "provider"]);
-        assert_eq!(c.to_toml(), "strict_tags = true\n");
-    }
-
-    #[cfg(feature = "ai")]
     #[test]
     fn parses_ai_providers() {
         let text = "[ai]\nsummarize = \"claude\"\ntag = \"local\"\n\n\
@@ -459,7 +413,6 @@ mod tests {
                     [provider.claude]\nkind = \"anthropic\"\nmodel = \"m\"\n\
                     api_key_env = \"ANTHROPIC_API_KEY\"\ntimeout = 30\n";
         let c = parse(text).unwrap();
-        assert!(c.ignored_sections().is_empty());
         let ai = c.ai.as_ref().unwrap();
         assert_eq!(ai.tag.as_ref().unwrap().get_ref(), "local");
         let local = c.provider["local"].get_ref();
@@ -481,7 +434,6 @@ mod tests {
         assert!(parse("").unwrap().ai.is_none());
     }
 
-    #[cfg(feature = "ai")]
     #[test]
     fn ai_errors_have_positions() {
         let local = "[provider.local]\nkind = \"openai-compatible\"\nbase_url = \"http://h/v1\"\n\
@@ -520,7 +472,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ai")]
     #[test]
     fn api_key_file_is_exclusive_and_shown_as_a_path() {
         let p = "[provider.c]\nkind = \"anthropic\"\nmodel = \"m\"\n";
@@ -539,7 +490,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ai")]
     #[test]
     fn api_key_cmd_is_an_array_exclusive_with_the_others() {
         let p = "[provider.c]\nkind = \"anthropic\"\nmodel = \"m\"\n";

@@ -1,6 +1,5 @@
-//! `shlv tag draft` against recorded provider replies, answered on stdin (feature `ai`). Without
-//! a terminal, each answer is a line whose first character is the key.
-#![cfg(feature = "ai")]
+//! `shlv tag draft` against recorded provider replies, answered on stdin. Without a
+//! terminal, each answer is a line whose first character is the key.
 
 mod common;
 

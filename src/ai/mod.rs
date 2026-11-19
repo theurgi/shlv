@@ -1,6 +1,5 @@
-//! AI providers (feature `ai`): summaries and tag choices from an LLM, configured as
-//! `[provider.NAME]` and picked per task in `[ai]`. Nothing is sent anywhere unless a provider is
-//! configured.
+//! AI providers: summaries and tag choices from an LLM, configured as `[provider.NAME]` and picked
+//! per task in `[ai]`. Nothing is sent anywhere unless a provider is configured.
 //!
 //! How the pieces fit: a provider *kind* is a transport ([`Llm`]: one structured-output request
 //! in, the model's JSON text out). [`Provider`] wraps one, owns the prompts, schemas, and output

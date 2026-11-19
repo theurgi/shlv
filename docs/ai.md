@@ -1,8 +1,8 @@
 # AI providers
 
-With the `ai` feature, an LLM can write summaries and suggest tags. AI is off until you configure
-it: there is no default provider or model. Each task names a provider, so tagging can stay local
-while summaries go elsewhere:
+An LLM can write summaries and suggest tags. AI is off until you configure it: there is no default
+provider or model. Each task names a provider, so tagging can stay local while summaries go
+elsewhere:
 
 ```toml
 [ai]

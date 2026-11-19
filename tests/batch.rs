@@ -1,6 +1,5 @@
 //! Message Batches for `summarize --batch` and `suggest --batch`, against the local test server
-//! playing the Batches API (feature `ai`).
-#![cfg(feature = "ai")]
+//! playing the Batches API.
 
 mod common;
 

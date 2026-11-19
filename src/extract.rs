@@ -1,6 +1,5 @@
-//! The readable main text of a page (feature `fetch`): the article, docs, or README without
-//! navigation and boilerplate, as input for summaries and LLM tags. It is used and dropped, never
-//! stored.
+//! The readable main text of a page: the article, docs, or README without navigation and
+//! boilerplate, as input for summaries and LLM tags. It is used and dropped, never stored.
 //!
 //! Hand-rolled and heuristic: a tolerant tree builder over [`crate::html`]'s tokenizer, then
 //!

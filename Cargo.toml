@@ -30,26 +30,14 @@ uuid = { version = "1.29.2", features = ["v7"] }
 # The TUI (task 042): ratatui for layout and widgets, crossterm for the terminal. Built by default.
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
 crossterm = "0.29.0"
-# HTTPS with rustls and bundled webpki roots; no gzip, no charset (see task 016).
-ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
-
-[features]
-# Network access: `add --fetch` and `shlv fetch`. Off by default; the core stays offline.
-fetch = ["dep:ureq"]
-# AI summaries and tag suggestions through a configured provider. Implies fetch: summaries need
-# page text, and both use the same HTTP client.
-ai = ["fetch"]
-# The in-binary tag classifier (task 022): no dependencies, offline.
-model = []
+# Fetching pages and AI providers: HTTPS with rustls and bundled webpki roots; no gzip,
+# no charset (see task 016).
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
-
-[[example]]
-name = "extract"
-required-features = ["fetch"]
 
 [dev-dependencies]
 # Already in the tree through ureq; the TLS test serves HTTPS with it.

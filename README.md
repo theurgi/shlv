@@ -13,9 +13,9 @@ nix run github:theurgi/shlv -- --help
 cargo install --git https://github.com/theurgi/shlv
 ```
 
-The default build is offline. Page titles from the web, AI summaries and tags, and the tag
-classifier are optional features; see [Install](docs/install.md) for them, the flake overlay, and
-the Home Manager module.
+shlv works offline and without AI. Fetching page titles and AI summaries and tags are off until you
+ask for them or configure a provider. See [Install](docs/install.md) for the flake overlay and the
+Home Manager module.
 
 ## Usage
 
@@ -85,15 +85,14 @@ The database is at `$SHLV_DB`, else `$XDG_DATA_HOME/shlv/shlv.db`, else
 
 ## Documentation
 
-- [Install](docs/install.md): Nix, Home Manager, Cargo, and optional features
+- [Install](docs/install.md): Nix, Home Manager, and Cargo
 - [The TUI](docs/tui.md): the keys and views of bare `shlv`
 - [Config and tags](docs/config.md): the config file, canonical tags, domain rules, suggestions,
   proposals, and tag health
 - [Import and export](docs/import-export.md): browser bookmarks, URL lists, moving from another app
-- [Page titles](docs/fetch.md): `add --fetch` and `shlv fetch` (`fetch` feature)
-- [AI providers](docs/ai.md): summaries and tag suggestions from an LLM (`ai` feature)
-- [Tag classifier](docs/classifier.md): offline tag suggestions learned from your bookmarks (`model`
-  feature)
+- [Page titles](docs/fetch.md): `add --fetch` and `shlv fetch`
+- [AI providers](docs/ai.md): summaries and tag suggestions from an LLM
+- [Tag classifier](docs/classifier.md): offline tag suggestions learned from your bookmarks
 
 ## Performance
 

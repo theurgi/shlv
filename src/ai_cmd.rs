@@ -1,4 +1,4 @@
-//! The CLI's AI commands (feature `ai`): `summarize`, and the LLM layer of `suggest`.
+//! The CLI's AI commands: `summarize`, and the LLM layer of `suggest`.
 
 use std::io::Write;
 use std::process::ExitCode;

@@ -35,6 +35,6 @@ From Karakeep (Settings → Import / export), either:
 
 ```sh
 shlv import urls.txt
-shlv fetch --all     # titles for bookmarks without one (`fetch` feature)
+shlv fetch --all     # titles for bookmarks without one
 shlv suggest --all   # the classifier or [ai] tag provider; the rules ran on import
 ```

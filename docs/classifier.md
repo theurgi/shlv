@@ -1,11 +1,10 @@
 # Tag classifier
 
-With the `model` feature, shlv learns tags from your own bookmarks: a small classifier (logistic
-regression over words from the title, host, URL path, summary, and note) trained on bookmarks that
-have canonical tags, plus suggestions you rejected. It runs offline in microseconds and is stored in
-the database. Tags with few examples fall back on matching their name, aliases, and description
-(`tag describe`), so it helps from the first day; the match counts less as a tag gathers examples
-and drops out at 100.
+shlv learns tags from your own bookmarks: a small classifier (logistic regression over words from
+the title, host, URL path, summary, and note) trained on bookmarks that have canonical tags, plus
+suggestions you rejected. It runs offline in microseconds and is stored in the database. Tags with
+few examples fall back on matching their name, aliases, and description (`tag describe`), so it
+helps from the first day; the match counts less as a tag gathers examples and drops out at 100.
 
 ```console
 $ shlv model train      # suggest retrains it by itself when your tags change
@@ -59,6 +58,5 @@ yet, so the classifier offers it from a probability of 0.1 rather than `threshol
 name or an alias scores 0.45, two words of its description 0.15. With an `[ai] tag` provider (and
 `provider` not `"never"`), the provider is asked too, with only that tag to choose and no proposals:
 about the IDs given, or with `--all` about the tagged bookmarks the classifier passed over. Its yes
-ranks as 0.5. A rejected candidate isn't offered again. Without the `model` feature, back-fill uses
-the provider alone. [`shlv review`](config.md#review) runs the same back-fill, on reviewed
-bookmarks, for each tag added after a batch.
+ranks as 0.5. A rejected candidate isn't offered again. [`shlv review`](config.md#review) runs the
+same back-fill, on reviewed bookmarks, for each tag added after a batch.

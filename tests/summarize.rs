@@ -1,6 +1,5 @@
 //! `shlv summarize` against the local test server: pages and a recorded openai-compatible
-//! provider on the same port (feature `ai`).
-#![cfg(feature = "ai")]
+//! provider on the same port.
 
 mod common;
 

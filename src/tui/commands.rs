@@ -88,28 +88,12 @@ impl App {
                     self.warn(format!("{e:#}"));
                 }
             }
-            "fetch" => {
-                if cfg!(feature = "fetch") {
-                    self.send_job(Job::FetchAll);
-                } else {
-                    self.warn("fetching needs the `fetch` feature");
-                }
-            }
+            "fetch" => self.send_job(Job::FetchAll),
             "summarize" => self.ask_summarize(),
-            "train" => {
-                if cfg!(feature = "model") {
-                    self.send_job(Job::Train);
-                } else {
-                    self.warn("the classifier needs the `model` feature");
-                }
-            }
+            "train" => self.send_job(Job::Train),
             "eval" => {
-                if cfg!(feature = "model") {
-                    self.switch(View::Status);
-                    self.send_job(Job::Eval);
-                } else {
-                    self.warn("the classifier needs the `model` feature");
-                }
+                self.switch(View::Status);
+                self.send_job(Job::Eval);
             }
             "jobs" => self.switch(View::Status),
             "cancel" => match args.first().map(|a| a.parse::<u64>()) {
@@ -247,7 +231,6 @@ impl App {
 
     /// Asks before summarizing every bookmark without a summary.
     fn ask_summarize(&mut self) {
-        #[cfg(feature = "ai")]
         {
             let p = match crate::ai_cmd::provider(&self.config, shlv::ai::Task::Summarize) {
                 Ok(p) => p,
@@ -284,8 +267,6 @@ impl App {
                 Job::SummarizeAll,
             );
         }
-        #[cfg(not(feature = "ai"))]
-        self.warn("summarizing needs the `ai` feature");
     }
 
     /// Candidates for Tab after `head` (the text before the cursor): command names, then

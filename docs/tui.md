@@ -37,7 +37,7 @@ completes command names, then subcommands, then tag names (or interests, or rule
 | `:tag describe TAG TEXT`                       | Describe a tag                               |
 | `:rule add HOST TAG...`, `:rule rm HOST [TAG]` | As `shlv rule`                               |
 | `:interest add NAME...`, `rm NAME...`          | Save or forget interests                     |
-| `:seed [INTEREST...]`, `:draft [N]`            | `tag seed`, `tag draft` (feature `ai`)       |
+| `:seed [INTEREST...]`, `:draft [N]`            | `tag seed`, `tag draft`                      |
 | `:fetch`                                       | Fetch titles for bookmarks without one       |
 | `:summarize`                                   | Summarize bookmarks without a summary (asks) |
 | `:train`, `:eval`                              | Retrain or measure the classifier (`model`)  |
@@ -66,8 +66,8 @@ pending suggestions, names proposed for the list, note, and summary.
 | `v`               | Mark the bookmark and move down; `t`, `dd`, `y`, `n` act on all marked |
 | `y` `n`           | Accept, reject every pending suggestion                                |
 | `s`               | Go through the suggestions one by one: `y`, `n`, `j` `k`, `Esc`        |
-| `F`               | Fetch the title (`fetch` feature)                                      |
-| `S`               | Summarize with the `[ai] summarize` provider (`ai` feature)            |
+| `F`               | Fetch the title                                                        |
+| `S`               | Summarize with the `[ai] summarize` provider                           |
 | `Ctrl-l`          | Reload, after changes made elsewhere (the CLI, another TUI)            |
 | `Esc`             | Clear the marks, then the search                                       |
 
@@ -76,8 +76,8 @@ pending suggestions, names proposed for the list, note, and summary.
 doesn't parse yet (a trailing `OR`) keeps the last results and says why on the bar.
 
 **Adding** runs the domain rules and the classifier as `shlv add` does, and says what they
-suggested; `y` accepts it. Pasting while the list has focus starts adding the pasted URL. With the
-`fetch` feature, a bookmark added without a title gets one fetched in the background.
+suggested; `y` accepts it. Pasting while the list has focus starts adding the pasted URL. A bookmark
+added without a title gets one fetched in the background.
 
 **Editing tags** of one bookmark shows its tags as text: edit the list, and tags left out are
 removed (`-tag` removes one too). With bookmarks marked, the text is a change instead: `tag` or
@@ -188,10 +188,10 @@ tags, with `suggestions = "auto"`). Rules pinned in config can't be removed here
 ## Bootstrap
 
 **Interests** are broad topics you bookmark (`nix`, `home-lab`): `a` saves some, `dd` forgets one
-(those in `[tags] interests` in the config are pinned and stay). With the `ai` feature, `s` runs
-`tag seed` on them (the `[ai] tag` provider expands them into candidate tags) and `D` runs
-`tag draft` (it drafts tags from a sample of bookmarks, 200 by default). Both first show exactly
-what is sent and where, and send only on `y`.
+(those in `[tags] interests` in the config are pinned and stay). `s` runs `tag seed` on them (the
+`[ai] tag` provider expands them into candidate tags) and `D` runs `tag draft` (it drafts tags from
+a sample of bookmarks, 200 by default). Both first show exactly what is sent and where, and send
+only on `y`.
 
 The **candidates** come back grouped by interest, with those already on the list shown as such:
 

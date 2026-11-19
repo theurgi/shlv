@@ -20,7 +20,6 @@ use shlv::{Bookmark, Deleted, Edit, NewBookmark};
 use super::app::{App, draw_line_input};
 use super::form::{Field, Form, FormKey, draw_form};
 use super::input::{Edited, Input};
-#[cfg(feature = "fetch")]
 use super::worker::Job;
 
 /// The view's keys, for `?`.
@@ -44,13 +43,9 @@ pub fn keys() -> Vec<(&'static str, &'static str)> {
         ("y n", "accept, reject the pending suggestions"),
         ("s", "go through the suggestions one by one"),
     ];
-    if cfg!(feature = "fetch") {
-        keys.push(("F", "fetch the title"));
-    }
-    if cfg!(feature = "ai") {
-        keys.push(("S", "summarize ([ai] summarize provider)"));
-    }
     keys.extend([
+        ("F", "fetch the title"),
+        ("S", "summarize ([ai] summarize provider)"),
         ("Ctrl-l", "reload (after changes from elsewhere)"),
         ("Esc", "clear the marks, then the search"),
     ]);
@@ -348,13 +343,11 @@ impl App {
                 Some(Err(e)) => self.warn(format!("{e:#}")),
                 _ => self.say("no pending suggestions"),
             },
-            #[cfg(feature = "fetch")]
             KeyCode::Char('F') => {
                 for (id, url) in self.target_urls() {
                     self.send_job(Job::FetchTitle { id, url });
                 }
             }
-            #[cfg(feature = "ai")]
             KeyCode::Char('S') => {
                 if let Err(e) = crate::ai_cmd::provider(&self.config, shlv::ai::Task::Summarize) {
                     self.warn(format!("{e:#}"));
@@ -370,7 +363,6 @@ impl App {
     }
 
     /// The URLs of the bookmarks an action works on.
-    #[cfg(feature = "fetch")]
     fn target_urls(&mut self) -> Vec<(i64, String)> {
         let mut v = Vec::new();
         for id in self.bookmarks.targets() {
@@ -665,7 +657,6 @@ impl App {
             ));
         }
         self.say(msg);
-        #[cfg(feature = "fetch")]
         if let Some(b) = self.store.get(id)?.filter(|b| b.title.is_none()) {
             self.send_job(Job::FetchTitle { id, url: b.url });
         }
